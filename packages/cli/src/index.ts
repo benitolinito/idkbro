@@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { networkInterfaces, userInfo } from "node:os";
 import { createInterface, type Interface } from "node:readline";
 import { promisify } from "node:util";
+import chalk, { chalkStderr } from "chalk";
 import { Command } from "commander";
 import { CodexAppServerAdapter } from "@multicode/agent-adapters";
 import type { AgentEvent, RelayServerMessage, RoomServerMessage, WorkspaceCheckpoint, WorkspaceDiff } from "@multicode/protocol";
@@ -20,6 +21,25 @@ import WebSocket from "ws";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
+
+const out = {
+  success: (message: string) => `${chalk.green("✓")} ${message}`,
+  warning: (message: string) => `${chalk.yellow("!")} ${message}`,
+  label: (label: string) => chalk.bold(label),
+  value: (value: string) => chalk.cyan(value),
+  muted: (value: string) => chalk.dim(value),
+  command: (value: string) => chalk.cyan(value),
+};
+
+const err = {
+  success: (message: string) => `${chalkStderr.green("✓")} ${message}`,
+  error: (message: string) => `${chalkStderr.red("✗")} ${message}`,
+  info: (symbol: string, message: string) => `${chalkStderr.cyan(symbol)} ${message}`,
+  warning: (message: string) => `${chalkStderr.yellow("!")} ${message}`,
+  label: (label: string) => chalkStderr.bold(label),
+  value: (value: string) => chalkStderr.cyan(value),
+  muted: (value: string) => chalkStderr.dim(value),
+};
 
 async function versionOf(command: string, args: string[]): Promise<string | null> {
   try {
@@ -42,14 +62,17 @@ async function doctor(): Promise<void> {
     { name: "Codex CLI", ok: Boolean(codexVersion), detail: codexVersion ?? "not found" },
   ];
 
-  for (const check of checks) console.log(`${check.ok ? "✓" : "✗"} ${check.name}: ${check.detail}`);
+  for (const check of checks) {
+    const icon = check.ok ? chalk.green("✓") : chalk.red("✗");
+    console.log(`${icon} ${out.label(check.name)} ${out.muted(check.detail)}`);
+  }
 
   try {
     const repository = await inspectRepository(process.cwd());
-    console.log(`✓ Repository: ${repository.root}`);
-    console.log(`  HEAD: ${repository.head.slice(0, 12)}${repository.dirty ? " (uncommitted changes excluded)" : ""}`);
+    console.log(out.success(`${out.label("Repository")} ${out.value(repository.root)}`));
+    console.log(`  ${out.muted("HEAD")} ${repository.head.slice(0, 12)}${repository.dirty ? out.muted(" (uncommitted changes excluded)") : ""}`);
   } catch (error) {
-    console.log(`- Repository: ${error instanceof Error ? error.message : String(error)}`);
+    console.log(`${chalk.red("✗")} ${out.label("Repository")} ${error instanceof Error ? error.message : String(error)}`);
   }
 
   if (checks.some((check) => !check.ok)) process.exitCode = 1;
@@ -62,14 +85,14 @@ function printAgentEvent(event: AgentEvent): void {
       process.stdout.write(event.text);
       break;
     case "approval.requested":
-      console.error(`\nApproval required on the host (${event.approvalKind}, request ${event.requestId}).`);
-      console.error("Interactive approval handling is not implemented; the request remains pending.");
+      console.error(`\n${err.warning(`${err.label("Approval required on the host")} ${err.muted(`(${event.approvalKind}, request ${event.requestId})`)}`)}`);
+      console.error(err.muted("  Interactive approval handling is not implemented; the request remains pending."));
       break;
     case "agent.error":
-      console.error(`\n[codex] ${event.message}`);
+      console.error(`\n${err.error(`${err.label("Codex")} ${event.message}`)}`);
       break;
     case "turn.completed":
-      console.error(`\n✓ Turn completed${event.status ? ` (${event.status})` : ""}`);
+      console.error(`\n${err.success(`${err.label("Turn completed")}${event.status ? err.muted(` (${event.status})`) : ""}`)}`);
       break;
     default:
       break;
@@ -79,23 +102,23 @@ function printAgentEvent(event: AgentEvent): void {
 function printRoomMessage(message: RoomServerMessage, includeAgent = true): void {
   switch (message.type) {
     case "room.welcome":
-      console.log(`✓ Joined room ${message.roomId}`);
-      console.log(`  Participants: ${message.participants.map((participant) => participant.name).join(", ")}`);
-      if (message.activePrompt) console.log(`  Active prompt: ${message.activePrompt.participantName}: ${message.activePrompt.text}`);
-      if (message.queue.length) console.log(`  ${message.queue.length} prompt(s) waiting`);
+      console.log(out.success(`${out.label("Joined room")} ${out.value(message.roomId)}`));
+      console.log(`  ${out.muted("Participants")} ${message.participants.map((participant) => participant.name).join(", ")}`);
+      if (message.activePrompt) console.log(`  ${out.muted("Active prompt")} ${out.label(message.activePrompt.participantName)}: ${message.activePrompt.text}`);
+      if (message.queue.length) console.log(`  ${chalk.yellow(message.queue.length)} ${out.muted("prompt(s) waiting")}`);
       if (message.latestDiff) printWorkspaceDiff(message.latestDiff);
       break;
     case "participant.joined":
-      console.error(`\n+ ${message.participant.name} joined the room`);
+      console.error(`\n${err.info("+", `${err.label(message.participant.name)} joined the room`)}`);
       break;
     case "participant.left":
-      console.error(`\n- ${message.name} left the room`);
+      console.error(`\n${err.muted(`− ${message.name} left the room`)}`);
       break;
     case "prompt.queued":
-      console.error(`\n→ ${message.prompt.participantName} queued prompt #${message.position}: ${message.prompt.text}`);
+      console.error(`\n${err.info("→", `${err.label(message.prompt.participantName)} queued prompt ${err.muted(`#${message.position}`)}: ${message.prompt.text}`)}`);
       break;
     case "prompt.started":
-      console.error(`\n▶ ${message.prompt.participantName}: ${message.prompt.text}`);
+      console.error(`\n${err.info("▶", `${err.label(message.prompt.participantName)}: ${message.prompt.text}`)}`);
       break;
     case "agent.event":
       if (includeAgent) printAgentEvent(message.event);
@@ -104,21 +127,21 @@ function printRoomMessage(message: RoomServerMessage, includeAgent = true): void
       printWorkspaceDiff(message.diff);
       break;
     case "workspace.checkpoint":
-      console.error(`\n↻ Workspace checkpoint ${message.checkpoint.sequence}: ${message.checkpoint.commit.slice(0, 12)}`);
+      console.error(`\n${err.info("↻", `${err.label("Workspace checkpoint")} ${message.checkpoint.sequence} ${err.muted(message.checkpoint.commit.slice(0, 12))}`)}`);
       break;
     case "participant.synced":
-      console.error(`\n✓ Participant synchronized at checkpoint ${message.sequence}`);
+      console.error(`\n${err.success(`${err.label("Participant synchronized")} ${err.muted(`checkpoint ${message.sequence}`)}`)}`);
       break;
     case "room.error":
-      console.error(`\nRoom error: ${message.message}`);
+      console.error(`\n${err.error(`${err.label("Room error")} ${message.message}`)}`);
       break;
   }
 }
 
 function printWorkspaceDiff(diff: WorkspaceDiff): void {
-  console.error(`\n── workspace after ${diff.revision} ${diff.truncated ? "(truncated) " : ""}──`);
+  console.error(`\n${chalkStderr.cyan("──")} ${err.label("Workspace changes")} ${err.muted(`after ${diff.revision}${diff.truncated ? " · truncated" : ""}`)} ${chalkStderr.cyan("──")}`);
   console.error(diff.text || "No tracked workspace changes.");
-  console.error("── end workspace diff ──");
+  console.error(chalkStderr.cyan("────────────────────────"));
 }
 
 async function readWorkspaceDiff(cwd: string, revision: string): Promise<WorkspaceDiff> {
@@ -151,18 +174,18 @@ async function prepareRoom(dryRun = false): Promise<{
   baseCommit?: string;
 }> {
   const repository = await inspectRepository(process.cwd());
-  console.log(`✓ Repository: ${repository.root}`);
-  if (repository.dirty) console.log("! Uncommitted and untracked changes will be included in synchronized checkpoints.");
+  console.log(out.success(`${out.label("Repository")} ${out.value(repository.root)}`));
+  if (repository.dirty) console.log(out.warning("Uncommitted and untracked changes will be included in synchronized checkpoints."));
   if (repository.operationInProgress) throw new Error("Finish the current Git operation before creating a room");
   if (dryRun) {
-    console.log(`✓ Base commit: ${repository.head}`);
-    console.log("✓ Repository is ready for a synchronized room");
+    console.log(out.success(`${out.label("Base commit")} ${out.muted(repository.head)}`));
+    console.log(out.success("Repository is ready for a synchronized room"));
     return { roomId: "dry-run" };
   }
 
   const roomId = randomUUID().split("-")[0] as string;
-  console.log(`✓ Workspace: ${repository.root}`);
-  console.log(`✓ Branch: ${repository.branch ?? "detached HEAD"}`);
+  console.log(out.success(`${out.label("Workspace")} ${out.value(repository.root)}`));
+  console.log(out.success(`${out.label("Branch")} ${out.value(repository.branch ?? "detached HEAD")}`));
   return { roomId, workspacePath: repository.root, baseCommit: repository.head };
 }
 
@@ -173,16 +196,16 @@ async function createRoom(options: { agent: string; prompt?: string; model?: str
 
   const adapter = new CodexAppServerAdapter();
   const stop = installStopHandlers(async () => {
-    console.error("\nStopping local room...");
+    console.error(`\n${err.info("■", "Stopping local room…")}`);
     await adapter.stop();
   });
   const eventTask = (async () => {
     for await (const event of adapter.events()) printAgentEvent(event);
   })();
   const { threadId } = await adapter.start({ cwd: room.workspacePath, ...(options.model ? { model: options.model } : {}) });
-  console.log(`✓ Codex thread: ${threadId}`);
+  console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
   if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
-  else console.log("Room is running locally. Pass --prompt to begin a turn.");
+  else console.log(`${out.muted("Room is running locally. Pass")} ${out.command("--prompt")} ${out.muted("to begin a turn.")}`);
   await eventTask;
   stop();
 }
@@ -329,7 +352,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       cwd: workspacePath,
       ...(options.model ? { model: options.model } : {}),
     });
-    console.log(`✓ Codex thread: ${threadId}`);
+    console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
 
     const bound = await relay.listen({ host: options.listen, port: parsePort(options.port) });
     await publishCheckpoint(true);
@@ -340,17 +363,17 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       roomId: prepared.roomId,
       token,
     });
-    console.log(`✓ Room ${prepared.roomId} listening on ${options.listen}:${bound.port}`);
-    console.log("\nInvite someone with:");
-    console.log(`  multicode room join '${invite}' --name 'Their name'`);
+    console.log(out.success(`${out.label("Room")} ${out.value(prepared.roomId)} ${out.muted("listening on")} ${out.value(`${options.listen}:${bound.port}`)}`));
+    console.log(`\n${out.label("Invite someone with")}`);
+    console.log(`  ${out.command(`multicode room join '${invite}' --name 'Their name'`)}`);
     if (!options.publicUrl && options.listen === "127.0.0.1") {
-      console.log("\nLocal-only listener. Use --listen 0.0.0.0 for trusted LAN access or --public-url with a secure tunnel.");
+      console.log(`\n${out.warning("Local-only listener.")} ${out.muted("Use")} ${out.command("--listen 0.0.0.0")} ${out.muted("for trusted LAN access or")} ${out.command("--public-url")} ${out.muted("with a secure tunnel.")}`);
     }
-    console.log("\nType a prompt and press Enter. Prompts from all participants run in queue order.");
+    console.log(`\n${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter. Shared prompts run in queue order.")}`);
 
     input = promptInput((text) => relay.submitHostPrompt(text));
     cleanupSignals = installStopHandlers(async () => {
-      console.error("\nStopping shared room...");
+      console.error(`\n${err.info("■", "Stopping shared room…")}`);
       await shutdown();
     });
     if (options.prompt) relay.submitHostPrompt(options.prompt);
@@ -464,21 +487,21 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       cwd: workspacePath,
       ...(options.model ? { model: options.model } : {}),
     });
-    console.log(`✓ Codex thread: ${threadId}`);
+    console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
     await publishCheckpoint(true);
-    console.log(`✓ Remote room created at ${relayUrl}`);
-    console.log(`\nRoom code: ${created.code}`);
-    console.log("\nInvite someone with:");
+    console.log(out.success(`${out.label("Remote room")} ${out.value(relayUrl)}`));
+    console.log(`\n${out.label("Room code")} ${chalk.bold.cyan(created.code)}`);
+    console.log(`\n${out.label("Invite someone with")}`);
     const relayArgument = relayUrl === defaultRelayUrl ? "" : ` --relay '${relayUrl}'`;
-    console.log(`  multicode join ${created.code}${relayArgument} --name 'Their name'`);
-    console.log("\nType a prompt and press Enter. Prompts from all participants run in queue order.");
+    console.log(`  ${out.command(`multicode join ${created.code}${relayArgument} --name 'Their name'`)}`);
+    console.log(`\n${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter. Shared prompts run in queue order.")}`);
 
     socket.on("message", (data) => {
       let message: RelayServerMessage;
       try {
         message = JSON.parse(data.toString()) as RelayServerMessage;
       } catch {
-        console.error("Received an invalid message from the relay");
+        console.error(err.error("Received an invalid message from the relay"));
         return;
       }
       if (message.type === "relay.room.created") return;
@@ -499,19 +522,19 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
 
     const disconnected = new Promise<void>((resolve) => {
       socket?.once("close", () => {
-        console.error("\nDisconnected from relay; the remote room has closed.");
+        console.error(`\n${err.error("Disconnected from relay; the remote room has closed.")}`);
         resolve();
       });
     });
     input = promptInput((text) => {
       if (socket?.readyState !== WebSocket.OPEN) {
-        console.error("Not connected; prompt was not sent.");
+        console.error(err.warning("Not connected; prompt was not sent."));
         return;
       }
       socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
     });
     cleanupSignals = installStopHandlers(async () => {
-      console.error("\nStopping remote room...");
+      console.error(`\n${err.info("■", "Stopping remote room…")}`);
       await shutdown();
     });
     if (options.prompt) {
@@ -557,7 +580,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
       baseCommit: checkpoint.baseCommit,
     });
     await applyWorkspaceCheckpoint(workspaceState, checkpoint);
-    console.error(`\n✓ Workspace synchronized at ${checkpoint.commit.slice(0, 12)} (checkpoint ${checkpoint.sequence})`);
+    console.error(`\n${err.success(`${err.label("Workspace synchronized")} ${err.muted(`${checkpoint.commit.slice(0, 12)} · checkpoint ${checkpoint.sequence}`)}`)}`);
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "workspace.ack", sequence: checkpoint.sequence, commit: checkpoint.commit }));
     }
@@ -570,13 +593,13 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
       try {
         message = JSON.parse(data.toString()) as RoomServerMessage;
       } catch {
-        console.error("Received an invalid message from the room");
+        console.error(err.error("Received an invalid message from the room"));
         return;
       }
       printRoomMessage(message);
       if (message.type === "room.welcome" && !joined) {
         if (!message.latestCheckpoint) {
-          console.error("Room has no workspace checkpoint; cannot synchronize safely.");
+          console.error(err.error("Room has no workspace checkpoint; cannot synchronize safely."));
           socket.close(4004, "Room has no workspace checkpoint");
           return;
         }
@@ -585,16 +608,16 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
         syncTask = syncTask.then(async () => {
           await synchronize(message.roomId, initialCheckpoint);
           joined = true;
-          console.log("Type a prompt and press Enter to add it to the shared queue.");
+          console.log(`${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter to add it to the shared queue.")}`);
           input = promptInput((text) => {
             if (socket.readyState !== WebSocket.OPEN) {
-              console.error("Not connected; prompt was not sent.");
+              console.error(err.warning("Not connected; prompt was not sent."));
               return;
             }
             socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
           });
         }).catch((error: unknown) => {
-          console.error(`Workspace synchronization failed: ${error instanceof Error ? error.message : String(error)}`);
+          console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
           socket.close(4005, "Workspace synchronization failed");
         });
       }
@@ -602,7 +625,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
         const roomId = joinedRoomId;
         if (!roomId) return;
         syncTask = syncTask.then(() => synchronize(roomId, message.checkpoint)).catch((error: unknown) => {
-          console.error(`Workspace synchronization failed: ${error instanceof Error ? error.message : String(error)}`);
+          console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
           socket.close(4005, "Workspace synchronization failed");
         });
       }
@@ -611,7 +634,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
     socket.once("error", reject);
     socket.once("close", (code, reason) => {
       input?.close();
-      console.error(`\nDisconnected from room${reason.length ? `: ${reason.toString()}` : ` (code ${code})`}`);
+      console.error(`\n${err.warning(`Disconnected from room${reason.length ? `: ${reason.toString()}` : ` (code ${code})`}`)}`);
       resolve();
     });
   });
@@ -623,10 +646,10 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   } finally {
     cleanupSignals();
     if (workspaceState) {
-      console.error("Restoring your original branch...");
+      console.error(err.info("↻", "Restoring your original branch…"));
       await restoreParticipantWorkspace(workspaceState);
-      console.error(`✓ Restored ${workspaceState.originalBranch ?? workspaceState.originalHead.slice(0, 12)}`);
-      if (workspaceState.backupRef) console.error(`✓ Local changes preserved at ${workspaceState.backupRef}`);
+      console.error(err.success(`${err.label("Restored")} ${err.value(workspaceState.originalBranch ?? workspaceState.originalHead.slice(0, 12))}`));
+      if (workspaceState.backupRef) console.error(err.success(`${err.label("Local changes preserved")} ${err.muted(workspaceState.backupRef)}`));
     }
   }
 }
@@ -638,12 +661,12 @@ async function serveRelay(options: { host: string; port: string; maxRooms: strin
   if (!Number.isInteger(maxRoomsPerIp) || maxRoomsPerIp < 1) throw new Error(`Invalid per-IP room limit: ${options.roomsPerIp}`);
   const relay = new RelayServer({ maxRooms, maxRoomsPerIp });
   const bound = await relay.listen({ host: options.host, port: parsePort(options.port) });
-  console.log(`✓ MultiCode relay listening on http://${bound.host}:${bound.port}`);
-  console.log(`✓ Health check: http://${bound.host}:${bound.port}/health`);
+  console.log(out.success(`${out.label("MultiCode relay")} ${out.value(`http://${bound.host}:${bound.port}`)}`));
+  console.log(out.success(`${out.label("Health check")} ${out.value(`http://${bound.host}:${bound.port}/health`)}`));
 
   await new Promise<void>((resolve) => {
     const cleanupSignals = installStopHandlers(async () => {
-      console.error("\nStopping relay...");
+      console.error(`\n${err.info("■", "Stopping relay…")}`);
       cleanupSignals();
       await relay.close();
       resolve();
@@ -727,6 +750,6 @@ relay
   .action(serveRelay);
 
 program.parseAsync().catch((error: unknown) => {
-  console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(err.error(`${err.label("Error")} ${error instanceof Error ? error.message : String(error)}`));
   process.exitCode = 1;
 });
