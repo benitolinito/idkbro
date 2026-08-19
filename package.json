@@ -12,6 +12,8 @@
     "build": "tsc -b",
     "clean": "tsc -b --clean",
     "dev": "npm run dev -w @multicode/cli",
+    "multicode": "node packages/cli/dist/index.js",
+    "relay:serve": "node packages/cli/dist/index.js relay serve",
     "test": "npm run build && vitest run",
     "typecheck": "tsc -b --pretty false"
   },

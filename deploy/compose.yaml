@@ -1,0 +1,27 @@
+name: multicode-relay
+
+services:
+  relay:
+    container_name: multicode-relay
+    image: multicode-relay:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:7337:7337"
+    environment:
+      MULTICODE_RELAY_HOST: 0.0.0.0
+      MULTICODE_RELAY_PORT: 7337
+      MULTICODE_MAX_ROOMS: ${MULTICODE_MAX_ROOMS:-100}
+      MULTICODE_ROOMS_PER_IP: ${MULTICODE_ROOMS_PER_IP:-5}
+      TZ: ${TZ:-America/New_York}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s

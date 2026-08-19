@@ -97,3 +97,103 @@ export interface AgentAdapter {
   stop(): Promise<void>;
 }
 
+export const roomClientMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("room.join"),
+    token: z.string().min(1),
+    name: z.string().trim().min(1).max(64),
+  }),
+  z.object({
+    type: z.literal("prompt.submit"),
+    promptId: z.string().min(1),
+    text: z.string().trim().min(1).max(100_000),
+  }),
+]);
+
+export type RoomClientMessage = z.infer<typeof roomClientMessageSchema>;
+
+export const workspaceDiffSchema = z.object({
+  revision: z.string().min(1),
+  text: z.string().max(250_000),
+  truncated: z.boolean(),
+  createdAt: z.string().datetime(),
+});
+
+export const relayHostMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("relay.room.create"),
+    name: z.string().trim().min(1).max(64),
+  }),
+  z.object({
+    type: z.literal("prompt.submit"),
+    promptId: z.string().min(1),
+    text: z.string().trim().min(1).max(100_000),
+  }),
+  z.object({
+    type: z.literal("relay.agent.event"),
+    event: z.object({ type: z.string().min(1) }).passthrough(),
+  }),
+  z.object({
+    type: z.literal("relay.workspace.diff"),
+    diff: workspaceDiffSchema,
+  }),
+  z.object({
+    type: z.literal("relay.prompt.failed"),
+    promptId: z.string().min(1),
+    message: z.string().min(1).max(1_000),
+  }),
+]);
+
+export interface RoomParticipant {
+  id: string;
+  name: string;
+  joinedAt: string;
+  host: boolean;
+}
+
+export interface QueuedPrompt {
+  promptId: string;
+  participantId: string;
+  participantName: string;
+  text: string;
+  submittedAt: string;
+}
+
+export interface WorkspaceDiff {
+  revision: string;
+  text: string;
+  truncated: boolean;
+  createdAt: string;
+}
+
+export type RelayHostMessage =
+  | {
+      type: "relay.room.create";
+      name: string;
+    }
+  | { type: "prompt.submit"; promptId: string; text: string }
+  | { type: "relay.agent.event"; event: AgentEvent }
+  | { type: "relay.workspace.diff"; diff: WorkspaceDiff }
+  | { type: "relay.prompt.failed"; promptId: string; message: string };
+
+export type RelayServerMessage =
+  | RoomServerMessage
+  | { type: "relay.room.created"; roomId: string; code: string };
+
+export type RoomServerMessage =
+  | {
+      type: "room.welcome";
+      roomId: string;
+      selfId: string;
+      participants: RoomParticipant[];
+      activePrompt: QueuedPrompt | null;
+      queue: QueuedPrompt[];
+      latestDiff: WorkspaceDiff | null;
+    }
+  | { type: "participant.joined"; participant: RoomParticipant }
+  | { type: "participant.left"; participantId: string; name: string }
+  | { type: "prompt.queued"; prompt: QueuedPrompt; position: number }
+  | { type: "prompt.started"; prompt: QueuedPrompt }
+  | { type: "agent.event"; event: AgentEvent }
+  | { type: "workspace.diff"; diff: WorkspaceDiff }
+  | { type: "room.error"; message: string; fatal?: boolean };

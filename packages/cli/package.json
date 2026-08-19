@@ -14,11 +14,13 @@
   "dependencies": {
     "@multicode/agent-adapters": "0.0.0",
     "@multicode/protocol": "0.0.0",
+    "@multicode/relay": "0.0.0",
     "@multicode/workspace": "0.0.0",
-    "commander": "^14.0.0"
+    "commander": "^14.0.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/ws": "^8.18.0",
     "tsx": "^4.0.0"
   }
 }
-
