@@ -1,0 +1,26 @@
+{
+  "name": "multicode",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A CLI-first collaboration layer for local coding agents.",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "dev": "npm run dev -w @multicode/cli",
+    "test": "npm run build && vitest run",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

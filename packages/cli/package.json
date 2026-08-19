@@ -1,0 +1,24 @@
+{
+  "name": "@multicode/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "multicode": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@multicode/agent-adapters": "0.0.0",
+    "@multicode/protocol": "0.0.0",
+    "@multicode/workspace": "0.0.0",
+    "commander": "^14.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}
+
