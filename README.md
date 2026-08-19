@@ -36,6 +36,12 @@ npm run build
 npm link --workspace @multicode/cli
 ```
 
+Or run the complete installation as one command:
+
+```bash
+npm run setup:cli
+```
+
 Check the hosting environment from the repository you want Codex to modify:
 
 ```bash
