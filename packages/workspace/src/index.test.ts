@@ -1,10 +1,18 @@
 import { execFile } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { createTaskWorktree, inspectRepository, sanitizeRoomId } from "./index.js";
+import {
+  applyWorkspaceCheckpoint,
+  createTaskWorktree,
+  createWorkspaceCheckpoint,
+  inspectRepository,
+  prepareParticipantWorkspace,
+  restoreParticipantWorkspace,
+  sanitizeRoomId,
+} from "./index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -38,5 +46,38 @@ describe("Git worktrees", () => {
       branch: "multicode/auth-room",
       dirty: false,
     });
+  });
+});
+
+describe("workspace checkpoints", () => {
+  it("synchronizes a participant room branch and restores local work", async () => {
+    const host = await mkdtemp(path.join(tmpdir(), "multicode-host-"));
+    const participant = await mkdtemp(path.join(tmpdir(), "multicode-participant-"));
+    await execFileAsync("git", ["init", "-q", host]);
+    await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(host, "shared.txt"), "initial\n");
+    await execFileAsync("git", ["-C", host, "add", "shared.txt"]);
+    await execFileAsync("git", ["-C", host, "commit", "-qm", "initial"]);
+    const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
+    await execFileAsync("git", ["clone", "-q", host, participant]);
+    const originalBranch = (await execFileAsync("git", ["-C", participant, "branch", "--show-current"])).stdout.trim();
+
+    await writeFile(path.join(participant, "local.txt"), "keep me\n");
+    await writeFile(path.join(host, "shared.txt"), "synchronized\n");
+    await writeFile(path.join(host, "added.txt"), "new file\n");
+    const checkpoint = await createWorkspaceCheckpoint({ cwd: host, roomId: "room-1", sequence: 1, baseCommit });
+    expect(checkpoint).not.toBeNull();
+    if (!checkpoint) throw new Error("Expected a checkpoint");
+    const state = await prepareParticipantWorkspace({ cwd: participant, roomId: "room-1", baseCommit });
+
+    await applyWorkspaceCheckpoint(state, checkpoint);
+    expect(await readFile(path.join(participant, "shared.txt"), "utf8")).toBe("synchronized\n");
+    expect(await readFile(path.join(participant, "added.txt"), "utf8")).toBe("new file\n");
+    expect((await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim()).toBe(checkpoint.commit);
+
+    await restoreParticipantWorkspace(state);
+    expect(await readFile(path.join(participant, "local.txt"), "utf8")).toBe("keep me\n");
+    expect((await execFileAsync("git", ["-C", participant, "branch", "--show-current"])).stdout.trim()).toBe(originalBranch);
   });
 });

@@ -1,6 +1,6 @@
 # MultiCode
 
-MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in an isolated Git worktree; everyone can submit prompts and watch agent output, commands, and workspace diffs in real time.
+MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in the current workspace; everyone can submit prompts and receives the same verified code checkpoints in real time.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -13,19 +13,20 @@ The public relay defaults to `wss://multicode.luisagd.com`, so the normal workfl
 Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbound WSS ── Collaborator
 ```
 
-- Only the host runs Codex and owns the repository worktree.
+- Only the host runs Codex and writes to the authoritative workspace.
 - The relay generates a random `XXXXX-XXXXX` room code.
 - Each originating IP can host at most five active rooms.
 - Anyone with a room code can join and submit prompts.
 - Prompts from all participants execute through one FIFO queue.
-- Late joiners receive the participants, active prompt, queue, and latest diff.
+- Every participant checkout follows the same synchronized room branch and commit.
+- Late joiners receive the participants, active prompt, queue, and latest workspace checkpoint.
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 20 or newer
 - Hosting: Git, an authenticated Codex CLI, and a repository with at least one commit
 - VS Code: version 1.96 or newer
-- Joining from the CLI: a built MultiCode checkout; Codex and the host's repository are not required
+- Joining: a clone containing the host's base commit; Codex is not required
 
 ## VS Code extension
 
@@ -35,12 +36,12 @@ Build and install the extension from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.1.0.vsix
+code --install-extension apps/vscode/multicode-vscode-0.2.0.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
 
-- **MultiCode: Host Room** — start Codex in an isolated worktree and copy the new room code to the clipboard.
+- **MultiCode: Host Room** — start Codex in the current workspace and copy the new room code to the clipboard.
 - **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
 - **MultiCode: Check Setup** — check Node.js, Git, Codex, and the current repository.
@@ -82,7 +83,7 @@ From the Git repository you want to work on:
 multicode host
 ```
 
-MultiCode creates an isolated worktree, starts Codex, connects to `multicode.luisagd.com`, and prints a room code:
+MultiCode starts Codex in the current checkout, connects to `multicode.luisagd.com`, and prints a room code:
 
 ```text
 Room code: K7MNP-4XQ2R
@@ -205,9 +206,11 @@ Run `multicode --help` for the full command tree. During development, every comm
 
 ## Git safety model
 
-Each hosted session starts on a new `multicode/<room-id>` branch created from the repository's committed `HEAD`. Uncommitted and untracked changes are excluded. Room creation is rejected during a merge, rebase, cherry-pick, or revert.
+The host agent works directly in the current checkout. After each completed turn, MultiCode creates a checkpoint commit through a temporary Git index, so the host's branch, index, and working tree are not changed by checkpoint creation.
 
-Worktrees are created under `~/.multicode/worktrees/`. Existing room worktrees and branches are not automatically removed when the process stops.
+Participants save staged, unstaged, and untracked work before joining, then switch to `multicode/room-<room-id>`. Checkpoints are transferred as verified Git bundles and applied with the exact host commit hash. The next prompt waits until every connected participant acknowledges the latest checkpoint. When leaving, MultiCode switches back to the original branch and reapplies saved work; a durable backup ref under `refs/multicode/backups/` remains available for recovery.
+
+Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
 
 ## Development
 
@@ -229,7 +232,7 @@ npm run package -w multicode-vscode
 | --- | --- |
 | `@multicode/cli` | Local, hosted, and participant commands |
 | `@multicode/protocol` | Shared schemas and event types |
-| `@multicode/workspace` | Git inspection and isolated worktree creation |
+| `@multicode/workspace` | Git inspection, checkpoints, branch backup, and synchronization |
 | `@multicode/agent-adapters` | Codex app-server integration |
 | `@multicode/relay` | Embedded and standalone WebSocket relays |
 | `multicode-vscode` | VS Code commands, session output, and status-bar controls |
@@ -241,4 +244,4 @@ npm run package -w multicode-vscode
 - A remote room closes if its host disconnects.
 - Approval requests are reported but cannot be resolved interactively through the CLI.
 - There is no browser client, automatic reconnect, or event replay after disconnect.
-- Worktree and branch cleanup is manual.
+- Participant room-branch and backup-ref cleanup is manual.

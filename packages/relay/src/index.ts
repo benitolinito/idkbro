@@ -7,6 +7,7 @@ import {
   type RoomParticipant,
   type RoomServerMessage,
   type WorkspaceDiff,
+  type WorkspaceCheckpoint,
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
 
@@ -37,6 +38,7 @@ export class RoomRelay {
   private readonly queue: QueuedPrompt[] = [];
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
+  private latestCheckpoint: WorkspaceCheckpoint | null = null;
   private readonly host: RoomParticipant;
 
   constructor(private readonly options: RoomRelayOptions) {
@@ -45,6 +47,7 @@ export class RoomRelay {
       name: options.hostName,
       joinedAt: new Date().toISOString(),
       host: true,
+      synced: true,
     };
   }
 
@@ -53,7 +56,7 @@ export class RoomRelay {
     const server = new WebSocketServer({
       host: options.host,
       port: options.port,
-      maxPayload: 128 * 1024,
+      maxPayload: 36 * 1024 * 1024,
       perMessageDeflate: false,
     });
     this.server = server;
@@ -99,6 +102,17 @@ export class RoomRelay {
   publishWorkspaceDiff(diff: WorkspaceDiff): void {
     this.latestDiff = diff;
     this.broadcast({ type: "workspace.diff", diff });
+  }
+
+  publishWorkspaceCheckpoint(checkpoint: WorkspaceCheckpoint): void {
+    if (this.latestCheckpoint && checkpoint.sequence <= this.latestCheckpoint.sequence) {
+      throw new Error("Workspace checkpoint sequence must increase");
+    }
+    this.latestCheckpoint = checkpoint;
+    for (const state of this.connections.values()) {
+      if (state.participant) state.participant.synced = false;
+    }
+    this.broadcast({ type: "workspace.checkpoint", checkpoint });
   }
 
   async close(): Promise<void> {
@@ -163,6 +177,27 @@ export class RoomRelay {
       return;
     }
 
+    if (parsed.data.type === "workspace.ack") {
+      if (!this.latestCheckpoint || parsed.data.sequence !== this.latestCheckpoint.sequence || parsed.data.commit !== this.latestCheckpoint.commit) {
+        this.send(socket, { type: "room.error", message: "Workspace acknowledgement does not match the latest checkpoint" });
+        return;
+      }
+      state.participant.synced = true;
+      this.broadcast({
+        type: "participant.synced",
+        participantId: state.participant.id,
+        sequence: parsed.data.sequence,
+        commit: parsed.data.commit,
+      });
+      this.dispatchNext();
+      return;
+    }
+
+    if (!state.participant.synced) {
+      this.send(socket, { type: "room.error", message: "Workspace is still synchronizing; wait before submitting prompts" });
+      return;
+    }
+
     const prompt: QueuedPrompt = {
       promptId: parsed.data.promptId,
       participantId: state.participant.id,
@@ -180,6 +215,7 @@ export class RoomRelay {
       name,
       joinedAt: new Date().toISOString(),
       host: false,
+      synced: this.latestCheckpoint === null,
     };
     state.participant = participant;
     this.send(socket, {
@@ -190,6 +226,7 @@ export class RoomRelay {
       activePrompt: this.activePrompt,
       queue: [...this.queue],
       latestDiff: this.latestDiff,
+      latestCheckpoint: this.latestCheckpoint,
     });
     this.broadcast({ type: "participant.joined", participant }, socket);
   }
@@ -205,6 +242,7 @@ export class RoomRelay {
         participantId: state.participant.id,
         name: state.participant.name,
       });
+      this.dispatchNext();
     }
   }
 
@@ -227,6 +265,7 @@ export class RoomRelay {
 
   private dispatchNext(): void {
     if (this.activePrompt || this.queue.length === 0) return;
+    if (this.participants().some((participant) => !participant.synced)) return;
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;

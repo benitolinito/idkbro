@@ -12,6 +12,7 @@ import {
   type RoomParticipant,
   type RoomServerMessage,
   type WorkspaceDiff,
+  type WorkspaceCheckpoint,
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
 
@@ -77,6 +78,7 @@ class CentralRoom {
   private readonly queue: QueuedPrompt[] = [];
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
+  private latestCheckpoint: WorkspaceCheckpoint | null = null;
   private closed = false;
   readonly host: RoomParticipant;
 
@@ -94,6 +96,7 @@ class CentralRoom {
       name: hostName,
       joinedAt: new Date().toISOString(),
       host: true,
+      synced: true,
     };
     hostSocket.on("message", (data) => this.receiveHost(data.toString()));
     hostSocket.once("close", () => this.close("Host disconnected"));
@@ -148,6 +151,7 @@ class CentralRoom {
       name,
       joinedAt: new Date().toISOString(),
       host: false,
+      synced: this.latestCheckpoint === null,
     };
     this.participants.set(socket, participant);
     send(socket, {
@@ -158,6 +162,7 @@ class CentralRoom {
       activePrompt: this.activePrompt,
       queue: [...this.queue],
       latestDiff: this.latestDiff,
+      latestCheckpoint: this.latestCheckpoint,
     });
     this.broadcast({ type: "participant.joined", participant }, socket);
 
@@ -175,12 +180,31 @@ class CentralRoom {
       return;
     }
     const parsed = roomClientMessageSchema.safeParse(value);
-    if (!parsed.success || parsed.data.type !== "prompt.submit") {
+    if (!parsed.success || parsed.data.type === "room.join") {
       send(socket, { type: "room.error", message: "Invalid participant message" });
       return;
     }
     const participant = this.participants.get(socket);
     if (!participant) return;
+    if (parsed.data.type === "workspace.ack") {
+      if (!this.latestCheckpoint || parsed.data.sequence !== this.latestCheckpoint.sequence || parsed.data.commit !== this.latestCheckpoint.commit) {
+        send(socket, { type: "room.error", message: "Workspace acknowledgement does not match the latest checkpoint" });
+        return;
+      }
+      participant.synced = true;
+      this.broadcast({
+        type: "participant.synced",
+        participantId: participant.id,
+        sequence: parsed.data.sequence,
+        commit: parsed.data.commit,
+      });
+      this.dispatchNext();
+      return;
+    }
+    if (!participant.synced) {
+      send(socket, { type: "room.error", message: "Workspace is still synchronizing; wait before submitting prompts" });
+      return;
+    }
     this.enqueue({
       promptId: parsed.data.promptId,
       participantId: participant.id,
@@ -231,6 +255,15 @@ class CentralRoom {
         this.latestDiff = message.diff;
         this.broadcast({ type: "workspace.diff", diff: message.diff }, this.hostSocket);
         break;
+      case "relay.workspace.checkpoint":
+        if (this.latestCheckpoint && message.checkpoint.sequence <= this.latestCheckpoint.sequence) {
+          send(this.hostSocket, { type: "room.error", message: "Workspace checkpoint sequence must increase" });
+          return;
+        }
+        this.latestCheckpoint = message.checkpoint;
+        for (const participant of this.participants.values()) participant.synced = false;
+        this.broadcast({ type: "workspace.checkpoint", checkpoint: message.checkpoint }, this.hostSocket);
+        break;
       case "relay.prompt.failed":
         if (this.activePrompt?.promptId !== message.promptId) return;
         this.broadcast({ type: "room.error", message: `Prompt failed on host: ${message.message}` });
@@ -254,6 +287,7 @@ class CentralRoom {
 
   private dispatchNext(): void {
     if (this.closed || this.activePrompt || this.queue.length === 0) return;
+    if ([...this.participants.values()].some((participant) => !participant.synced)) return;
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;
@@ -265,6 +299,7 @@ class CentralRoom {
     if (!participant) return;
     this.participants.delete(socket);
     this.broadcast({ type: "participant.left", participantId: participant.id, name: participant.name });
+    this.dispatchNext();
   }
 
   private broadcast(message: RoomServerMessage, except?: WebSocket): void {
@@ -295,7 +330,7 @@ export class RelayServer {
     if (this.httpServer) throw new Error("Relay server is already listening");
     const webSocketServer = new WebSocketServer({
       noServer: true,
-      maxPayload: 384 * 1024,
+      maxPayload: 36 * 1024 * 1024,
       perMessageDeflate: false,
     });
     const httpServer = createServer((request, response) => {

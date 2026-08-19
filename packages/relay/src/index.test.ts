@@ -129,4 +129,37 @@ describe("RoomRelay", () => {
     const error = await messages.next("room.error");
     expect(error).toMatchObject({ message: "Invalid room token", fatal: true });
   });
+
+  it("waits for workspace acknowledgement before dispatching prompts", async () => {
+    const dispatched: string[] = [];
+    const relay = new RoomRelay({
+      roomId: "room-1",
+      token: "secret-token",
+      hostName: "Ada",
+      onPrompt: async (prompt) => { dispatched.push(prompt.text); },
+    });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const client = await connect(port, "secret-token", "Grace");
+    sockets.push(client.socket);
+
+    relay.publishWorkspaceCheckpoint({
+      sequence: 1,
+      baseCommit: "base",
+      commit: "checkpoint",
+      ref: "refs/multicode/checkpoints/room-1",
+      bundle: "bundle",
+      createdAt: new Date().toISOString(),
+    });
+    await client.messages.next("workspace.checkpoint");
+    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
+    expect((await client.messages.next("room.error")).message).toMatch(/synchronizing/);
+    expect(dispatched).toEqual([]);
+
+    client.socket.send(JSON.stringify({ type: "workspace.ack", sequence: 1, commit: "checkpoint" }));
+    await client.messages.next("participant.synced");
+    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
+    await client.messages.next("prompt.started");
+    expect(dispatched).toEqual(["Continue"]);
+  });
 });

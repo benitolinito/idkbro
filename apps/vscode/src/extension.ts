@@ -98,7 +98,7 @@ class MultiCodeController implements vscode.Disposable {
     const activeProcess = this.process;
     setTimeout(() => {
       if (this.process === activeProcess) activeProcess.kill("SIGTERM");
-    }, 3_000);
+    }, 10_000);
   }
 
   dispose(): void {

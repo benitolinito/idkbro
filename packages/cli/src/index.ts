@@ -6,9 +6,16 @@ import { createInterface, type Interface } from "node:readline";
 import { promisify } from "node:util";
 import { Command } from "commander";
 import { CodexAppServerAdapter } from "@multicode/agent-adapters";
-import type { AgentEvent, RelayServerMessage, RoomServerMessage, WorkspaceDiff } from "@multicode/protocol";
+import type { AgentEvent, RelayServerMessage, RoomServerMessage, WorkspaceCheckpoint, WorkspaceDiff } from "@multicode/protocol";
 import { RelayServer, RoomRelay } from "@multicode/relay";
-import { createTaskWorktree, inspectRepository } from "@multicode/workspace";
+import {
+  applyWorkspaceCheckpoint,
+  createWorkspaceCheckpoint,
+  inspectRepository,
+  prepareParticipantWorkspace,
+  restoreParticipantWorkspace,
+  type ParticipantWorkspaceState,
+} from "@multicode/workspace";
 import WebSocket from "ws";
 
 const execFileAsync = promisify(execFile);
@@ -96,6 +103,12 @@ function printRoomMessage(message: RoomServerMessage, includeAgent = true): void
     case "workspace.diff":
       printWorkspaceDiff(message.diff);
       break;
+    case "workspace.checkpoint":
+      console.error(`\n↻ Workspace checkpoint ${message.checkpoint.sequence}: ${message.checkpoint.commit.slice(0, 12)}`);
+      break;
+    case "participant.synced":
+      console.error(`\n✓ Participant synchronized at checkpoint ${message.sequence}`);
+      break;
     case "room.error":
       console.error(`\nRoom error: ${message.message}`);
       break;
@@ -134,29 +147,29 @@ async function readWorkspaceDiff(cwd: string, revision: string): Promise<Workspa
 
 async function prepareRoom(dryRun = false): Promise<{
   roomId: string;
-  worktreePath?: string;
+  workspacePath?: string;
+  baseCommit?: string;
 }> {
   const repository = await inspectRepository(process.cwd());
   console.log(`✓ Repository: ${repository.root}`);
-  if (repository.dirty) console.log("! Uncommitted changes will not be included; the room starts from HEAD.");
+  if (repository.dirty) console.log("! Uncommitted and untracked changes will be included in synchronized checkpoints.");
   if (repository.operationInProgress) throw new Error("Finish the current Git operation before creating a room");
   if (dryRun) {
     console.log(`✓ Base commit: ${repository.head}`);
-    console.log("✓ Repository is ready for an isolated room");
+    console.log("✓ Repository is ready for a synchronized room");
     return { roomId: "dry-run" };
   }
 
   const roomId = randomUUID().split("-")[0] as string;
-  const worktree = await createTaskWorktree({ cwd: repository.root, roomId });
-  console.log(`✓ Branch: ${worktree.branch}`);
-  console.log(`✓ Worktree: ${worktree.path}`);
-  return { roomId, worktreePath: worktree.path };
+  console.log(`✓ Workspace: ${repository.root}`);
+  console.log(`✓ Branch: ${repository.branch ?? "detached HEAD"}`);
+  return { roomId, workspacePath: repository.root, baseCommit: repository.head };
 }
 
 async function createRoom(options: { agent: string; prompt?: string; model?: string; dryRun?: boolean }): Promise<void> {
   if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
   const room = await prepareRoom(options.dryRun);
-  if (options.dryRun || !room.worktreePath) return;
+  if (options.dryRun || !room.workspacePath) return;
 
   const adapter = new CodexAppServerAdapter();
   const stop = installStopHandlers(async () => {
@@ -166,7 +179,7 @@ async function createRoom(options: { agent: string; prompt?: string; model?: str
   const eventTask = (async () => {
     for await (const event of adapter.events()) printAgentEvent(event);
   })();
-  const { threadId } = await adapter.start({ cwd: room.worktreePath, ...(options.model ? { model: options.model } : {}) });
+  const { threadId } = await adapter.start({ cwd: room.workspacePath, ...(options.model ? { model: options.model } : {}) });
   console.log(`✓ Codex thread: ${threadId}`);
   if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
   else console.log("Room is running locally. Pass --prompt to begin a turn.");
@@ -254,8 +267,11 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   }
   if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
   const prepared = await prepareRoom();
-  if (!prepared.worktreePath) return;
-  const worktreePath = prepared.worktreePath;
+  if (!prepared.workspacePath || !prepared.baseCommit) return;
+  const workspacePath = prepared.workspacePath;
+  const baseCommit = prepared.baseCommit;
+  let checkpointSequence = 0;
+  let checkpointParent = baseCommit;
   const adapter = new CodexAppServerAdapter();
   const token = randomBytes(24).toString("base64url");
   const relay = new RoomRelay({
@@ -267,16 +283,32 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     },
     onRoomEvent: (message) => printRoomMessage(message, false),
   });
+  const publishCheckpoint = async (force = false): Promise<void> => {
+    const checkpoint = await createWorkspaceCheckpoint({
+      cwd: workspacePath,
+      roomId: prepared.roomId,
+      sequence: checkpointSequence + 1,
+      baseCommit,
+      parentCommit: checkpointParent,
+      force,
+    });
+    if (!checkpoint) return;
+    checkpointSequence = checkpoint.sequence;
+    checkpointParent = checkpoint.commit;
+    relay.publishWorkspaceCheckpoint(checkpoint);
+  };
 
   const eventTask = (async () => {
     for await (const event of adapter.events()) {
       printAgentEvent(event);
       if (event.type === "turn.completed") {
-        const diff = await readWorkspaceDiff(worktreePath, event.turnId);
+        await publishCheckpoint();
+        const diff = await readWorkspaceDiff(workspacePath, event.turnId);
         relay.publishWorkspaceDiff(diff);
         relay.publishAgentEvent(event);
         continue;
       }
+      if (event.type === "command.exited") await publishCheckpoint();
       relay.publishAgentEvent(event);
     }
   })();
@@ -294,12 +326,13 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
 
   try {
     const { threadId } = await adapter.start({
-      cwd: worktreePath,
+      cwd: workspacePath,
       ...(options.model ? { model: options.model } : {}),
     });
     console.log(`✓ Codex thread: ${threadId}`);
 
     const bound = await relay.listen({ host: options.listen, port: parsePort(options.port) });
+    await publishCheckpoint(true);
     const invite = inviteUrl({
       ...(options.publicUrl ? { publicUrl: options.publicUrl } : {}),
       listenHost: options.listen,
@@ -392,26 +425,47 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     socket = await openWebSocket(remoteUrl(relayUrl, "/host"));
     const created = await createRemoteRoom(socket, { name: options.name });
     const prepared = await prepareRoom();
-    if (!prepared.worktreePath) return;
-    const worktreePath = prepared.worktreePath;
+    if (!prepared.workspacePath || !prepared.baseCommit) return;
+    const workspacePath = prepared.workspacePath;
+    const baseCommit = prepared.baseCommit;
+    let checkpointSequence = 0;
+    let checkpointParent = baseCommit;
+    const publishCheckpoint = async (force = false): Promise<void> => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const checkpoint = await createWorkspaceCheckpoint({
+        cwd: workspacePath,
+        roomId: prepared.roomId,
+        sequence: checkpointSequence + 1,
+        baseCommit,
+        parentCommit: checkpointParent,
+        force,
+      });
+      if (!checkpoint) return;
+      checkpointSequence = checkpoint.sequence;
+      checkpointParent = checkpoint.commit;
+      socket.send(JSON.stringify({ type: "relay.workspace.checkpoint", checkpoint }));
+    };
     const eventTask = (async () => {
       for await (const event of adapter.events()) {
         printAgentEvent(event);
         if (!socket || socket.readyState !== WebSocket.OPEN) continue;
         if (event.type === "turn.completed") {
-          const diff = await readWorkspaceDiff(worktreePath, event.turnId);
+          await publishCheckpoint();
+          const diff = await readWorkspaceDiff(workspacePath, event.turnId);
           socket.send(JSON.stringify({ type: "relay.workspace.diff", diff }));
           socket.send(JSON.stringify({ type: "relay.agent.event", event }));
         } else {
+          if (event.type === "command.exited") await publishCheckpoint();
           socket.send(JSON.stringify({ type: "relay.agent.event", event }));
         }
       }
     })();
     const { threadId } = await adapter.start({
-      cwd: worktreePath,
+      cwd: workspacePath,
       ...(options.model ? { model: options.model } : {}),
     });
     console.log(`✓ Codex thread: ${threadId}`);
+    await publishCheckpoint(true);
     console.log(`✓ Remote room created at ${relayUrl}`);
     console.log(`\nRoom code: ${created.code}`);
     console.log("\nInvite someone with:");
@@ -491,7 +545,24 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
 
   const socket = new WebSocket(url);
   let joined = false;
+  let joinedRoomId: string | undefined;
   let input: Interface | undefined;
+  let workspaceState: ParticipantWorkspaceState | undefined;
+  let syncTask = Promise.resolve();
+
+  const synchronize = async (roomId: string, checkpoint: WorkspaceCheckpoint): Promise<void> => {
+    workspaceState ??= await prepareParticipantWorkspace({
+      cwd: process.cwd(),
+      roomId,
+      baseCommit: checkpoint.baseCommit,
+    });
+    await applyWorkspaceCheckpoint(workspaceState, checkpoint);
+    console.error(`\n✓ Workspace synchronized at ${checkpoint.commit.slice(0, 12)} (checkpoint ${checkpoint.sequence})`);
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "workspace.ack", sequence: checkpoint.sequence, commit: checkpoint.commit }));
+    }
+  };
+
   const closed = new Promise<void>((resolve, reject) => {
     socket.once("open", () => socket.send(JSON.stringify({ type: "room.join", token, name: options.name })));
     socket.on("message", (data) => {
@@ -504,14 +575,35 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
       }
       printRoomMessage(message);
       if (message.type === "room.welcome" && !joined) {
-        joined = true;
-        console.log("Type a prompt and press Enter to add it to the shared queue.");
-        input = promptInput((text) => {
-          if (socket.readyState !== WebSocket.OPEN) {
-            console.error("Not connected; prompt was not sent.");
-            return;
-          }
-          socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
+        if (!message.latestCheckpoint) {
+          console.error("Room has no workspace checkpoint; cannot synchronize safely.");
+          socket.close(4004, "Room has no workspace checkpoint");
+          return;
+        }
+        joinedRoomId = message.roomId;
+        const initialCheckpoint = message.latestCheckpoint;
+        syncTask = syncTask.then(async () => {
+          await synchronize(message.roomId, initialCheckpoint);
+          joined = true;
+          console.log("Type a prompt and press Enter to add it to the shared queue.");
+          input = promptInput((text) => {
+            if (socket.readyState !== WebSocket.OPEN) {
+              console.error("Not connected; prompt was not sent.");
+              return;
+            }
+            socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
+          });
+        }).catch((error: unknown) => {
+          console.error(`Workspace synchronization failed: ${error instanceof Error ? error.message : String(error)}`);
+          socket.close(4005, "Workspace synchronization failed");
+        });
+      }
+      if (message.type === "workspace.checkpoint") {
+        const roomId = joinedRoomId;
+        if (!roomId) return;
+        syncTask = syncTask.then(() => synchronize(roomId, message.checkpoint)).catch((error: unknown) => {
+          console.error(`Workspace synchronization failed: ${error instanceof Error ? error.message : String(error)}`);
+          socket.close(4005, "Workspace synchronization failed");
         });
       }
       if (message.type === "room.error" && message.fatal) socket.close();
@@ -525,8 +617,18 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   });
 
   const cleanupSignals = installStopHandlers(async () => socket.close(1000, "Participant left"));
-  await closed;
-  cleanupSignals();
+  try {
+    await closed;
+    await syncTask;
+  } finally {
+    cleanupSignals();
+    if (workspaceState) {
+      console.error("Restoring your original branch...");
+      await restoreParticipantWorkspace(workspaceState);
+      console.error(`✓ Restored ${workspaceState.originalBranch ?? workspaceState.originalHead.slice(0, 12)}`);
+      if (workspaceState.backupRef) console.error(`✓ Local changes preserved at ${workspaceState.backupRef}`);
+    }
+  }
 }
 
 async function serveRelay(options: { host: string; port: string; maxRooms: string; roomsPerIp: string }): Promise<void> {
@@ -567,11 +669,11 @@ program.command("doctor").description("Check local prerequisites").action(doctor
 const room = program.command("room").description("Manage collaboration rooms");
 room
   .command("create")
-  .description("Create an isolated local agent room")
+  .description("Create a local agent room in the current workspace")
   .option("--agent <agent>", "agent adapter", "codex")
   .option("--prompt <prompt>", "send an initial prompt")
   .option("--model <model>", "override the configured Codex model")
-  .option("--dry-run", "validate the repository without creating a worktree")
+  .option("--dry-run", "validate the repository without starting Codex")
   .action(createRoom);
 
 room

@@ -10,5 +10,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     }
+  },
+  "dependencies": {
+    "@multicode/protocol": "0.0.0"
   }
 }

@@ -108,6 +108,11 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     promptId: z.string().min(1),
     text: z.string().trim().min(1).max(100_000),
   }),
+  z.object({
+    type: z.literal("workspace.ack"),
+    sequence: z.number().int().positive(),
+    commit: z.string().min(1).max(128),
+  }),
 ]);
 
 export type RoomClientMessage = z.infer<typeof roomClientMessageSchema>;
@@ -116,6 +121,15 @@ export const workspaceDiffSchema = z.object({
   revision: z.string().min(1),
   text: z.string().max(250_000),
   truncated: z.boolean(),
+  createdAt: z.string().datetime(),
+});
+
+export const workspaceCheckpointSchema = z.object({
+  sequence: z.number().int().positive(),
+  baseCommit: z.string().min(1).max(128),
+  commit: z.string().min(1).max(128),
+  ref: z.string().min(1).max(256),
+  bundle: z.string().min(1).max(32 * 1024 * 1024),
   createdAt: z.string().datetime(),
 });
 
@@ -138,6 +152,10 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
     diff: workspaceDiffSchema,
   }),
   z.object({
+    type: z.literal("relay.workspace.checkpoint"),
+    checkpoint: workspaceCheckpointSchema,
+  }),
+  z.object({
     type: z.literal("relay.prompt.failed"),
     promptId: z.string().min(1),
     message: z.string().min(1).max(1_000),
@@ -149,6 +167,7 @@ export interface RoomParticipant {
   name: string;
   joinedAt: string;
   host: boolean;
+  synced: boolean;
 }
 
 export interface QueuedPrompt {
@@ -166,6 +185,15 @@ export interface WorkspaceDiff {
   createdAt: string;
 }
 
+export interface WorkspaceCheckpoint {
+  sequence: number;
+  baseCommit: string;
+  commit: string;
+  ref: string;
+  bundle: string;
+  createdAt: string;
+}
+
 export type RelayHostMessage =
   | {
       type: "relay.room.create";
@@ -174,6 +202,7 @@ export type RelayHostMessage =
   | { type: "prompt.submit"; promptId: string; text: string }
   | { type: "relay.agent.event"; event: AgentEvent }
   | { type: "relay.workspace.diff"; diff: WorkspaceDiff }
+  | { type: "relay.workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
   | { type: "relay.prompt.failed"; promptId: string; message: string };
 
 export type RelayServerMessage =
@@ -189,6 +218,7 @@ export type RoomServerMessage =
       activePrompt: QueuedPrompt | null;
       queue: QueuedPrompt[];
       latestDiff: WorkspaceDiff | null;
+      latestCheckpoint: WorkspaceCheckpoint | null;
     }
   | { type: "participant.joined"; participant: RoomParticipant }
   | { type: "participant.left"; participantId: string; name: string }
@@ -196,4 +226,6 @@ export type RoomServerMessage =
   | { type: "prompt.started"; prompt: QueuedPrompt }
   | { type: "agent.event"; event: AgentEvent }
   | { type: "workspace.diff"; diff: WorkspaceDiff }
+  | { type: "workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
+  | { type: "participant.synced"; participantId: string; sequence: number; commit: string }
   | { type: "room.error"; message: string; fatal?: boolean };
