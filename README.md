@@ -1,11 +1,11 @@
 # MultiCode
 
-MultiCode lets multiple people collaborate around one coding-agent session. The host runs Codex in an isolated Git worktree; everyone can submit prompts and watch agent output, commands, and workspace diffs in real time.
+MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in an isolated Git worktree; everyone can submit prompts and watch agent output, commands, and workspace diffs in real time.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
 > [!IMPORTANT]
-> MultiCode is an early terminal-based release. It includes a self-hosted relay, but there is no browser client or managed persistence yet.
+> MultiCode is an early release. It includes a VS Code extension, CLI, and self-hosted relay, but there is no browser client or managed persistence yet.
 
 ## How it works
 
@@ -24,9 +24,33 @@ Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 
 - [Node.js](https://nodejs.org/) 20 or newer
 - Hosting: Git, an authenticated Codex CLI, and a repository with at least one commit
-- Joining: a built MultiCode checkout; Codex and the host's repository are not required
+- VS Code: version 1.96 or newer
+- Joining from the CLI: a built MultiCode checkout; Codex and the host's repository are not required
 
-## Setup
+## VS Code extension
+
+Build and install the extension from this checkout:
+
+```bash
+npm install
+npm run build
+npm run package -w multicode-vscode
+code --install-extension apps/vscode/multicode-vscode-0.1.0.vsix
+```
+
+Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
+
+- **MultiCode: Host Room** — start Codex in an isolated worktree and copy the new room code to the clipboard.
+- **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
+- **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
+- **MultiCode: Check Setup** — check Node.js, Git, Codex, and the current repository.
+- **MultiCode: Stop or Leave Room** — end the current host or participant session.
+
+Room activity appears in the **MultiCode** output channel, and the status bar shows the current connection. The packaged VSIX includes the MultiCode CLI; hosts still need Git and an authenticated Codex CLI installed locally.
+
+Settings are available for the participant display name, relay URL, and an optional custom MultiCode executable. See [`apps/vscode`](apps/vscode) for extension development details.
+
+## CLI setup
 
 ```bash
 git clone https://github.com/benitolinito/idkbro
@@ -194,6 +218,13 @@ npm test           # Build and run the Vitest suite
 npm run clean      # Remove TypeScript build outputs
 ```
 
+Build and package the VS Code extension:
+
+```bash
+npm run build
+npm run package -w multicode-vscode
+```
+
 | Package | Responsibility |
 | --- | --- |
 | `@multicode/cli` | Local, hosted, and participant commands |
@@ -201,6 +232,7 @@ npm run clean      # Remove TypeScript build outputs
 | `@multicode/workspace` | Git inspection and isolated worktree creation |
 | `@multicode/agent-adapters` | Codex app-server integration |
 | `@multicode/relay` | Embedded and standalone WebSocket relays |
+| `multicode-vscode` | VS Code commands, session output, and status-bar controls |
 
 ## Current limitations
 

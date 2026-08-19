@@ -1,0 +1,103 @@
+{
+  "name": "multicode-vscode",
+  "displayName": "MultiCode",
+  "description": "Host and join collaborative Codex sessions from VS Code.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "multicode",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benitolinito/idkbro.git"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "codex",
+    "collaboration",
+    "pair programming"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onCommand:multicode.host",
+    "onCommand:multicode.join",
+    "onCommand:multicode.sendPrompt",
+    "onCommand:multicode.doctor",
+    "onCommand:multicode.stop"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "multicode.host",
+        "title": "MultiCode: Host Room",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "multicode.join",
+        "title": "MultiCode: Join Room",
+        "icon": "$(people)"
+      },
+      {
+        "command": "multicode.sendPrompt",
+        "title": "MultiCode: Send Prompt",
+        "icon": "$(send)"
+      },
+      {
+        "command": "multicode.doctor",
+        "title": "MultiCode: Check Setup"
+      },
+      {
+        "command": "multicode.stop",
+        "title": "MultiCode: Stop or Leave Room",
+        "icon": "$(debug-stop)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "multicode.sendPrompt",
+          "when": "multicode.connected"
+        },
+        {
+          "command": "multicode.stop",
+          "when": "multicode.connected"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "MultiCode",
+      "properties": {
+        "multicode.executable": {
+          "type": "string",
+          "default": "multicode",
+          "description": "Path to the MultiCode CLI executable. The development checkout is detected automatically."
+        },
+        "multicode.displayName": {
+          "type": "string",
+          "default": "",
+          "description": "Name shown to other room participants. Leave blank to use your operating-system username."
+        },
+        "multicode.relayUrl": {
+          "type": "string",
+          "default": "wss://multicode.luisagd.com",
+          "description": "WebSocket relay used when hosting or joining rooms."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js && esbuild ../../packages/cli/src/index.ts --bundle --platform=node --format=cjs --outfile=dist/multicode-cli.cjs",
+    "package": "npm run bundle && vsce package --no-dependencies",
+    "clean": "tsc -b --clean"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.6.2",
+    "esbuild": "^0.25.0"
+  }
+}
