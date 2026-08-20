@@ -18,10 +18,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
   relay:
     container_name: multicode-relay
     image: multicode-relay:local
