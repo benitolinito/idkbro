@@ -41,6 +41,8 @@ const err = {
   muted: (value: string) => chalkStderr.dim(value),
 };
 
+const streamingReasoningItems = new Set<string>();
+
 async function versionOf(command: string, args: string[]): Promise<string | null> {
   try {
     const { stdout, stderr } = await execFileAsync(command, args, { encoding: "utf8" });
@@ -80,6 +82,20 @@ async function doctor(): Promise<void> {
 
 function printAgentEvent(event: AgentEvent): void {
   switch (event.type) {
+    case "agent.reasoning.delta":
+      if (!streamingReasoningItems.has(event.itemId)) {
+        streamingReasoningItems.add(event.itemId);
+        process.stdout.write(`\n${chalk.cyan("◆")} ${chalk.bold("Thinking")}\n`);
+      }
+      process.stdout.write(chalk.dim(event.text));
+      break;
+    case "agent.reasoning.completed":
+      if (streamingReasoningItems.delete(event.itemId)) {
+        process.stdout.write("\n");
+      } else if (event.text) {
+        process.stdout.write(`\n${chalk.cyan("◆")} ${chalk.bold("Thinking")}\n${chalk.dim(event.text)}\n`);
+      }
+      break;
     case "agent.message.delta":
     case "command.output":
       process.stdout.write(event.text);

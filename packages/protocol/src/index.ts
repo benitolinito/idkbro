@@ -17,6 +17,8 @@ export const roomEventTypeSchema = z.enum([
   "agent.started",
   "agent.message.delta",
   "agent.message.completed",
+  "agent.reasoning.delta",
+  "agent.reasoning.completed",
   "agent.interrupted",
   "agent.exited",
   "turn.started",
@@ -76,6 +78,8 @@ export type AgentEvent =
   | { type: "turn.completed"; threadId: string; turnId: string; status?: string }
   | { type: "agent.message.delta"; threadId: string; turnId: string; itemId: string; text: string }
   | { type: "agent.message.completed"; threadId: string; turnId: string; itemId: string; text: string }
+  | { type: "agent.reasoning.delta"; threadId: string; turnId: string; itemId: string; text: string }
+  | { type: "agent.reasoning.completed"; threadId: string; turnId: string; itemId: string; text: string }
   | { type: "command.started"; threadId: string; turnId: string; itemId: string; command: string; cwd?: string }
   | { type: "command.output"; threadId: string; turnId: string; itemId: string; text: string }
   | { type: "command.exited"; threadId: string; turnId: string; itemId: string; exitCode: number | null; output?: string }

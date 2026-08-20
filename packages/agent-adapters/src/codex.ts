@@ -68,6 +68,16 @@ function numberOrNull(value: unknown): number | null {
 export function normalizeCodexMessage(message: JsonRpcMessage): AgentEvent | undefined {
   const params = object(message.params);
 
+  if (message.method === "item/reasoning/summaryTextDelta" && params) {
+    return {
+      type: "agent.reasoning.delta",
+      threadId: string(params.threadId) ?? "",
+      turnId: string(params.turnId) ?? "",
+      itemId: string(params.itemId) ?? "",
+      text: string(params.delta) ?? "",
+    };
+  }
+
   if (message.method === "item/agentMessage/delta" && params) {
     return {
       type: "agent.message.delta",
@@ -118,6 +128,22 @@ export function normalizeCodexMessage(message: JsonRpcMessage): AgentEvent | und
           turnId: string(params.turnId) ?? "",
           itemId: string(item.id) ?? "",
           text: string(item.text) ?? "",
+        };
+      }
+      return undefined;
+    }
+
+    if (item?.type === "reasoning") {
+      if (message.method === "item/completed") {
+        const summary = Array.isArray(item.summary)
+          ? item.summary.filter((part): part is string => typeof part === "string").join("\n")
+          : "";
+        return {
+          type: "agent.reasoning.completed",
+          threadId: string(params.threadId) ?? "",
+          turnId: string(params.turnId) ?? "",
+          itemId: string(item.id) ?? "",
+          text: summary,
         };
       }
       return undefined;
@@ -218,6 +244,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       threadId: this.threadId,
       clientUserMessageId: prompt.promptId,
       input: [{ type: "text", text: prompt.text }],
+      summary: "auto",
     });
     const turn = object(result.turn);
     const turnId = string(turn?.id);

@@ -82,6 +82,12 @@ describe("RelayServer", () => {
       event: { type: "agent.message.delta", threadId: "t1", turnId: "u1", itemId: "i1", text: "Working" },
     }));
     expect((await participant.messages.next("agent.event")).event).toMatchObject({ type: "agent.message.delta", text: "Working" });
+
+    host.socket.send(JSON.stringify({
+      type: "relay.agent.event",
+      event: { type: "agent.reasoning.delta", threadId: "t1", turnId: "u1", itemId: "r1", text: "Inspecting" },
+    }));
+    expect((await participant.messages.next("agent.event")).event).toMatchObject({ type: "agent.reasoning.delta", text: "Inspecting" });
   });
 
   it("limits each originating IP to five active rooms", async () => {

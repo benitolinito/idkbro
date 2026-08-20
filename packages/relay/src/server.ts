@@ -50,6 +50,8 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
   "turn.completed",
   "agent.message.delta",
   "agent.message.completed",
+  "agent.reasoning.delta",
+  "agent.reasoning.completed",
   "command.started",
   "command.output",
   "command.exited",

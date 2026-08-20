@@ -31,5 +31,38 @@ describe("normalizeCodexMessage", () => {
       details: { threadId: "thr_1", command: "npm test" },
     });
   });
-});
 
+  it("normalizes streamed Codex reasoning summaries", () => {
+    expect(
+      normalizeCodexMessage({
+        method: "item/reasoning/summaryTextDelta",
+        params: { threadId: "thr_1", turnId: "turn_1", itemId: "reason_1", delta: "Inspecting the code" },
+      }),
+    ).toEqual({
+      type: "agent.reasoning.delta",
+      threadId: "thr_1",
+      turnId: "turn_1",
+      itemId: "reason_1",
+      text: "Inspecting the code",
+    });
+  });
+
+  it("normalizes completed Codex reasoning summaries", () => {
+    expect(
+      normalizeCodexMessage({
+        method: "item/completed",
+        params: {
+          threadId: "thr_1",
+          turnId: "turn_1",
+          item: { type: "reasoning", id: "reason_1", summary: ["Inspecting", "Implementing"] },
+        },
+      }),
+    ).toEqual({
+      type: "agent.reasoning.completed",
+      threadId: "thr_1",
+      turnId: "turn_1",
+      itemId: "reason_1",
+      text: "Inspecting\nImplementing",
+    });
+  });
+});
