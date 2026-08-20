@@ -13,6 +13,7 @@ import { CodexAppServerAdapter } from "@multicode/agent-adapters";
 import { HostSession, LocalIpcServer, loadOrCreateRoomSecret, loadOrCreateSessionEpoch, PostgresJournal, requestLocalIpc, roomSecret, SqliteJournal, writeSessionToken, type WorkspaceTransactionOperation } from "@multicode/session-core";
 import {
   checkpointChunkBytes,
+  isSensitiveWorkspacePath,
   type AgentEvent,
   type CollaborationEvent,
   type Capability,
@@ -511,8 +512,7 @@ class RoomAuthority {
     if (path.resolve(directory) !== path.resolve(this.workspacePath)) return;
     const listed = (await execFileAsync("git", ["-C", this.workspacePath, "ls-files", "-c", "-o", "--exclude-standard", "-z"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })).stdout;
     for (const relative of listed.split("\0").filter(Boolean)) {
-      const name = path.posix.basename(relative);
-      if (/(^|\/)(node_modules|dist|build|\.cache|coverage)(\/|$)/.test(relative) || name === ".env" || name.startsWith(".env.") || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name)) continue;
+      if (/(^|\/)(node_modules|dist|build|\.cache|coverage)(\/|$)/.test(relative) || isSensitiveWorkspacePath(relative)) continue;
       const { target: absolute } = safeRoomFile(this.workspacePath, relative);
       if (preserveAuthoritative && this.session.manifest.fileByPath(relative)) continue;
       try {
@@ -530,8 +530,8 @@ class RoomAuthority {
   }
 
   private async assertCollaborativePolicy(file: string): Promise<void> {
-    safeRoomFile(this.workspacePath, file); const name = path.posix.basename(file);
-    if (/(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || name === ".env" || name.startsWith(".env.") || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name)) throw new Error("Path is excluded by the room sharing policy");
+    safeRoomFile(this.workspacePath, file);
+    if (/(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) throw new Error("Path is excluded by the room sharing policy");
     try { await execFileAsync("git", ["-C", this.workspacePath, "check-ignore", "-q", "--", file]); throw new Error("Path is ignored by the room sharing policy"); }
     catch (error) { if ((error as NodeJS.ErrnoException & { code?: number }).code !== 1) throw error; }
   }
@@ -664,7 +664,7 @@ class AgentPreviewWatcher {
     try {
       this.watcher = watch(this.agentPath, { recursive: true }, (_event, filename) => {
         const file = filename?.toString().split(path.sep).join("/") ?? "";
-        if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env/.test(file)) return;
+        if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return;
         this.schedule();
       });
     } catch { /* Periodic reconciliation below is the portable watcher fallback. */ }
@@ -696,7 +696,7 @@ class SharedWorkspaceWatcher {
   private watcher: FSWatcher | undefined; private timer: ReturnType<typeof setTimeout> | undefined; private interval: ReturnType<typeof setInterval> | undefined; private reconciling = false; private pending = false;
   constructor(private readonly workspacePath: string, private readonly reconcile: () => Promise<void>) {}
   start(): void {
-    try { this.watcher = watch(this.workspacePath, { recursive: true }, (_event, filename) => { const file = filename?.toString().split(path.sep).join("/") ?? ""; if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env(?:\.|$)/.test(file)) return; this.schedule(); }); }
+    try { this.watcher = watch(this.workspacePath, { recursive: true }, (_event, filename) => { const file = filename?.toString().split(path.sep).join("/") ?? ""; if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return; this.schedule(); }); }
     catch { /* Periodic reconciliation remains active on platforms without recursive fs.watch. */ }
     this.interval = setInterval(() => this.schedule(), 2_000); this.interval.unref();
   }
@@ -716,7 +716,7 @@ async function prepareRoom(dryRun = false, includeSensitive = false): Promise<{
     throw new Error(`Refusing to host from a MultiCode ${managedWorktree.role} worktree. Open the original repository at ${managedWorktree.repositoryRoot}`);
   }
   const tracked = (await execFileAsync("git", ["-C", repository.root, "ls-files", "-z"], { encoding: "utf8" })).stdout.split("\0").filter(Boolean);
-  const sensitive = tracked.filter((file) => file.split("/").some((name) => name === ".env" || name.startsWith(".env.") || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name)));
+  const sensitive = tracked.filter(isSensitiveWorkspacePath);
   if (sensitive.length && !includeSensitive) throw new Error(`Tracked sensitive files require explicit confirmation: ${sensitive.slice(0, 5).join(", ")}. Re-run with --include-sensitive only if every participant may receive them.`);
   console.log(out.success(`${out.label("Repository")} ${out.value(repository.root)}`));
   if (repository.dirty) console.log(out.warning("Uncommitted and untracked changes will be included in synchronized checkpoints."));

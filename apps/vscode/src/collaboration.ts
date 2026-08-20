@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import * as vscode from "vscode";
 import WebSocket from "ws";
 import * as Y from "yjs";
+import { isSensitiveWorkspacePath } from "@multicode/protocol";
 import type { AgentEvent, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
 
 interface EncryptedUpdate { file: string; nonce: string; tag: string; ciphertext: string; }
@@ -285,7 +286,7 @@ export class CollaborationBridge implements vscode.Disposable {
   }
   private subscribe(document: vscode.TextDocument): void {
     const file = this.file(document);
-    if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env(?:\.|$)/.test(file) || /(^|\/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx))$/i.test(file)) return;
+    if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return;
     void this.isIgnored(file).then((ignored) => { if (!ignored) this.subscribeFile(file); });
   }
   private subscribeFile(file: string): void {
@@ -403,7 +404,7 @@ export class CollaborationBridge implements vscode.Disposable {
   }
   private scheduleExternalChange(uri: vscode.Uri): void {
     if (this.applyingRemoteManifest) return;
-    const file = this.relativeFile(uri); if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env(?:\.|$)/.test(file)) return;
+    const file = this.relativeFile(uri); if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return;
     if (path.posix.basename(file) === ".gitignore") this.ignoredPaths.clear();
     const existing = this.externalChangeTimers.get(file); if (existing) clearTimeout(existing);
     this.externalChangeTimers.set(file, setTimeout(() => { this.externalChangeTimers.delete(file); void this.importExternalChange(uri, file); }, 150));
@@ -435,7 +436,7 @@ export class CollaborationBridge implements vscode.Disposable {
     } catch { /* Ignore transient, binary, deleted, and unsupported external writes. */ }
   }
   private async isIgnored(file: string): Promise<boolean> {
-    if (/(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env(?:\.|$)/.test(file) || /(^|\/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx))$/i.test(file)) return true;
+    if (/(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return true;
     const cached = this.ignoredPaths.get(file); if (cached !== undefined) return cached;
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath; if (!root) return true;
     try { await execFileAsync("git", ["-C", root, "check-ignore", "-q", "--", file]); this.ignoredPaths.set(file, true); return true; }

@@ -1,5 +1,17 @@
 import { z } from "zod";
 
+const shareableEnvironmentTemplates = new Set([".env.example", ".env.sample", ".env.template"]);
+
+export function isSensitiveWorkspacePath(file: string): boolean {
+  return file.split(/[\\/]/).some((segment) => {
+    const name = segment.toLowerCase();
+    if (shareableEnvironmentTemplates.has(name)) return false;
+    return name === ".env"
+      || name.startsWith(".env.")
+      || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name);
+  });
+}
+
 export const actorTypeSchema = z.enum(["human", "agent", "system"]);
 
 export const roomEventTypeSchema = z.enum([
