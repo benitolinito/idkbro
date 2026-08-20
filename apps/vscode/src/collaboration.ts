@@ -27,16 +27,30 @@ export class CollaborationBridge implements vscode.Disposable {
   }
 
   connect(relayUrl: string, inviteToken: string, name: string): void {
+    if (
+      this.relayUrl === relayUrl
+      && this.inviteToken === inviteToken
+      && this.displayName === name
+      && (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING)
+    ) return;
+
     this.disconnect();
     this.relayUrl = relayUrl; this.inviteToken = inviteToken; this.displayName = name;
     const [code, secret] = inviteToken.split(".", 2);
     if (!code || !secret) throw new Error("Invalid MultiCode room token");
     this.key = Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(code), Buffer.from("multicode/v2/editor"), 32));
     const base = new URL(relayUrl); base.pathname = `${base.pathname.replace(/\/$/, "")}/rooms/${code}`;
-    this.socket = new WebSocket(base);
-    this.socket.on("open", () => this.socket?.send(JSON.stringify({ type: "room.join", token: code, name })));
-    this.socket.on("message", (data) => void this.receive(data.toString()));
-    this.socket.on("close", () => { if (this.inviteToken) { this.reconnectTimer = setTimeout(() => this.connect(this.relayUrl, this.inviteToken, this.displayName), 5_000); } });
+    const socket = new WebSocket(base);
+    this.socket = socket;
+    socket.on("open", () => socket.send(JSON.stringify({ type: "room.join", token: code, name })));
+    socket.on("message", (data) => void this.receive(data.toString()));
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.socket = undefined;
+      if (this.inviteToken) {
+        this.reconnectTimer = setTimeout(() => this.connect(this.relayUrl, this.inviteToken, this.displayName), 5_000);
+      }
+    });
   }
 
   disconnect(): void { if (this.reconnectTimer) clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; const socket = this.socket; this.socket = undefined; this.key = undefined; this.inviteToken = ""; socket?.close(); }

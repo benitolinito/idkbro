@@ -167,7 +167,7 @@ class MultiCodeController implements vscode.Disposable {
     }
     if (this.mode === "host") {
       const match = this.recentOutput.match(/Room token:\s*([A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}\.[A-Za-z0-9_-]{40,})/i);
-      if (match?.[1]) {
+      if (match?.[1] && match[1] !== this.roomCode) {
         this.roomCode = match[1];
         this.status.text = `$(broadcast) MultiCode: ${this.roomCode.slice(0, 11)}`;
         this.status.tooltip = "Click to send a prompt";
