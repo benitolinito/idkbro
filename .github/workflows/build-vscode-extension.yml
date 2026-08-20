@@ -1,0 +1,62 @@
+name: Build VS Code extension
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-vscode-extension.yml"
+      - "apps/vscode/**"
+      - "packages/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "tsconfig.base.json"
+      - "vitest.config.ts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vscode-extension-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and package VSIX
+    runs-on: self-hosted
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      - name: Package extension
+        run: npm run package -w multicode-vscode
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v7
+        with:
+          name: multicode-vscode-${{ github.run_number }}
+          path: apps/vscode/multicode-vscode-*.vsix
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
