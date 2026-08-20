@@ -13,7 +13,8 @@ export interface RelayRoomStore {
 export class PostgresRelayRoomStore implements RelayRoomStore {
   private readonly pool: Pool;
   constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString, ssl: connectionString.includes("localhost") || connectionString.includes("127.0.0.1") ? false : { rejectUnauthorized: true } });
+    const sslDisabled = /(?:^|[?&])sslmode=disable(?:&|$)/i.test(connectionString);
+    this.pool = new Pool({ connectionString, ssl: sslDisabled || connectionString.includes("localhost") || connectionString.includes("127.0.0.1") ? false : { rejectUnauthorized: true } });
   }
   async migrate(): Promise<void> {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS multicode_relay_rooms (
