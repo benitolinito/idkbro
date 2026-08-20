@@ -7,5 +7,8 @@
     "tsBuildInfoFile": "dist/.tsbuildinfo",
     "types": ["node", "vscode"]
   },
+  "references": [
+    { "path": "../../packages/workspace" }
+  ],
   "include": ["src/**/*.ts"]
 }

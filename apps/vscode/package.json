@@ -24,6 +24,7 @@
   "main": "./dist/extension.js",
   "dependencies": {
     "@multicode/protocol": "0.0.0",
+    "@multicode/workspace": "0.0.0",
     "ws": "^8.18.0",
     "yjs": "^13.6.27"
   },

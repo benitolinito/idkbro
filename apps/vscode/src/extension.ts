@@ -5,6 +5,7 @@ import path from "node:path";
 import * as vscode from "vscode";
 import { MultiCodeChatView } from "./chat-view.js";
 import { CollaborationBridge } from "./collaboration.js";
+import { resolveHostingDirectory } from "./host-workspace.js";
 import { roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 
 type SessionMode = "host" | "join";
@@ -50,8 +51,9 @@ class MultiCodeController implements vscode.Disposable {
 
   async host(): Promise<void> {
     if (!this.ensureIdle()) return;
-    const cwd = this.workspaceDirectory();
-    if (!cwd) return;
+    const workspaceDirectory = this.workspaceDirectory();
+    if (!workspaceDirectory) return;
+    const cwd = await resolveHostingDirectory(workspaceDirectory);
 
     const config = vscode.workspace.getConfiguration("multicode");
     const name = config.get<string>("displayName")?.trim() || this.defaultName();
