@@ -113,6 +113,12 @@ multicode join K7MNP-4XQ2R --name "Grace"
 
 ## Self-host the relay on a Raspberry Pi
 
+> [!IMPORTANT]
+> Protocol v2 introduces the host session daemon and PostgreSQL-backed encrypted
+> journal. Set `MULTICODE_POSTGRES_USER` and `MULTICODE_POSTGRES_PASSWORD` before
+> starting the deployment. The database stores encrypted room records only; a
+> host daemon needs a TLS-protected `MULTICODE_DATABASE_URL` to acknowledge edits.
+
 The included deployment is a completely separate Compose project. It does not modify or join an existing Compose project or Docker network.
 
 ### 1. Clone and start it
@@ -180,11 +186,27 @@ Optional limits can be changed in `deploy/.env`:
 MULTICODE_MAX_ROOMS=100
 MULTICODE_ROOMS_PER_IP=5
 TZ=America/New_York
+MULTICODE_POSTGRES_USER=multicode
+MULTICODE_POSTGRES_PASSWORD=use-a-long-random-secret
 ```
 
 The relay uses Cloudflare's `CF-Connecting-IP` header when enforcing the per-IP limit and falls back to the direct socket address outside Cloudflare.
 
 ## Advanced usage
+
+### Protocol-v2 session daemon
+
+The v2 daemon owns local room state and exposes a user-only local IPC socket. It
+requires PostgreSQL and creates a token under `~/.multicode/sessions/<room>/`:
+
+```bash
+MULTICODE_DATABASE_URL='postgresql://…?sslmode=require' \
+  multicode session --session my-room
+```
+
+Room source, prompts, document updates, and previews are encrypted before they
+are written to PostgreSQL or forwarded through a relay. Invite URLs carry their
+room key in the URL fragment; do not share a room code separately from its invite.
 
 Override the public relay:
 

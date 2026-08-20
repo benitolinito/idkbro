@@ -233,3 +233,76 @@ export type RoomServerMessage =
   | { type: "workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
   | { type: "participant.synced"; participantId: string; sequence: number; commit: string }
   | { type: "room.error"; message: string; fatal?: boolean };
+
+// Protocol v2 deliberately keeps routing metadata separate from encrypted payloads.
+// Relays may validate limits and ordering without learning workspace content.
+export const protocolVersion = 2 as const;
+export const maxFrameBytes = 256 * 1024;
+
+export const v2PayloadTypeSchema = z.enum([
+  "session.hello", "session.welcome", "session.resume", "session.error", "session.goodbye",
+  "member.joined", "member.left", "member.capability", "presence.update",
+  "manifest.snapshot", "manifest.operation", "manifest.ack", "manifest.resync",
+  "document.subscribe", "document.unsubscribe", "document.snapshot", "document.update", "document.ack", "document.resync",
+  "agent.prompt", "agent.event", "agent.preview", "agent.completed", "agent.failed",
+  "workspace.prepare", "workspace.part", "workspace.finalize", "workspace.abort", "workspace.proposal",
+  "blob.chunk", "blob.complete",
+]);
+
+export const envelopeV2Schema = z.object({
+  protocolVersion: z.literal(protocolVersion),
+  roomId: z.string().min(1).max(128),
+  sessionEpoch: z.string().min(16).max(256),
+  messageId: z.string().uuid(),
+  actorId: z.string().min(1).max(128),
+  sequence: z.number().int().nonnegative().optional(),
+  correlationId: z.string().uuid().optional(),
+  payloadType: v2PayloadTypeSchema,
+  payloadLength: z.number().int().nonnegative().max(maxFrameBytes).optional(),
+  payloadHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+});
+export type EnvelopeV2 = z.infer<typeof envelopeV2Schema>;
+export type V2PayloadType = z.infer<typeof v2PayloadTypeSchema>;
+
+export const binaryFrameHeaderSchema = envelopeV2Schema.extend({
+  payloadLength: z.number().int().min(1).max(maxFrameBytes),
+  payloadHash: z.string().regex(/^[a-f0-9]{64}$/),
+  chunkIndex: z.number().int().nonnegative(),
+  chunkCount: z.number().int().positive().max(16_384),
+});
+export type BinaryFrameHeader = z.infer<typeof binaryFrameHeaderSchema>;
+
+export interface BinaryFrame {
+  header: BinaryFrameHeader;
+  payload: Uint8Array;
+}
+
+export function encodeBinaryFrame(frame: BinaryFrame): Uint8Array {
+  const header = binaryFrameHeaderSchema.parse(frame.header);
+  if (frame.payload.byteLength !== header.payloadLength) throw new Error("Binary frame length does not match header");
+  const encodedHeader = new TextEncoder().encode(JSON.stringify(header));
+  if (encodedHeader.byteLength > 16_384) throw new Error("Binary frame header exceeds 16 KiB");
+  const result = new Uint8Array(4 + encodedHeader.byteLength + frame.payload.byteLength);
+  new DataView(result.buffer).setUint32(0, encodedHeader.byteLength);
+  result.set(encodedHeader, 4);
+  result.set(frame.payload, 4 + encodedHeader.byteLength);
+  return result;
+}
+
+export function decodeBinaryFrame(value: Uint8Array): BinaryFrame {
+  if (value.byteLength < 5) throw new Error("Binary frame is too short");
+  const headerLength = new DataView(value.buffer, value.byteOffset, value.byteLength).getUint32(0);
+  if (headerLength < 2 || headerLength > 16_384 || 4 + headerLength >= value.byteLength) throw new Error("Invalid binary frame header length");
+  const header = binaryFrameHeaderSchema.parse(JSON.parse(new TextDecoder().decode(value.slice(4, 4 + headerLength))));
+  const payload = value.slice(4 + headerLength);
+  if (payload.byteLength !== header.payloadLength) throw new Error("Binary frame payload length does not match header");
+  return { header, payload };
+}
+
+export function chunkBytes(payload: Uint8Array, chunkSize = maxFrameBytes): Uint8Array[] {
+  if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > maxFrameBytes) throw new Error("Invalid chunk size");
+  if (!payload.byteLength) return [new Uint8Array()];
+  const chunks: Uint8Array[] = [];
+  for (let offset = 0; offset < payload.byteLength; offset += chunkSize) chunks.push(payload.slice(offset, offset + chunkSize));
+  return chunks;
+}

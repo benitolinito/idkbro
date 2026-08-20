@@ -15,11 +15,15 @@ import {
   type WorkspaceCheckpoint,
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
+import type { RelayRoomStore } from "./store.js";
+
+const maxRelayFrameBytes = 256 * 1024;
 
 export interface RelayServerOptions {
   maxRooms?: number;
   maxRoomsPerIp?: number;
   authenticationTimeoutMs?: number;
+  store?: RelayRoomStore;
 }
 
 const roomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -203,10 +207,6 @@ class CentralRoom {
       this.dispatchNext();
       return;
     }
-    if (!participant.synced) {
-      send(socket, { type: "room.error", message: "Workspace is still synchronizing; wait before submitting prompts" });
-      return;
-    }
     this.enqueue({
       promptId: parsed.data.promptId,
       participantId: participant.id,
@@ -289,7 +289,6 @@ class CentralRoom {
 
   private dispatchNext(): void {
     if (this.closed || this.activePrompt || this.queue.length === 0) return;
-    if ([...this.participants.values()].some((participant) => !participant.synced)) return;
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;
@@ -330,9 +329,10 @@ export class RelayServer {
 
   async listen(options: { host: string; port: number }): Promise<{ host: string; port: number }> {
     if (this.httpServer) throw new Error("Relay server is already listening");
+    await this.options.store?.migrate();
     const webSocketServer = new WebSocketServer({
       noServer: true,
-      maxPayload: 36 * 1024 * 1024,
+      maxPayload: maxRelayFrameBytes,
       perMessageDeflate: false,
     });
     const httpServer = createServer((request, response) => {
@@ -355,7 +355,7 @@ export class RelayServer {
         return;
       }
       webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-        if (pathname === "/host") this.acceptHost(webSocket, originatingIp(request));
+      if (pathname === "/host") void this.acceptHost(webSocket, originatingIp(request));
         else this.acceptParticipant(webSocket, canonicalRoomCode(roomMatch?.[1] ?? ""));
       });
     });
@@ -399,11 +399,12 @@ export class RelayServer {
       webSocketServer.close();
     }
     if (httpServer) await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await this.options.store?.close();
   }
 
-  private acceptHost(socket: WebSocket, ownerIp: string): void {
+  private async acceptHost(socket: WebSocket, ownerIp: string): Promise<void> {
     const timer = setTimeout(() => reject(socket, "Room creation timed out", 4001), this.authenticationTimeoutMs);
-    socket.once("message", (data) => {
+    socket.once("message", (data) => { void (async () => {
       clearTimeout(timer);
       let value: unknown;
       try {
@@ -437,11 +438,14 @@ export class RelayServer {
         creation.name,
         ownerIp,
         this.authenticationTimeoutMs,
-        () => this.rooms.delete(roomId),
+        () => { this.rooms.delete(roomId); void this.options.store?.roomClosed(roomId); },
       );
       this.rooms.set(roomId, room);
+      try { await this.options.store?.roomOpened({ roomId, ownerIp }); } catch (error) {
+        this.rooms.delete(roomId); room.close("Relay persistence failed"); reject(socket, error instanceof Error ? error.message : "Relay persistence failed", 1011); return;
+      }
       send(socket, { type: "relay.room.created", roomId, code });
-    });
+    })(); });
     socket.once("close", () => clearTimeout(timer));
   }
 

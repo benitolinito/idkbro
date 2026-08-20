@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyWorkspaceCheckpoint,
   createTaskWorktree,
+  createRoomWorktrees,
   createWorkspaceCheckpoint,
   inspectRepository,
   prepareParticipantWorkspace,
@@ -50,9 +51,10 @@ describe("Git worktrees", () => {
 });
 
 describe("workspace checkpoints", () => {
-  it("synchronizes a participant room branch and restores local work", async () => {
+  it("synchronizes only an isolated participant room worktree", async () => {
     const host = await mkdtemp(path.join(tmpdir(), "multicode-host-"));
     const participant = await mkdtemp(path.join(tmpdir(), "multicode-participant-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-participant-data-"));
     await execFileAsync("git", ["init", "-q", host]);
     await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
     await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
@@ -61,7 +63,7 @@ describe("workspace checkpoints", () => {
     await execFileAsync("git", ["-C", host, "commit", "-qm", "initial"]);
     const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
     await execFileAsync("git", ["clone", "-q", host, participant]);
-    const originalBranch = (await execFileAsync("git", ["-C", participant, "branch", "--show-current"])).stdout.trim();
+    const originalHead = (await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim();
 
     await writeFile(path.join(participant, "local.txt"), "keep me\n");
     await writeFile(path.join(host, "shared.txt"), "synchronized\n");
@@ -69,15 +71,35 @@ describe("workspace checkpoints", () => {
     const checkpoint = await createWorkspaceCheckpoint({ cwd: host, roomId: "room-1", sequence: 1, baseCommit });
     expect(checkpoint).not.toBeNull();
     if (!checkpoint) throw new Error("Expected a checkpoint");
-    const state = await prepareParticipantWorkspace({ cwd: participant, roomId: "room-1", baseCommit });
+    const state = await prepareParticipantWorkspace({ cwd: participant, roomId: "room-1", baseCommit, dataDirectory });
 
     await applyWorkspaceCheckpoint(state, checkpoint);
-    expect(await readFile(path.join(participant, "shared.txt"), "utf8")).toBe("synchronized\n");
-    expect(await readFile(path.join(participant, "added.txt"), "utf8")).toBe("new file\n");
-    expect((await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim()).toBe(checkpoint.commit);
+    expect(await readFile(path.join(state.root, "shared.txt"), "utf8")).toBe("synchronized\n");
+    expect(await readFile(path.join(state.root, "added.txt"), "utf8")).toBe("new file\n");
+    expect((await execFileAsync("git", ["-C", state.root, "rev-parse", "HEAD"])).stdout.trim()).toBe(checkpoint.commit);
+    expect(await readFile(path.join(participant, "shared.txt"), "utf8")).toBe("initial\n");
+    expect(await readFile(path.join(participant, "local.txt"), "utf8")).toBe("keep me\n");
+    expect((await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim()).toBe(originalHead);
 
     await restoreParticipantWorkspace(state);
     expect(await readFile(path.join(participant, "local.txt"), "utf8")).toBe("keep me\n");
-    expect((await execFileAsync("git", ["-C", participant, "branch", "--show-current"])).stdout.trim()).toBe(originalBranch);
+    expect((await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim()).toBe(originalHead);
+  });
+});
+
+describe("v2 host room worktrees", () => {
+  it("creates separate shared and agent worktrees without changing the original checkout", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-host-room-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-host-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "file.txt"), "base\n");
+    await execFileAsync("git", ["-C", repository, "add", "."]); await execFileAsync("git", ["-C", repository, "commit", "-qm", "base"]);
+    await writeFile(path.join(repository, "file.txt"), "unsaved\n");
+    const room = await createRoomWorktrees({ cwd: repository, roomId: "room", dataDirectory });
+    expect(await readFile(path.join(room.sharedPath, "file.txt"), "utf8")).toBe("unsaved\n");
+    expect(await readFile(path.join(room.agentPath, "file.txt"), "utf8")).toBe("unsaved\n");
+    expect(await readFile(path.join(repository, "file.txt"), "utf8")).toBe("unsaved\n");
   });
 });

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -22,12 +23,26 @@ export interface TaskWorktree {
   baseCommit: string;
 }
 
+export interface RoomWorktrees {
+  roomId: string;
+  baseCommit: string;
+  checkpointCommit: string;
+  sharedPath: string;
+  agentPath: string;
+  sessionDirectory: string;
+}
+
 export interface ParticipantWorkspaceState {
+  /** Isolated MultiCode room worktree; never the user's original checkout. */
   root: string;
+  originalRoot: string;
   originalBranch: string | null;
   originalHead: string;
   roomBranch: string;
   backupRef: string | null;
+  roomId: string;
+  markerPath: string;
+  creationNonce: string;
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -121,6 +136,40 @@ export async function createTaskWorktree(options: {
   };
 }
 
+/** Creates the two isolated projections used by a v2 host session. */
+export async function createRoomWorktrees(options: {
+  cwd: string;
+  roomId: string;
+  dataDirectory?: string;
+}): Promise<RoomWorktrees> {
+  const repository = await inspectRepository(options.cwd);
+  if (repository.operationInProgress) throw new Error("Cannot create a room while a Git operation is in progress");
+  const roomId = sanitizeRoomId(options.roomId);
+  const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
+  const sessionDirectory = path.join(dataDirectory, roomId);
+  const sharedPath = path.join(sessionDirectory, "shared");
+  const agentPath = path.join(sessionDirectory, "agent");
+  try { await access(sessionDirectory); throw new Error(`Session directory already exists for ${roomId}`); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
+  try {
+    const checkpoint = await createWorkspaceCheckpoint({ cwd: repository.root, roomId, sequence: 1, baseCommit: repository.head, force: true });
+    if (!checkpoint) throw new Error("Unable to create initial room checkpoint");
+    await git(repository.root, ["worktree", "add", "--detach", sharedPath, checkpoint.commit]);
+    await git(repository.root, ["worktree", "add", "--detach", agentPath, checkpoint.commit]);
+    const [shared, agent] = await Promise.all([realpath(sharedPath), realpath(agentPath)]);
+    await writeFile(path.join(sessionDirectory, ".multicode-session.json"), JSON.stringify({ version: 2, roomId, repositoryRoot: repository.root, baseCommit: repository.head, checkpointCommit: checkpoint.commit, sharedPath: shared, agentPath: agent }, null, 2), { mode: 0o600 });
+    return { roomId, baseCommit: repository.head, checkpointCommit: checkpoint.commit, sharedPath: shared, agentPath: agent, sessionDirectory };
+  } catch (error) {
+    // Cleanup is limited to the newly created, deterministic session directory.
+    await git(repository.root, ["worktree", "remove", "--force", sharedPath]).catch(() => undefined);
+    await git(repository.root, ["worktree", "remove", "--force", agentPath]).catch(() => undefined);
+    await rm(sessionDirectory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export async function createWorkspaceCheckpoint(options: {
   cwd: string;
   roomId: string;
@@ -172,6 +221,7 @@ export async function prepareParticipantWorkspace(options: {
   cwd: string;
   roomId: string;
   baseCommit: string;
+  dataDirectory?: string;
 }): Promise<ParticipantWorkspaceState> {
   const repository = await inspectRepository(options.cwd);
   await git(repository.root, ["cat-file", "-e", `${options.baseCommit}^{commit}`]).catch(() => {
@@ -179,25 +229,53 @@ export async function prepareParticipantWorkspace(options: {
   });
 
   const roomId = sanitizeRoomId(options.roomId);
-  const originalHead = repository.head;
-  const originalBranch = repository.branch;
-  let backupRef: string | null = null;
-  if (repository.dirty) {
-    await git(repository.root, ["stash", "push", "--include-untracked", "-m", `MultiCode backup before ${roomId}`]);
-    const stashCommit = await git(repository.root, ["rev-parse", "stash@{0}"]);
-    backupRef = `refs/multicode/backups/${roomId}/${Date.now()}`;
-    await git(repository.root, ["update-ref", backupRef, stashCommit]);
-  }
-
   const roomBranch = `multicode/room-${roomId}`;
-  await git(repository.root, ["switch", "-C", roomBranch, options.baseCommit]);
-  return { root: repository.root, originalBranch, originalHead, roomBranch, backupRef };
+  const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
+  const roomDirectory = path.join(dataDirectory, "rooms", roomId);
+  const workspacePath = path.join(roomDirectory, "workspace");
+  const markerPath = path.join(roomDirectory, ".multicode-room.json");
+  try {
+    await access(workspacePath);
+    throw new Error(`A MultiCode room workspace already exists for ${roomId}; remove it explicitly before joining again`);
+  } catch (error) {
+    if (!(error instanceof Error) || !/ENOENT/.test(String((error as NodeJS.ErrnoException).code))) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  await mkdir(roomDirectory, { recursive: true, mode: 0o700 });
+  await git(repository.root, ["worktree", "add", "--detach", workspacePath, options.baseCommit]);
+  const root = await realpath(workspacePath);
+  if (root === repository.root) throw new Error("Refusing to use the original checkout as a room worktree");
+  const creationNonce = randomBytes(32).toString("base64url");
+  await writeFile(markerPath, JSON.stringify({ version: 2, roomId, repositoryRoot: repository.root, workspacePath: root, creationNonce }, null, 2), { mode: 0o600 });
+  return {
+    root,
+    originalRoot: repository.root,
+    originalBranch: repository.branch,
+    originalHead: repository.head,
+    roomBranch,
+    backupRef: null,
+    roomId,
+    markerPath,
+    creationNonce,
+  };
+}
+
+async function verifyParticipantWorktree(state: ParticipantWorkspaceState): Promise<void> {
+  const marker = JSON.parse(await readFile(state.markerPath, "utf8")) as Record<string, unknown>;
+  const root = await realpath(state.root);
+  if (root !== state.root || root === state.originalRoot || marker.roomId !== state.roomId || marker.workspacePath !== root || marker.creationNonce !== state.creationNonce) {
+    throw new Error("Refusing destructive operation outside the validated MultiCode room worktree");
+  }
+  const worktrees = await git(state.originalRoot, ["worktree", "list", "--porcelain"]);
+  if (!worktrees.split("\n").some((line) => line === `worktree ${root}`)) throw new Error("Room worktree is no longer registered by Git");
 }
 
 export async function applyWorkspaceCheckpoint(state: ParticipantWorkspaceState, checkpoint: WorkspaceCheckpoint): Promise<void> {
+  await verifyParticipantWorktree(state);
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "multicode-apply-"));
   const bundlePath = path.join(temporaryDirectory, "checkpoint.bundle");
-  const localRef = `refs/multicode/received/${sanitizeRoomId(state.roomBranch)}`;
+  const localRef = `refs/multicode/received/${sanitizeRoomId(state.roomId)}`;
   try {
     await writeFile(bundlePath, Buffer.from(checkpoint.bundle, "base64"));
     await git(state.root, ["bundle", "verify", bundlePath]);
@@ -212,7 +290,7 @@ export async function applyWorkspaceCheckpoint(state: ParticipantWorkspaceState,
 }
 
 export async function restoreParticipantWorkspace(state: ParticipantWorkspaceState): Promise<void> {
-  if (state.originalBranch) await git(state.root, ["switch", state.originalBranch]);
-  else await git(state.root, ["switch", "--detach", state.originalHead]);
-  if (state.backupRef) await git(state.root, ["stash", "apply", "--index", state.backupRef]);
+  // Joining never touches the original checkout, so leaving deliberately preserves
+  // the room worktree for recovery/export instead of switching or stashing anything.
+  await verifyParticipantWorktree(state);
 }

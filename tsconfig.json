@@ -5,6 +5,7 @@
     { "path": "./packages/workspace" },
     { "path": "./packages/agent-adapters" },
     { "path": "./packages/relay" },
+    { "path": "./packages/session-core" },
     { "path": "./packages/cli" },
     { "path": "./apps/vscode" }
   ]

@@ -130,7 +130,7 @@ describe("RoomRelay", () => {
     expect(error).toMatchObject({ message: "Invalid room token", fatal: true });
   });
 
-  it("waits for workspace acknowledgement before dispatching prompts", async () => {
+  it("does not let a slow workspace checkpoint acknowledgement block prompts", async () => {
     const dispatched: string[] = [];
     const relay = new RoomRelay({
       roomId: "room-1",
@@ -152,12 +152,6 @@ describe("RoomRelay", () => {
       createdAt: new Date().toISOString(),
     });
     await client.messages.next("workspace.checkpoint");
-    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
-    expect((await client.messages.next("room.error")).message).toMatch(/synchronizing/);
-    expect(dispatched).toEqual([]);
-
-    client.socket.send(JSON.stringify({ type: "workspace.ack", sequence: 1, commit: "checkpoint" }));
-    await client.messages.next("participant.synced");
     client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
     await client.messages.next("prompt.started");
     expect(dispatched).toEqual(["Continue"]);

@@ -11,7 +11,10 @@ import {
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
 
+const maxRelayFrameBytes = 256 * 1024;
+
 export { RelayServer, type RelayServerOptions } from "./server.js";
+export { PostgresRelayRoomStore, type RelayRoomStore } from "./store.js";
 
 export interface RoomRelayOptions {
   roomId: string;
@@ -56,7 +59,7 @@ export class RoomRelay {
     const server = new WebSocketServer({
       host: options.host,
       port: options.port,
-      maxPayload: 36 * 1024 * 1024,
+      maxPayload: maxRelayFrameBytes,
       perMessageDeflate: false,
     });
     this.server = server;
@@ -193,11 +196,6 @@ export class RoomRelay {
       return;
     }
 
-    if (!state.participant.synced) {
-      this.send(socket, { type: "room.error", message: "Workspace is still synchronizing; wait before submitting prompts" });
-      return;
-    }
-
     const prompt: QueuedPrompt = {
       promptId: parsed.data.promptId,
       participantId: state.participant.id,
@@ -265,7 +263,6 @@ export class RoomRelay {
 
   private dispatchNext(): void {
     if (this.activePrompt || this.queue.length === 0) return;
-    if (this.participants().some((participant) => !participant.synced)) return;
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;

@@ -1,20 +1,23 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { networkInterfaces, userInfo } from "node:os";
+import { homedir, networkInterfaces, userInfo } from "node:os";
+import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import { promisify } from "node:util";
 import chalk, { chalkStderr } from "chalk";
 import { Command } from "commander";
 import { CodexAppServerAdapter } from "@multicode/agent-adapters";
+import { LocalIpcServer, PostgresJournal, writeSessionToken } from "@multicode/session-core";
 import type { AgentEvent, RelayServerMessage, RoomServerMessage, WorkspaceCheckpoint, WorkspaceDiff } from "@multicode/protocol";
-import { RelayServer, RoomRelay } from "@multicode/relay";
+import { PostgresRelayRoomStore, RelayServer, RoomRelay } from "@multicode/relay";
 import {
   applyWorkspaceCheckpoint,
   createWorkspaceCheckpoint,
   inspectRepository,
   prepareParticipantWorkspace,
   restoreParticipantWorkspace,
+  sanitizeRoomId,
   type ParticipantWorkspaceState,
 } from "@multicode/workspace";
 import WebSocket from "ws";
@@ -675,7 +678,8 @@ async function serveRelay(options: { host: string; port: string; maxRooms: strin
   if (!Number.isInteger(maxRooms) || maxRooms < 1) throw new Error(`Invalid room limit: ${options.maxRooms}`);
   const maxRoomsPerIp = Number(options.roomsPerIp);
   if (!Number.isInteger(maxRoomsPerIp) || maxRoomsPerIp < 1) throw new Error(`Invalid per-IP room limit: ${options.roomsPerIp}`);
-  const relay = new RelayServer({ maxRooms, maxRoomsPerIp });
+  const databaseUrl = process.env.MULTICODE_DATABASE_URL;
+  const relay = new RelayServer({ maxRooms, maxRoomsPerIp, ...(databaseUrl ? { store: new PostgresRelayRoomStore(databaseUrl) } : {}) });
   const bound = await relay.listen({ host: options.host, port: parsePort(options.port) });
   console.log(out.success(`${out.label("MultiCode relay")} ${out.value(`http://${bound.host}:${bound.port}`)}`));
   console.log(out.success(`${out.label("Health check")} ${out.value(`http://${bound.host}:${bound.port}/health`)}`));
@@ -687,6 +691,23 @@ async function serveRelay(options: { host: string; port: string; maxRooms: strin
       await relay.close();
       resolve();
     });
+  });
+}
+
+async function serveSession(options: { session: string; socket?: string }): Promise<void> {
+  const databaseUrl = process.env.MULTICODE_DATABASE_URL;
+  if (!databaseUrl) throw new Error("MULTICODE_DATABASE_URL is required to start a v2 session daemon");
+  const sessionDirectory = path.join(homedir(), ".multicode", "sessions", sanitizeRoomId(options.session));
+  const token = await writeSessionToken(path.join(sessionDirectory, "token"));
+  const journal = new PostgresJournal(databaseUrl);
+  await journal.migrate();
+  const socketPath = options.socket ?? (process.platform === "win32" ? `\\\\.\\pipe\\multicode-${sanitizeRoomId(options.session)}` : path.join(sessionDirectory, "daemon.sock"));
+  const ipc = new LocalIpcServer(token, async (payload) => ({ session: options.session, payload }));
+  await ipc.listen(socketPath);
+  console.log(out.success(`${out.label("Session daemon")} ${out.value(options.session)} ${out.muted(`listening on ${socketPath}`)}`));
+  await new Promise<void>((resolve) => {
+    const stop = async () => { await ipc.close(); await journal.close(); resolve(); };
+    process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
   });
 }
 
@@ -764,6 +785,13 @@ relay
   .option("--max-rooms <count>", "maximum concurrent rooms", process.env.MULTICODE_MAX_ROOMS ?? "100")
   .option("--rooms-per-ip <count>", "maximum active rooms per originating IP", process.env.MULTICODE_ROOMS_PER_IP ?? "5")
   .action(serveRelay);
+
+program
+  .command("session")
+  .description("Run the protocol-v2 host session daemon")
+  .requiredOption("--session <room-id>", "room/session identifier")
+  .option("--socket <path>", "local IPC socket or named pipe")
+  .action(serveSession);
 
 program.parseAsync().catch((error: unknown) => {
   console.error(err.error(`${err.label("Error")} ${error instanceof Error ? error.message : String(error)}`));

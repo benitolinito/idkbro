@@ -1,0 +1,18 @@
+{
+  "name": "@multicode/session-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": { "multicode-session": "./dist/daemon.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "dependencies": {
+    "@multicode/protocol": "0.0.0",
+    "@multicode/workspace": "0.0.0",
+    "pg": "^8.16.3",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": { "@types/pg": "^8.15.4" }
+}

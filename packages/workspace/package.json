@@ -12,6 +12,7 @@
     }
   },
   "dependencies": {
-    "@multicode/protocol": "0.0.0"
+    "@multicode/protocol": "0.0.0",
+    "chokidar": "^4.0.3"
   }
 }

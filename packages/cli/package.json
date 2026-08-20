@@ -15,6 +15,7 @@
     "@multicode/agent-adapters": "0.0.0",
     "@multicode/protocol": "0.0.0",
     "@multicode/relay": "0.0.0",
+    "@multicode/session-core": "0.0.0",
     "@multicode/workspace": "0.0.0",
     "chalk": "^5.6.2",
     "commander": "^14.0.0",

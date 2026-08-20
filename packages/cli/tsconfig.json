@@ -11,6 +11,7 @@
     { "path": "../protocol" },
     { "path": "../workspace" },
     { "path": "../agent-adapters" },
-    { "path": "../relay" }
+    { "path": "../relay" },
+    { "path": "../session-core" }
   ]
 }

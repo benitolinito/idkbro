@@ -1,6 +1,27 @@
 name: multicode-relay
 
 services:
+  postgres:
+    container_name: multicode-postgres
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MULTICODE_POSTGRES_DB:-multicode}
+      POSTGRES_USER: ${MULTICODE_POSTGRES_USER:?set MULTICODE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${MULTICODE_POSTGRES_PASSWORD:?set MULTICODE_POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      - multicode-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
   relay:
     container_name: multicode-relay
     image: multicode-relay:local
@@ -16,6 +37,7 @@ services:
       MULTICODE_RELAY_PORT: 7337
       MULTICODE_MAX_ROOMS: ${MULTICODE_MAX_ROOMS:-100}
       MULTICODE_ROOMS_PER_IP: ${MULTICODE_ROOMS_PER_IP:-5}
+      MULTICODE_DATABASE_URL: postgresql://${MULTICODE_POSTGRES_USER:?set MULTICODE_POSTGRES_USER}:${MULTICODE_POSTGRES_PASSWORD:?set MULTICODE_POSTGRES_PASSWORD}@postgres:5432/${MULTICODE_POSTGRES_DB:-multicode}
       TZ: ${TZ:-America/New_York}
     read_only: true
     tmpfs:
@@ -25,3 +47,9 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  multicode-postgres:
