@@ -26,6 +26,7 @@ import {
   cleanupParticipantWorkspace,
   createRoomWorktrees,
   createWorkspaceCheckpoint,
+  inspectManagedRoomWorktree,
   inspectRepository,
   prepareParticipantWorkspace,
   restoreParticipantWorkspace,
@@ -301,6 +302,10 @@ async function prepareRoom(dryRun = false): Promise<{
   baseCommit?: string;
 }> {
   const repository = await inspectRepository(process.cwd());
+  const managedWorktree = await inspectManagedRoomWorktree(repository.root);
+  if (managedWorktree) {
+    throw new Error(`Refusing to host from a MultiCode ${managedWorktree.role} worktree. Open the original repository at ${managedWorktree.repositoryRoot}`);
+  }
   console.log(out.success(`${out.label("Repository")} ${out.value(repository.root)}`));
   if (repository.dirty) console.log(out.warning("Uncommitted and untracked changes will be included in synchronized checkpoints."));
   if (repository.operationInProgress) throw new Error("Finish the current Git operation before creating a room");

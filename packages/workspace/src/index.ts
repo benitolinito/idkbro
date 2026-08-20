@@ -32,6 +32,13 @@ export interface RoomWorktrees {
   sessionDirectory: string;
 }
 
+export interface ManagedRoomWorktree {
+  role: "shared" | "agent";
+  roomId: string;
+  repositoryRoot: string;
+  sessionDirectory: string;
+}
+
 export interface ParticipantWorkspaceState {
   /** Isolated MultiCode room worktree; never the user's original checkout. */
   root: string;
@@ -107,6 +114,29 @@ export async function inspectRepository(cwd: string): Promise<RepositoryInfo> {
     dirty: status.length > 0,
     operationInProgress,
   };
+}
+
+export async function inspectManagedRoomWorktree(cwd: string): Promise<ManagedRoomWorktree | null> {
+  const repository = await inspectRepository(cwd);
+  const sessionDirectory = path.dirname(repository.root);
+  const markerPath = path.join(sessionDirectory, ".multicode-session.json");
+  let marker: unknown;
+  try {
+    marker = JSON.parse(await readFile(markerPath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!marker || typeof marker !== "object") return null;
+  const value = marker as Record<string, unknown>;
+  if (value.version !== 2 || typeof value.roomId !== "string" || typeof value.repositoryRoot !== "string") return null;
+  const current = path.resolve(repository.root);
+  const role = typeof value.sharedPath === "string" && path.resolve(value.sharedPath) === current
+    ? "shared"
+    : typeof value.agentPath === "string" && path.resolve(value.agentPath) === current
+      ? "agent"
+      : null;
+  if (!role) return null;
+  return { role, roomId: value.roomId, repositoryRoot: value.repositoryRoot, sessionDirectory };
 }
 
 export async function createTaskWorktree(options: {

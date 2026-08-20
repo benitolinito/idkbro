@@ -36,7 +36,7 @@ Build and install the extension from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.3.2.vsix
+code --install-extension apps/vscode/multicode-vscode-0.3.3.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
@@ -210,6 +210,8 @@ Run `multicode --help` for operator/development commands. End users only need
 
 The host and Codex use MultiCode-owned isolated worktrees. The original checkout
 is never switched, stashed, reset, or cleaned.
+Hosting from a MultiCode-managed `shared` or `agent` worktree is rejected to
+prevent accidentally nesting one room inside another.
 
 Participants receive an isolated room worktree and acknowledge encrypted
 checkpoints only after the Pi relay has durably recorded them. If the Pi is

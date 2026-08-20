@@ -10,6 +10,7 @@ import {
   createTaskWorktree,
   createRoomWorktrees,
   createWorkspaceCheckpoint,
+  inspectManagedRoomWorktree,
   inspectRepository,
   prepareParticipantWorkspace,
   restoreParticipantWorkspace,
@@ -166,5 +167,8 @@ describe("v2 host room worktrees", () => {
     expect(await readFile(path.join(room.sharedPath, "file.txt"), "utf8")).toBe("unsaved\n");
     expect(await readFile(path.join(room.agentPath, "file.txt"), "utf8")).toBe("unsaved\n");
     expect(await readFile(path.join(repository, "file.txt"), "utf8")).toBe("unsaved\n");
+    expect(await inspectManagedRoomWorktree(repository)).toBeNull();
+    expect(await inspectManagedRoomWorktree(room.sharedPath)).toMatchObject({ role: "shared", roomId: "room", repositoryRoot: repository });
+    expect(await inspectManagedRoomWorktree(room.agentPath)).toMatchObject({ role: "agent", roomId: "room", repositoryRoot: repository });
   });
 });
