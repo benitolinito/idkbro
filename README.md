@@ -30,7 +30,9 @@ Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 
 ## VS Code extension
 
-Build and install the extension from this checkout:
+Download the latest packaged extension from
+[GitHub Releases](https://github.com/benitolinito/idkbro/releases/latest), or
+build and install it from this checkout:
 
 ```bash
 npm install
@@ -234,6 +236,17 @@ Build and package the VS Code extension:
 npm run build
 npm run package -w multicode-vscode
 ```
+
+Publish a downloadable GitHub Release by pushing a version tag that matches
+`apps/vscode/package.json`:
+
+```bash
+git tag v0.3.3
+git push origin v0.3.3
+```
+
+The release workflow verifies the version, runs all checks, and attaches the
+packaged VSIX to the repository's Releases page.
 
 | Package | Responsibility |
 | --- | --- |

@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
     paths:
       - ".github/workflows/build-vscode-extension.yml"
       - "apps/vscode/**"
@@ -40,6 +42,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          extension_version="$(node -p "require('./apps/vscode/package.json').version")"
+          test "$GITHUB_REF_NAME" = "v$extension_version"
+
       - name: Install dependencies
         run: npm ci
 
@@ -60,3 +68,30 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged VSIX
+        uses: actions/download-artifact@v8
+        with:
+          name: multicode-vscode-${{ github.run_number }}
+          path: release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" release/*.vsix
+          --repo "$GITHUB_REPOSITORY"
+          --title "MultiCode $GITHUB_REF_NAME"
+          --generate-notes
+          --verify-tag
+          --latest
