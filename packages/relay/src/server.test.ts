@@ -70,7 +70,9 @@ describe("RelayServer", () => {
     sockets.push(participant.socket);
     participant.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" }));
     expect((await participant.messages.next("room.welcome")).participants.map((value) => value.name)).toEqual(["Ada", "Grace"]);
-    expect((await host.messages.next("participant.joined")).participant.name).toBe("Grace");
+    const joined = await host.messages.next("participant.joined"); expect(joined.participant.name).toBe("Grace");
+    host.socket.send(JSON.stringify({ type: "relay.participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "editor", "prompter", "reviewer"] }));
+    expect(await participant.messages.next("participant.capabilities")).toMatchObject({ participantId: joined.participant.id, capabilities: expect.arrayContaining(["reviewer"]) });
 
     participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Fix the test" }));
     await participant.messages.next("prompt.queued");
@@ -88,6 +90,18 @@ describe("RelayServer", () => {
       event: { type: "agent.reasoning.delta", threadId: "t1", turnId: "u1", itemId: "r1", text: "Inspecting" },
     }));
     expect((await participant.messages.next("agent.event")).event).toMatchObject({ type: "agent.reasoning.delta", text: "Inspecting" });
+    host.socket.send(JSON.stringify({ type: "relay.agent.encrypted", eventType: "agent.message.delta", payload: "opaque-ciphertext" }));
+    expect(await participant.messages.next("agent.encrypted")).toMatchObject({ eventType: "agent.message.delta", payload: "opaque-ciphertext" });
+    participant.socket.send(JSON.stringify({ type: "approval.resolve", requestId: "approval-1", decision: "accept" }));
+    expect(await host.messages.next("approval.submitted")).toMatchObject({ participantId: joined.participant.id, requestId: "approval-1", decision: "accept" });
+
+    const collaboration = { id: randomUUID(), kind: "document.update", payload: "encrypted-update" } as const;
+    participant.socket.send(JSON.stringify({ type: "collab.publish", event: collaboration }));
+    const submitted = await host.messages.next("collab.submitted");
+    expect(submitted).toMatchObject({ participantId: expect.any(String), event: collaboration });
+    const committed = { ...collaboration, sequence: 1, committedAt: new Date().toISOString() };
+    host.socket.send(JSON.stringify({ type: "relay.collab.event", event: committed }));
+    expect((await participant.messages.next("collab.event")).event).toEqual(committed);
   });
 
   it("limits each originating IP to five active rooms", async () => {
@@ -115,7 +129,7 @@ describe("RelayServer", () => {
 
     await new Promise<void>((resolve) => {
       activeHosts[0]?.once("close", () => resolve());
-      activeHosts[0]?.close();
+      activeHosts[0]?.close(1000, "Host stopped");
     });
     const replacement = await open(`ws://127.0.0.1:${port}/host`, headers);
     sockets.push(replacement.socket);
@@ -170,5 +184,28 @@ describe("RelayServer", () => {
     host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.chunk", chunk: { sequence: 2, index: 0, data: bundle.toString("base64") } }));
     host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.complete", sequence: 2 }));
     expect((await host.messages.next("room.error")).message).toMatch(/integrity validation/);
+  });
+
+  it("keeps participants connected while an authenticated host resumes", async () => {
+    const server = new RelayServer({}); servers.push(server); const { port } = await server.listen({ host: "127.0.0.1", port: 0 });
+    const host = await open(`ws://127.0.0.1:${port}/host`); sockets.push(host.socket); host.socket.send(JSON.stringify({ type: "relay.room.create", name: "Ada" }));
+    const created = await host.messages.next("relay.room.created");
+    const participant = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`); sockets.push(participant.socket); participant.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" })); await participant.messages.next("room.welcome");
+    host.socket.terminate(); expect((await participant.messages.next("room.error")).fatal).not.toBe(true);
+    const resumed = await open(`ws://127.0.0.1:${port}/host`); sockets.push(resumed.socket); resumed.socket.send(JSON.stringify({ type: "relay.room.resume", roomId: created.roomId, resumeToken: created.resumeToken }));
+    expect(await resumed.messages.next("relay.room.created")).toMatchObject({ roomId: created.roomId, resumed: true });
+    participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Still here" }));
+    expect((await resumed.messages.next("prompt.started")).prompt.text).toBe("Still here");
+  });
+
+  it("routes authoritative document snapshots only to the subscriber", async () => {
+    const server = new RelayServer({}); servers.push(server); const { port } = await server.listen({ host: "127.0.0.1", port: 0 });
+    const host = await open(`ws://127.0.0.1:${port}/host`); sockets.push(host.socket); host.socket.send(JSON.stringify({ type: "relay.room.create", name: "Ada" })); const created = await host.messages.next("relay.room.created");
+    const first = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`); sockets.push(first.socket); first.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" })); const firstWelcome = await first.messages.next("room.welcome"); await host.messages.next("participant.joined");
+    const second = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`); sockets.push(second.socket); second.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Linus" })); await second.messages.next("room.welcome"); await host.messages.next("participant.joined");
+    const snapshot = { id: randomUUID(), kind: "document.snapshot", payload: "encrypted-snapshot", recipientId: firstWelcome.selfId } as const; host.socket.send(JSON.stringify({ type: "relay.collab.event", event: snapshot }));
+    expect((await first.messages.next("collab.event")).event).toEqual(snapshot);
+    const preview = { id: randomUUID(), kind: "agent.preview", payload: "encrypted-preview" } as const; host.socket.send(JSON.stringify({ type: "relay.collab.event", event: preview }));
+    expect((await second.messages.next("collab.event")).event).toEqual(preview);
   });
 });

@@ -38,7 +38,7 @@ class MessageCollector {
   }
 }
 
-async function connect(port: number, token: string, name: string): Promise<{
+async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "editor"): Promise<{
   socket: WebSocket;
   messages: MessageCollector;
   welcome: Extract<RoomServerMessage, { type: "room.welcome" }>;
@@ -49,7 +49,7 @@ async function connect(port: number, token: string, name: string): Promise<{
     socket.once("open", resolve);
     socket.once("error", reject);
   });
-  socket.send(JSON.stringify({ type: "room.join", token, name }));
+  socket.send(JSON.stringify({ type: "room.join", token, name, ...(requestedRole ? { requestedRole } : {}) }));
   const welcome = await messages.next("room.welcome");
   return { socket, messages, welcome };
 }
@@ -72,6 +72,7 @@ describe("RoomRelay", () => {
       onPrompt: async (prompt) => {
         dispatched.push(prompt.text);
       },
+      onCollaborationEvent: async (_participant, event) => event,
     });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
@@ -114,6 +115,7 @@ describe("RoomRelay", () => {
       token: "correct-token",
       hostName: "Ada",
       onPrompt: async () => undefined,
+      onCollaborationEvent: async (_participant, event) => event,
     });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
@@ -131,7 +133,7 @@ describe("RoomRelay", () => {
   });
 
   it("broadcasts collaboration updates without checkpoint gating", async () => {
-    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined });
+    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
     const first = await connect(port, "secret-token", "Grace");
@@ -148,6 +150,7 @@ describe("RoomRelay", () => {
       token: "secret-token",
       hostName: "Ada",
       onPrompt: async (prompt) => { dispatched.push(prompt.text); },
+      onCollaborationEvent: async (_participant, event) => event,
     });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
@@ -162,10 +165,21 @@ describe("RoomRelay", () => {
       bundle: "bundle",
       createdAt: new Date().toISOString(),
     });
-    await client.messages.next("workspace.checkpoint.start");
-    await client.messages.next("workspace.checkpoint.complete");
     client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
     await client.messages.next("prompt.started");
     expect(dispatched).toEqual(["Continue"]);
+  });
+
+  it("enforces independent viewer and editor capabilities", async () => {
+    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const viewer = await connect(port, "secret-token", "Viewer", "viewer");
+    sockets.push(viewer.socket);
+    expect(viewer.welcome.participants.find((participant) => participant.name === "Viewer")?.capabilities).toEqual(["viewer"]);
+    viewer.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "not allowed" }));
+    expect((await viewer.messages.next("room.error")).message).toMatch(/prompter capability/);
+    viewer.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "document.update", payload: "opaque" } }));
+    expect((await viewer.messages.next("room.error")).message).toMatch(/editor capability/);
   });
 });

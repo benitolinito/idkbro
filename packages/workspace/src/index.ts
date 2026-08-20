@@ -189,7 +189,7 @@ export async function createRoomWorktrees(options: {
     await git(repository.root, ["worktree", "add", "--detach", sharedPath, checkpoint.commit]);
     await git(repository.root, ["worktree", "add", "--detach", agentPath, checkpoint.commit]);
     const [shared, agent] = await Promise.all([realpath(sharedPath), realpath(agentPath)]);
-    await writeFile(path.join(sessionDirectory, ".multicode-session.json"), JSON.stringify({ version: 2, roomId, repositoryRoot: repository.root, baseCommit: repository.head, checkpointCommit: checkpoint.commit, sharedPath: shared, agentPath: agent }, null, 2), { mode: 0o600 });
+    await writeFile(path.join(sessionDirectory, ".multicode-session.json"), JSON.stringify({ version: 2, roomId, repositoryRoot: repository.root, baseCommit: repository.head, checkpointCommit: checkpoint.commit, sharedPath: shared, agentPath: agent, creationNonce: randomBytes(32).toString("base64url") }, null, 2), { mode: 0o600 });
     return { roomId, baseCommit: repository.head, checkpointCommit: checkpoint.commit, sharedPath: shared, agentPath: agent, sessionDirectory };
   } catch (error) {
     // Cleanup is limited to the newly created, deterministic session directory.
@@ -413,4 +413,93 @@ export async function cleanupParticipantWorkspace(options: {
   await git(state.originalRoot, ["worktree", "remove", ...(options.force ? ["--force"] : []), state.root]);
   await rm(path.dirname(state.root), { recursive: true, force: false });
   return state.root;
+}
+
+export interface AgentTurnSnapshot { commit: string; sequence: number }
+export interface WorkspaceChange { operation: "create" | "update" | "delete" | "rename"; path: string; sourcePath?: string }
+export interface PendingWorkspaceProposal { version: 1; sequence: number; roomId: string; baseCommit: string; agentCommit: string; humanCommit: string; patchPath: string; createdAt: string; status: "pending" }
+
+async function captureSnapshotCommit(options: { cwd: string; roomId: string; sequence: number; baseCommit: string; parentCommit: string }): Promise<string> {
+  const checkpoint = await createWorkspaceCheckpoint({ ...options, force: true });
+  if (!checkpoint) throw new Error("Unable to capture workspace state");
+  return checkpoint.commit;
+}
+
+async function verifyOwnedHostWorktrees(sharedPath: string, agentPath: string, roomId: string): Promise<void> {
+  const shared = await realpath(sharedPath); const agent = await realpath(agentPath); const sessionDirectory = path.dirname(shared); const markerPath = path.join(sessionDirectory, ".multicode-session.json");
+  if (path.dirname(agent) !== sessionDirectory || path.basename(shared) !== "shared" || path.basename(agent) !== "agent") throw new Error("Refusing destructive operation outside MultiCode-owned host worktrees");
+  const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+  if (marker.version !== 2 || marker.roomId !== sanitizeRoomId(roomId) || marker.sharedPath !== shared || marker.agentPath !== agent || typeof marker.creationNonce !== "string" || marker.creationNonce.length < 32) throw new Error("Refusing destructive operation because the host worktree marker is invalid");
+  const [sharedCommon, agentCommon] = await Promise.all([git(shared, ["rev-parse", "--git-common-dir"]), git(agent, ["rev-parse", "--git-common-dir"])]);
+  if (await realpath(path.resolve(shared, sharedCommon)) !== await realpath(path.resolve(agent, agentCommon))) throw new Error("Host worktrees do not belong to the same repository");
+}
+
+export async function prepareAgentTurnWorkspace(options: { sharedPath: string; agentPath: string; roomId: string; sequence: number; baseCommit: string; parentCommit: string }): Promise<AgentTurnSnapshot> {
+  await verifyOwnedHostWorktrees(options.sharedPath, options.agentPath, options.roomId);
+  const commit = await captureSnapshotCommit({ cwd: options.sharedPath, roomId: `${options.roomId}-turn-base`, sequence: options.sequence, baseCommit: options.baseCommit, parentCommit: options.parentCommit });
+  await git(options.agentPath, ["reset", "--hard", commit]);
+  await git(options.agentPath, ["clean", "-fd"]);
+  return { commit, sequence: options.sequence };
+}
+
+async function applyPatch(cwd: string, patchText: string, check: boolean, reverse = false): Promise<void> {
+  if (!patchText) return;
+  await new Promise<void>((resolve, reject) => {
+    const child = execFile("git", ["apply", ...(check ? ["--check"] : []), ...(reverse ? ["--reverse"] : []), "--whitespace=nowarn", "-"], { cwd }, (error, _stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve());
+    child.stdin?.end(patchText);
+  });
+}
+
+async function tree(cwd: string, commit: string): Promise<string> { return git(cwd, ["rev-parse", `${commit}^{tree}`]); }
+async function gitRaw(cwd: string, args: string[]): Promise<string> {
+  return (await execFileAsync("git", args, { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 })).stdout;
+}
+
+export async function mergeAgentWorkspace(options: {
+  sharedPath: string;
+  agentPath: string;
+  sessionDirectory: string;
+  roomId: string;
+  baseCommit: string;
+  turn: AgentTurnSnapshot;
+  withCommitLock: <T>(operation: () => Promise<T>) => Promise<T>;
+  onApplied?: (changes: WorkspaceChange[]) => Promise<void>;
+}): Promise<{ status: "unchanged" | "merged" | "conflicted"; proposalPath?: string; changes?: WorkspaceChange[] }> {
+  await verifyOwnedHostWorktrees(options.sharedPath, options.agentPath, options.roomId);
+  const agentCommit = await captureSnapshotCommit({ cwd: options.agentPath, roomId: `${options.roomId}-agent-final`, sequence: options.turn.sequence, baseCommit: options.baseCommit, parentCommit: options.turn.commit });
+  if (await tree(options.agentPath, agentCommit) === await tree(options.agentPath, options.turn.commit)) return { status: "unchanged" };
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const humanCommit = await captureSnapshotCommit({ cwd: options.sharedPath, roomId: `${options.roomId}-human-current`, sequence: options.turn.sequence + attempt, baseCommit: options.baseCommit, parentCommit: options.turn.commit });
+    let mergedTree: string;
+    try {
+      mergedTree = (await git(options.sharedPath, ["merge-tree", "--write-tree", "--no-messages", `--merge-base=${options.turn.commit}`, humanCommit, agentCommit])).split("\n")[0] ?? "";
+      if (!/^[a-f0-9]{40,64}$/.test(mergedTree)) throw new Error("Merge engine did not produce a tree");
+    } catch {
+      const proposal = await gitRaw(options.agentPath, ["diff", "--binary", options.turn.commit, agentCommit]);
+      const proposalDirectory = path.join(options.sessionDirectory, "proposals"); await mkdir(proposalDirectory, { recursive: true });
+      const proposalPath = path.join(proposalDirectory, `${options.turn.sequence}.patch`); await writeFile(proposalPath, proposal, "utf8");
+      const metadata: PendingWorkspaceProposal = { version: 1, sequence: options.turn.sequence, roomId: options.roomId, baseCommit: options.turn.commit, agentCommit, humanCommit, patchPath: proposalPath, createdAt: new Date().toISOString(), status: "pending" };
+      await writeFile(path.join(proposalDirectory, `${options.turn.sequence}.json`), JSON.stringify(metadata, null, 2), { mode: 0o600 });
+      return { status: "conflicted", proposalPath };
+    }
+    const patchText = await gitRaw(options.sharedPath, ["diff", "--binary", humanCommit, mergedTree]);
+    const nameStatus = await gitRaw(options.sharedPath, ["diff", "--name-status", "-M", "-z", humanCommit, mergedTree]);
+    const fields = nameStatus.split("\0").filter(Boolean); const changes: WorkspaceChange[] = [];
+    for (let index = 0; index < fields.length;) {
+      const status = fields[index++] as string;
+      if (status.startsWith("R")) { const sourcePath = fields[index++] as string; const destinationPath = fields[index++] as string; changes.push({ operation: "rename", sourcePath, path: destinationPath }); }
+      else { const filePath = fields[index++] as string; changes.push({ operation: status === "A" ? "create" : status === "D" ? "delete" : "update", path: filePath }); }
+    }
+    const applied = await options.withCommitLock(async () => {
+      const verification = await captureSnapshotCommit({ cwd: options.sharedPath, roomId: `${options.roomId}-merge-verify`, sequence: options.turn.sequence + attempt, baseCommit: options.baseCommit, parentCommit: humanCommit });
+      if (await tree(options.sharedPath, verification) !== await tree(options.sharedPath, humanCommit)) return false;
+      await applyPatch(options.sharedPath, patchText, true);
+      await applyPatch(options.sharedPath, patchText, false);
+      try { await options.onApplied?.(changes); }
+      catch (error) { await applyPatch(options.sharedPath, patchText, false, true); throw error; }
+      return true;
+    });
+    if (applied) return { status: "merged", changes };
+  }
+  throw new Error("Human workspace kept changing during merge; retry the Codex proposal later");
 }

@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { QueuedPrompt, RoomParticipant, RoomServerMessage } from "@multicode/protocol";
 import { ChatModel } from "./chat-model.js";
 
-const host: RoomParticipant = { id: "host", name: "Ada", joinedAt: new Date(0).toISOString(), host: true, synced: true };
-const editor: RoomParticipant = { id: "editor", name: "Ada", joinedAt: new Date(0).toISOString(), host: false, synced: true };
+const host: RoomParticipant = { id: "host", name: "Ada", joinedAt: new Date(0).toISOString(), host: true, synced: true, capabilities: ["viewer", "editor", "prompter", "reviewer"] };
+const editor: RoomParticipant = { id: "editor", name: "Ada", joinedAt: new Date(0).toISOString(), host: false, synced: true, capabilities: ["viewer", "editor", "prompter"] };
 const prompt: QueuedPrompt = { promptId: "prompt-1", participantId: "host", participantName: "Ada", text: "Fix the reconnect loop", submittedAt: new Date(0).toISOString() };
 
 function welcome(): RoomServerMessage {

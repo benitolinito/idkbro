@@ -34,6 +34,8 @@
     "onCommand:multicode.sendPrompt",
     "onCommand:multicode.doctor",
     "onCommand:multicode.stop",
+    "onCommand:multicode.openPreview",
+    "onCommand:multicode.openProposal",
     "onView:multicode.chatView"
   ],
   "contributes": {
@@ -89,6 +91,11 @@
         "command": "multicode.openProposal",
         "title": "MultiCode: Open Agent Conflict Proposal",
         "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "multicode.openPreview",
+        "title": "MultiCode: Open Codex Preview (Not Merged)",
+        "icon": "$(diff)"
       }
     ],
     "menus": {
@@ -106,7 +113,11 @@
         },
         {
           "command": "multicode.openProposal",
-          "when": "multicode.connected"
+          "when": "multicode.connected && multicode.hasProposal"
+        },
+        {
+          "command": "multicode.openPreview",
+          "when": "multicode.connected && multicode.hasPreview"
         }
       ]
     },

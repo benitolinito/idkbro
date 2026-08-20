@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes, randomUUID } from "node:crypto";
+import { watch, type FSWatcher } from "node:fs";
 import { homedir, networkInterfaces, userInfo } from "node:os";
 import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
-import { writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import chalk, { chalkStderr } from "chalk";
 import { Command } from "commander";
 import { CodexAppServerAdapter } from "@multicode/agent-adapters";
-import { FileJournal, HostSession, LocalIpcServer, PostgresJournal, roomSecret, writeSessionToken } from "@multicode/session-core";
+import { HostSession, LocalIpcServer, loadOrCreateRoomSecret, loadOrCreateSessionEpoch, PostgresJournal, requestLocalIpc, roomSecret, SqliteJournal, writeSessionToken, type WorkspaceTransactionOperation } from "@multicode/session-core";
 import {
   checkpointChunkBytes,
   type AgentEvent,
+  type CollaborationEvent,
+  type Capability,
   type RelayServerMessage,
   type RoomServerMessage,
+  type RoomParticipant,
   type WorkspaceCheckpoint,
   type WorkspaceCheckpointChunk,
   type WorkspaceCheckpointDescriptor,
@@ -28,15 +32,23 @@ import {
   createWorkspaceCheckpoint,
   inspectManagedRoomWorktree,
   inspectRepository,
+  mergeAgentWorkspace,
   prepareParticipantWorkspace,
+  prepareAgentTurnWorkspace,
   restoreParticipantWorkspace,
   sanitizeRoomId,
   type ParticipantWorkspaceState,
+  type AgentTurnSnapshot,
+  type WorkspaceChange,
 } from "@multicode/workspace";
 import WebSocket from "ws";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
+const maxCollaborativeTextBytes = 96 * 1024;
+const inviteAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function localInviteCode(): string { const bytes = randomBytes(10); const value = [...bytes].map((byte) => inviteAlphabet[byte % inviteAlphabet.length]).join(""); return `${value.slice(0, 5)}-${value.slice(5)}`; }
 
 const out = {
   success: (message: string) => `${chalk.green("✓")} ${message}`,
@@ -74,8 +86,9 @@ async function doctor(): Promise<void> {
     versionOf("codex", ["--version"]),
   ]);
 
+  const [nodeMajor = 0, nodeMinor = 0] = process.versions.node.split(".").map(Number);
   const checks = [
-    { name: "Node.js", ok: Number(process.versions.node.split(".")[0]) >= 20, detail: process.version },
+    { name: "Node.js", ok: nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 5), detail: process.version },
     { name: "Git", ok: Boolean(gitVersion), detail: gitVersion ?? "not found" },
     { name: "Codex CLI", ok: Boolean(codexVersion), detail: codexVersion ?? "not found" },
   ];
@@ -118,7 +131,7 @@ function printAgentEvent(event: AgentEvent): void {
       break;
     case "approval.requested":
       console.error(`\n${err.warning(`${err.label("Approval required on the host")} ${err.muted(`(${event.approvalKind}, request ${event.requestId})`)}`)}`);
-      console.error(err.muted("  Interactive approval handling is not implemented; the request remains pending."));
+      console.error(err.muted(`  Resolve with /approve ${event.requestId} accept|decline|cancel, or grant a participant reviewer capability.`));
       break;
     case "agent.error":
       console.error(`\n${err.error(`${err.label("Codex")} ${event.message}`)}`);
@@ -170,6 +183,16 @@ function printRoomMessage(message: RoomServerMessage, includeAgent = true): void
   }
 }
 
+function decryptPromptMessage(message: RoomServerMessage, key: Buffer): RoomServerMessage {
+  if (message.type === "prompt.queued" || message.type === "prompt.started") return { ...message, prompt: { ...message.prompt, text: openPrompt(key, message.prompt.promptId, message.prompt.text) } };
+  if (message.type !== "room.welcome") return message;
+  return {
+    ...message,
+    activePrompt: message.activePrompt ? { ...message.activePrompt, text: openPrompt(key, message.activePrompt.promptId, message.activePrompt.text) } : null,
+    queue: message.queue.map((prompt) => ({ ...prompt, text: openPrompt(key, prompt.promptId, prompt.text) })),
+  };
+}
+
 function printWorkspaceDiff(diff: WorkspaceDiff): void {
   console.error(`\n${chalkStderr.cyan("──")} ${err.label("Workspace changes")} ${err.muted(`after ${diff.revision}${diff.truncated ? " · truncated" : ""}`)} ${chalkStderr.cyan("──")}`);
   console.error(diff.text || "No tracked workspace changes.");
@@ -177,7 +200,7 @@ function printWorkspaceDiff(diff: WorkspaceDiff): void {
 }
 
 async function readWorkspaceDiff(cwd: string, revision: string): Promise<WorkspaceDiff> {
-  const maxLength = 250_000;
+  const maxLength = 96_000;
   let combined: string;
   try {
     const [status, diff] = await Promise.all([
@@ -198,11 +221,6 @@ async function readWorkspaceDiff(cwd: string, revision: string): Promise<Workspa
     truncated: combined.length > maxLength,
     createdAt: new Date().toISOString(),
   };
-}
-
-async function agentPreviewEvent(cwd: string, revision: string) {
-  const diff = await readWorkspaceDiff(cwd, revision);
-  return { id: randomUUID(), kind: "agent.preview" as const, payload: Buffer.from(diff.text.slice(0, 180_000)).toString("base64url") };
 }
 
 function checkpointTransfer(checkpoint: WorkspaceCheckpoint): {
@@ -296,7 +314,398 @@ class CheckpointReceiver {
   }
 }
 
-async function prepareRoom(dryRun = false): Promise<{
+interface EncryptedEditorUpdate {
+  file: string;
+  nonce: string;
+  tag: string;
+  ciphertext: string;
+}
+
+function transportKey(secret: string, roomCode: string): Buffer {
+  return Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(roomCode.replace(/-/g, "").toUpperCase()), Buffer.from("multicode/v2/transport"), 32));
+}
+
+function sealTransport(key: Buffer, plaintext: Uint8Array, aad?: string): string {
+  const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", key, nonce); if (aad) cipher.setAAD(new TextEncoder().encode(aad)); const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return JSON.stringify({ version: 1, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") });
+}
+
+function openTransport(key: Buffer, sealed: string, aad?: string): Uint8Array {
+  const value = JSON.parse(sealed) as { version?: unknown; nonce?: unknown; tag?: unknown; ciphertext?: unknown };
+  if (value.version !== 1 || typeof value.nonce !== "string" || typeof value.tag !== "string" || typeof value.ciphertext !== "string") throw new Error("Invalid encrypted transport payload");
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(value.nonce, "base64url")); if (aad) decipher.setAAD(new TextEncoder().encode(aad)); decipher.setAuthTag(Buffer.from(value.tag, "base64url"));
+  return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(value.ciphertext, "base64url")), decipher.final()]));
+}
+
+function sealPrompt(key: Buffer, promptId: string, text: string): string { return sealTransport(key, new TextEncoder().encode(text), `prompt:${promptId}`); }
+function openPrompt(key: Buffer, promptId: string, text: string): string { return new TextDecoder().decode(openTransport(key, text, `prompt:${promptId}`)); }
+function sealAgentEvent(key: Buffer, event: AgentEvent): string {
+  const safe = { ...event } as AgentEvent & { text?: string; output?: string; truncated?: boolean };
+  if (typeof safe.text === "string" && safe.text.length > 96_000) { safe.text = safe.text.slice(0, 96_000); safe.truncated = true; }
+  if (typeof safe.output === "string" && safe.output.length > 96_000) { safe.output = safe.output.slice(0, 96_000); safe.truncated = true; }
+  return sealTransport(key, new TextEncoder().encode(JSON.stringify(safe)));
+}
+function sealCheckpoint(key: Buffer, checkpoint: WorkspaceCheckpoint): WorkspaceCheckpoint {
+  const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", key, nonce); const ciphertext = Buffer.concat([cipher.update(Buffer.from(checkpoint.bundle, "base64")), cipher.final()]);
+  return { ...checkpoint, bundle: Buffer.concat([Buffer.from([1]), nonce, cipher.getAuthTag(), ciphertext]).toString("base64") };
+}
+function openCheckpoint(key: Buffer, checkpoint: WorkspaceCheckpoint): WorkspaceCheckpoint {
+  const sealed = Buffer.from(checkpoint.bundle, "base64"); if (sealed.byteLength < 30 || sealed[0] !== 1) throw new Error("Invalid encrypted checkpoint");
+  const decipher = createDecipheriv("aes-256-gcm", key, sealed.subarray(1, 13)); decipher.setAuthTag(sealed.subarray(13, 29));
+  return { ...checkpoint, bundle: Buffer.concat([decipher.update(sealed.subarray(29)), decipher.final()]).toString("base64") };
+}
+
+function safeRoomFile(root: string, file: string): { fileId: string; target: string } {
+  if (!file || file.includes("\0") || file.includes("\\") || path.posix.isAbsolute(file)) throw new Error("Invalid collaborative file path");
+  const normalized = path.posix.normalize(file);
+  if (normalized !== file || normalized === "." || normalized.startsWith("../") || /^[A-Za-z]:/.test(normalized)) throw new Error("Collaborative file path escapes the room workspace");
+  const target = path.resolve(root, ...normalized.split("/"));
+  const canonicalRoot = path.resolve(root);
+  if (!target.startsWith(`${canonicalRoot}${path.sep}`)) throw new Error("Collaborative file path escapes the room workspace");
+  return { fileId: normalized, target };
+}
+
+async function assertNoSymlinkPath(root: string, target: string): Promise<void> {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Collaborative path escapes the room workspace");
+  let current = path.resolve(root);
+  for (const part of relative.split(path.sep)) {
+    current = path.join(current, part);
+    try { if ((await lstat(current)).isSymbolicLink()) throw new Error("Symlinks are not supported in collaborative paths"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  }
+}
+
+class RoomAuthority {
+  private workspaceTail: Promise<void> = Promise.resolve();
+  private readonly committedEvents = new Map<string, { actorId: string; event: CollaborationEvent }>();
+  private constructor(
+    private readonly workspacePath: string,
+    private readonly editorKey: Buffer,
+    private readonly session: HostSession,
+  ) {}
+
+  static async create(options: {
+    roomId: string;
+    editorSalt: string;
+    secret: string;
+    workspacePath: string;
+    sessionDirectory: string;
+  }): Promise<RoomAuthority> {
+    const secret = await loadOrCreateRoomSecret(path.join(options.sessionDirectory, "room-secret"), options.secret);
+    const epoch = await loadOrCreateSessionEpoch(path.join(options.sessionDirectory, "epoch"));
+    const journal = new SqliteJournal(path.join(options.sessionDirectory, "session.db"));
+    const session = new HostSession(options.roomId, epoch, secret, journal);
+    const recovery = await session.recover();
+    const authority = new RoomAuthority(
+      options.workspacePath,
+      Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(options.editorSalt), Buffer.from("multicode/v2/editor"), 32)),
+      session,
+    );
+    const manifest = session.manifest.snapshot();
+    for (const retiredPath of manifest.retiredPaths) { const retired = safeRoomFile(options.workspacePath, retiredPath); await assertNoSymlinkPath(options.workspacePath, retired.target); await rm(retired.target, { force: true }); }
+    for (const file of manifest.files) if (!file.deleted && file.kind === "text") await authority.materialize(file.fileId);
+    await authority.discoverWorkspaceFiles(options.workspacePath, recovery.lastSequence > 0);
+    return authority;
+  }
+
+  commit(actorId: string, event: CollaborationEvent): Promise<CollaborationEvent> {
+    return this.enqueueWorkspace(async () => {
+      const prior = this.committedEvents.get(event.id);
+      if (prior) { if (prior.actorId !== actorId) throw new Error("Collaboration event ID was already used by another participant"); return prior.event; }
+      const committed = await this.commitNow(actorId, event);
+      this.committedEvents.set(event.id, { actorId, event: committed });
+      if (this.committedEvents.size > 10_000) this.committedEvents.delete(this.committedEvents.keys().next().value as string);
+      return committed;
+    });
+  }
+
+  withWorkspaceLock<T>(operation: () => Promise<T>): Promise<T> {
+    return this.enqueueWorkspace(operation);
+  }
+
+  compact(): Promise<number> { return this.enqueueWorkspace(() => this.session.compact()); }
+  close(): Promise<void> { return this.enqueueWorkspace(() => this.session.close()); }
+
+  previewEvent(turnId: string, revision: number, diff: WorkspaceDiff): CollaborationEvent {
+    return this.encryptedEvent("agent.preview", "__preview__", new TextEncoder().encode(JSON.stringify({ turnId, revision, diff })));
+  }
+
+  proposalEvent(turnId: string, patchText: string): CollaborationEvent {
+    const truncated = patchText.length > 96_000;
+    return this.encryptedEvent("agent.proposal", "__proposal__", new TextEncoder().encode(JSON.stringify({ turnId, status: "pending", patchText: truncated ? patchText.slice(0, 96_000) : patchText, truncated })));
+  }
+
+  async reconcileAgentChanges(changes: WorkspaceChange[]): Promise<CollaborationEvent[]> {
+    return this.enqueueWorkspace(() => this.reconcileWorkspaceChangesLocked(changes, "agent"));
+  }
+
+  async reconcileAgentChangesLocked(changes: WorkspaceChange[]): Promise<CollaborationEvent[]> {
+    return this.reconcileWorkspaceChangesLocked(changes, "agent");
+  }
+
+  async reconcileExternalWorkspace(): Promise<CollaborationEvent[]> {
+    return this.enqueueWorkspace(async () => {
+      const listed = (await execFileAsync("git", ["-C", this.workspacePath, "ls-files", "-c", "-o", "--exclude-standard", "-z"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })).stdout.split("\0").filter(Boolean);
+      const current = new Map<string, { content: string; hash: string }>();
+      for (const file of listed) {
+        try { await this.assertCollaborativePolicy(file); const content = await this.readCollaborativeText(safeRoomFile(this.workspacePath, file).target); current.set(file, { content, hash: createHash("sha256").update(content).digest("hex") }); }
+        catch { /* Missing, ignored, binary, oversized, and unsafe paths are not imported. */ }
+      }
+      const active = this.session.manifest.snapshot().files.filter((file) => !file.deleted && file.kind === "text"); const changes: WorkspaceChange[] = [];
+      const missing = active.filter((record) => !current.has(record.path)); const created = [...current.entries()].filter(([file]) => !this.session.manifest.fileByPath(file)); const consumedCreates = new Set<string>();
+      for (const record of missing) {
+        const renamed = created.find(([file, value]) => !consumedCreates.has(file) && value.hash === record.contentHash);
+        if (renamed) { consumedCreates.add(renamed[0]); changes.push({ operation: "rename", sourcePath: record.path, path: renamed[0] }); }
+        else changes.push({ operation: "delete", path: record.path });
+      }
+      for (const [file] of created) if (!consumedCreates.has(file)) changes.push({ operation: "create", path: file });
+      for (const record of active) { const value = current.get(record.path); if (value && value.hash !== record.contentHash) changes.push({ operation: "update", path: record.path }); }
+      return this.reconcileWorkspaceChangesLocked(changes, "external");
+    });
+  }
+
+  private async reconcileWorkspaceChangesLocked(changes: WorkspaceChange[], actorId: string): Promise<CollaborationEvent[]> {
+      const operations: WorkspaceTransactionOperation[] = [];
+      for (const change of changes) {
+        if (change.operation === "rename") {
+          if (!change.sourcePath) throw new Error("Agent rename is missing its source path");
+          const destination = safeRoomFile(this.workspacePath, change.path);
+          const content = await this.readCollaborativeText(destination.target);
+          operations.push({ type: "rename", sourcePath: change.sourcePath, destinationPath: change.path, content });
+          continue;
+        }
+        if (change.operation === "delete") {
+          operations.push({ type: "delete", path: change.path });
+          continue;
+        }
+        const target = safeRoomFile(this.workspacePath, change.path);
+        const content = await this.readCollaborativeText(target.target);
+        const existing = this.session.manifest.fileByPath(change.path);
+        operations.push(existing ? { type: "replace", path: change.path, content } : { type: "create", path: change.path, content });
+      }
+      if (!operations.length) return [];
+      const result = await this.session.applyWorkspaceTransaction(actorId, operations);
+      const parts: CollaborationEvent[] = [];
+      for (const operation of operations) {
+        if (operation.type === "create" || operation.type === "delete" || operation.type === "rename") {
+          const publicOperation = operation.type === "rename"
+            ? { type: operation.type, sourcePath: operation.sourcePath, destinationPath: operation.destinationPath }
+            : operation;
+          parts.push(this.encryptedEvent("manifest.operation", "__manifest__", new TextEncoder().encode(JSON.stringify(publicOperation)), result.sequence, actorId));
+        }
+        if (operation.type === "replace" || operation.type === "rename") {
+          const path = operation.type === "rename" ? operation.destinationPath : operation.path;
+          const update = result.documentUpdates.find((candidate) => candidate.path === path);
+          if (update) parts.push(this.documentEvent(path, update.update, result.sequence, actorId));
+        }
+      }
+      const metadata = { transactionId: result.transactionId, partCount: parts.length };
+      const prepare = this.encryptedEvent("workspace.commit.prepare", "__transaction__", new TextEncoder().encode(JSON.stringify(metadata)), result.sequence, actorId);
+      const committedParts = parts.map((event, partIndex) => ({ ...event, transactionId: result.transactionId, partIndex, partCount: parts.length }));
+      const finalize = this.encryptedEvent("workspace.commit.finalize", "__transaction__", new TextEncoder().encode(JSON.stringify(metadata)), result.sequence, actorId);
+      return [prepare, ...committedParts, finalize];
+  }
+
+  private async discoverWorkspaceFiles(directory = this.workspacePath, preserveAuthoritative = false): Promise<void> {
+    if (path.resolve(directory) !== path.resolve(this.workspacePath)) return;
+    const listed = (await execFileAsync("git", ["-C", this.workspacePath, "ls-files", "-c", "-o", "--exclude-standard", "-z"], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })).stdout;
+    for (const relative of listed.split("\0").filter(Boolean)) {
+      const name = path.posix.basename(relative);
+      if (/(^|\/)(node_modules|dist|build|\.cache|coverage)(\/|$)/.test(relative) || name === ".env" || name.startsWith(".env.") || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name)) continue;
+      const { target: absolute } = safeRoomFile(this.workspacePath, relative);
+      if (preserveAuthoritative && this.session.manifest.fileByPath(relative)) continue;
+      try {
+        const content = await this.readCollaborativeText(absolute);
+        await this.session.ensureDocumentText("system", relative, content);
+      } catch { /* Binary, oversized, unreadable, and secret files are not collaborative text documents. */ }
+    }
+  }
+
+  private async readCollaborativeText(target: string): Promise<string> {
+    await assertNoSymlinkPath(this.workspacePath, target);
+    const contents = await readFile(target);
+    if (contents.byteLength > maxCollaborativeTextBytes) throw new Error("Collaborative text file is too large");
+    return new TextDecoder("utf-8", { fatal: true }).decode(contents);
+  }
+
+  private async assertCollaborativePolicy(file: string): Promise<void> {
+    safeRoomFile(this.workspacePath, file); const name = path.posix.basename(file);
+    if (/(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || name === ".env" || name.startsWith(".env.") || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name)) throw new Error("Path is excluded by the room sharing policy");
+    try { await execFileAsync("git", ["-C", this.workspacePath, "check-ignore", "-q", "--", file]); throw new Error("Path is ignored by the room sharing policy"); }
+    catch (error) { if ((error as NodeJS.ErrnoException & { code?: number }).code !== 1) throw error; }
+  }
+
+  private async commitNow(actorId: string, event: CollaborationEvent): Promise<CollaborationEvent> {
+    if (event.sequence !== undefined) throw new Error("Clients cannot assign authoritative collaboration sequences");
+    if (event.kind === "presence.update") {
+      const value = JSON.parse(Buffer.from(this.decryptEvent(event)).toString()) as { file?: unknown; selections?: unknown };
+      if (typeof value.file !== "string" || !Array.isArray(value.selections) || value.selections.length > 100) throw new Error("Invalid presence update");
+      safeRoomFile(this.workspacePath, value.file);
+      return { ...event, actorId, committedAt: new Date().toISOString() };
+    }
+    if (event.kind === "document.subscribe") {
+      const encrypted = this.parseEncryptedEvent(event);
+      if (encrypted.file !== "__control__") throw new Error("Invalid document subscription");
+      const subscription = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { file?: unknown };
+      if (typeof subscription.file !== "string") throw new Error("Invalid document subscription");
+      await this.assertCollaborativePolicy(subscription.file);
+      const { fileId, target } = safeRoomFile(this.workspacePath, subscription.file);
+      const text = await this.readCollaborativeText(target);
+      await this.session.ensureDocumentText(actorId, fileId, text, event.id);
+      const snapshot = this.session.documentSnapshot(fileId);
+      return this.encryptedEvent("document.snapshot", "__snapshot__", new TextEncoder().encode(JSON.stringify({ file: fileId, fileId: snapshot.record.fileId, documentEpoch: snapshot.record.documentEpoch, update: Buffer.from(snapshot.update).toString("base64url") })), undefined, actorId, actorId);
+    }
+    if (event.kind === "manifest.operation") {
+      const encrypted = this.parseEncryptedEvent(event);
+      if (encrypted.file !== "__manifest__") throw new Error("Invalid encrypted manifest payload");
+      const operation = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as
+        | { type: "create"; path: string; content: string }
+        | { type: "rename"; sourcePath: string; destinationPath: string }
+        | { type: "delete"; path: string };
+      if (!operation || !["create", "rename", "delete"].includes(operation.type)) throw new Error("Invalid manifest operation");
+      if (operation.type === "create") {
+        await this.assertCollaborativePolicy(operation.path);
+        const destination = safeRoomFile(this.workspacePath, operation.path); await assertNoSymlinkPath(this.workspacePath, destination.target);
+        if (typeof operation.content !== "string" || Buffer.byteLength(operation.content) > maxCollaborativeTextBytes) throw new Error("Collaborative text file is too large");
+        const result = await this.session.applyManifestOperation(actorId, operation, event.id);
+        await this.materialize(result.record.fileId);
+        return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
+      }
+      if (operation.type === "rename") {
+        await this.assertCollaborativePolicy(operation.destinationPath);
+        const source = safeRoomFile(this.workspacePath, operation.sourcePath);
+        const destination = safeRoomFile(this.workspacePath, operation.destinationPath);
+        await assertNoSymlinkPath(this.workspacePath, source.target); await assertNoSymlinkPath(this.workspacePath, destination.target);
+        const result = await this.session.applyManifestOperation(actorId, operation, event.id);
+        await mkdir(path.dirname(destination.target), { recursive: true });
+        await rename(source.target, destination.target).catch(async (error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+          await this.materialize(result.record.fileId);
+        });
+        return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
+      }
+      const target = safeRoomFile(this.workspacePath, operation.path);
+      await assertNoSymlinkPath(this.workspacePath, target.target);
+      const result = await this.session.applyManifestOperation(actorId, operation, event.id);
+      await rm(target.target, { force: true });
+      return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
+    }
+    if (event.kind !== "document.update") throw new Error("Participants cannot publish agent previews");
+    const encrypted = this.parseEncryptedEvent(event);
+    if (encrypted.file !== "__document__") throw new Error("Invalid document update");
+    const updatePayload = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { file?: unknown; fileId?: unknown; documentEpoch?: unknown; update?: unknown };
+    if (typeof updatePayload.file !== "string" || typeof updatePayload.fileId !== "string" || typeof updatePayload.documentEpoch !== "number" || typeof updatePayload.update !== "string") throw new Error("Invalid document update");
+    const { fileId } = safeRoomFile(this.workspacePath, updatePayload.file);
+    const record = this.session.manifest.fileByPath(fileId);
+    if (!record || record.fileId !== updatePayload.fileId || record.documentEpoch !== updatePayload.documentEpoch) throw new Error("Document identity changed; resynchronization required");
+    await assertNoSymlinkPath(this.workspacePath, safeRoomFile(this.workspacePath, record.path).target);
+    const result = await this.session.applyDocumentUpdate(actorId, fileId, Buffer.from(updatePayload.update, "base64url"), event.id);
+    await this.materialize(result.fileId);
+    return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
+  }
+
+  private async materialize(fileId: string): Promise<void> {
+    const record = this.session.manifest.file(fileId);
+    if (!record || record.deleted || record.kind !== "text") throw new Error("Authoritative manifest file no longer exists");
+    const { target } = safeRoomFile(this.workspacePath, record.path);
+    await assertNoSymlinkPath(this.workspacePath, target);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, this.session.documents.document(fileId).getText("content").toString(), "utf8");
+  }
+
+  private decryptEvent(event: CollaborationEvent): Uint8Array {
+    return this.decrypt(this.parseEncryptedEvent(event));
+  }
+
+  private parseEncryptedEvent(event: CollaborationEvent): EncryptedEditorUpdate {
+    const value = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as Partial<EncryptedEditorUpdate>;
+    if (typeof value.file !== "string" || typeof value.nonce !== "string" || typeof value.tag !== "string" || typeof value.ciphertext !== "string") {
+      throw new Error("Invalid encrypted collaboration payload");
+    }
+    return value as EncryptedEditorUpdate;
+  }
+
+  private decrypt(value: EncryptedEditorUpdate): Uint8Array {
+    const decipher = createDecipheriv("aes-256-gcm", this.editorKey, Buffer.from(value.nonce, "base64url"));
+    decipher.setAuthTag(Buffer.from(value.tag, "base64url"));
+    return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(value.ciphertext, "base64url")), decipher.final()]));
+  }
+
+  private encryptedEvent(kind: CollaborationEvent["kind"], file: string, payload: Uint8Array, sequence?: number, actorId = "host", recipientId?: string): CollaborationEvent {
+    const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", this.editorKey, nonce); const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()]);
+    const encrypted: EncryptedEditorUpdate = { file, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") };
+    return { id: randomUUID(), kind, payload: Buffer.from(JSON.stringify(encrypted)).toString("base64url"), ...(sequence ? { sequence } : {}), actorId, ...(recipientId ? { recipientId } : {}), committedAt: new Date().toISOString() };
+  }
+
+  private documentEvent(file: string, update: Uint8Array, sequence: number, actorId: string): CollaborationEvent {
+    const record = this.session.manifest.fileByPath(file);
+    if (!record) throw new Error("Document is not present in the authoritative manifest");
+    return this.encryptedEvent("document.update", "__document__", new TextEncoder().encode(JSON.stringify({ file, fileId: record.fileId, documentEpoch: record.documentEpoch, update: Buffer.from(update).toString("base64url") })), sequence, actorId);
+  }
+
+  private enqueueWorkspace<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.workspaceTail.then(operation);
+    this.workspaceTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
+
+class AgentPreviewWatcher {
+  private watcher: FSWatcher | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private reconcileTimer: ReturnType<typeof setInterval> | undefined;
+  private revision = 0;
+  private turnId = "idle";
+
+  constructor(private readonly agentPath: string, private readonly publish: (turnId: string, revision: number, diff: WorkspaceDiff) => Promise<void> | void) {}
+
+  start(): void {
+    try {
+      this.watcher = watch(this.agentPath, { recursive: true }, (_event, filename) => {
+        const file = filename?.toString().split(path.sep).join("/") ?? "";
+        if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env/.test(file)) return;
+        this.schedule();
+      });
+    } catch { /* Periodic reconciliation below is the portable watcher fallback. */ }
+    this.reconcileTimer = setInterval(() => this.schedule(), 2_000);
+    this.reconcileTimer.unref();
+  }
+
+  beginTurn(turnId: string): void { this.turnId = turnId; this.revision = 0; this.schedule(); }
+  reconcileNow(): void { this.schedule(0); }
+  close(): void { this.watcher?.close(); this.watcher = undefined; if (this.timer) clearTimeout(this.timer); if (this.reconcileTimer) clearInterval(this.reconcileTimer); }
+
+  private schedule(delay = 200): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => { this.timer = undefined; void this.reconcile().catch((error: unknown) => console.error(err.warning(`Agent preview reconciliation failed: ${error instanceof Error ? error.message : String(error)}`))); }, delay);
+  }
+
+  private async reconcile(): Promise<void> {
+    const candidateRevision = this.revision + 1;
+    const first = await readWorkspaceDiff(this.agentPath, `${this.turnId}:${candidateRevision}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = await readWorkspaceDiff(this.agentPath, `${this.turnId}:${candidateRevision}`);
+    if (createHash("sha256").update(first.text).digest("hex") !== createHash("sha256").update(second.text).digest("hex")) { this.schedule(); return; }
+    this.revision = candidateRevision;
+    await this.publish(this.turnId, candidateRevision, second);
+  }
+}
+
+class SharedWorkspaceWatcher {
+  private watcher: FSWatcher | undefined; private timer: ReturnType<typeof setTimeout> | undefined; private interval: ReturnType<typeof setInterval> | undefined; private reconciling = false; private pending = false;
+  constructor(private readonly workspacePath: string, private readonly reconcile: () => Promise<void>) {}
+  start(): void {
+    try { this.watcher = watch(this.workspacePath, { recursive: true }, (_event, filename) => { const file = filename?.toString().split(path.sep).join("/") ?? ""; if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || /(^|\/)\.env(?:\.|$)/.test(file)) return; this.schedule(); }); }
+    catch { /* Periodic reconciliation remains active on platforms without recursive fs.watch. */ }
+    this.interval = setInterval(() => this.schedule(), 2_000); this.interval.unref();
+  }
+  close(): void { this.watcher?.close(); if (this.timer) clearTimeout(this.timer); if (this.interval) clearInterval(this.interval); }
+  private schedule(): void { if (this.timer) clearTimeout(this.timer); this.timer = setTimeout(() => { this.timer = undefined; void this.run(); }, 200); }
+  private async run(): Promise<void> { if (this.reconciling) { this.pending = true; return; } this.reconciling = true; try { await this.reconcile(); } catch (error) { console.error(err.warning(`External workspace reconciliation failed: ${error instanceof Error ? error.message : String(error)}`)); } finally { this.reconciling = false; if (this.pending) { this.pending = false; this.schedule(); } } }
+}
+
+async function prepareRoom(dryRun = false, includeSensitive = false): Promise<{
   roomId: string;
   workspacePath?: string;
   baseCommit?: string;
@@ -306,6 +715,9 @@ async function prepareRoom(dryRun = false): Promise<{
   if (managedWorktree) {
     throw new Error(`Refusing to host from a MultiCode ${managedWorktree.role} worktree. Open the original repository at ${managedWorktree.repositoryRoot}`);
   }
+  const tracked = (await execFileAsync("git", ["-C", repository.root, "ls-files", "-z"], { encoding: "utf8" })).stdout.split("\0").filter(Boolean);
+  const sensitive = tracked.filter((file) => file.split("/").some((name) => name === ".env" || name.startsWith(".env.") || /^(id_(rsa|dsa|ecdsa|ed25519)|.*\.(pem|key|p12|pfx))$/i.test(name)));
+  if (sensitive.length && !includeSensitive) throw new Error(`Tracked sensitive files require explicit confirmation: ${sensitive.slice(0, 5).join(", ")}. Re-run with --include-sensitive only if every participant may receive them.`);
   console.log(out.success(`${out.label("Repository")} ${out.value(repository.root)}`));
   if (repository.dirty) console.log(out.warning("Uncommitted and untracked changes will be included in synchronized checkpoints."));
   if (repository.operationInProgress) throw new Error("Finish the current Git operation before creating a room");
@@ -321,37 +733,18 @@ async function prepareRoom(dryRun = false): Promise<{
   return { roomId, workspacePath: repository.root, baseCommit: repository.head };
 }
 
-async function prepareHostedWorkspace(roomId: string): Promise<{ workspacePath: string; agentPath: string; baseCommit: string; checkpointCommit: string }> {
+async function prepareHostedWorkspace(roomId: string): Promise<{ workspacePath: string; agentPath: string; baseCommit: string; checkpointCommit: string; sessionDirectory: string }> {
   const room = await createRoomWorktrees({ cwd: process.cwd(), roomId });
   console.log(out.success(`${out.label("Room workspace")} ${out.value(room.sharedPath)}`));
   console.log(out.success(`${out.label("Codex workspace")} ${out.value(room.agentPath)}`));
-  return { workspacePath: room.sharedPath, agentPath: room.agentPath, baseCommit: room.baseCommit, checkpointCommit: room.checkpointCommit };
+  return { workspacePath: room.sharedPath, agentPath: room.agentPath, baseCommit: room.baseCommit, checkpointCommit: room.checkpointCommit, sessionDirectory: room.sessionDirectory };
 }
 
-async function applyAgentResult(options: { sharedPath: string; agentPath: string; checkpointCommit: string }): Promise<boolean> {
-  const { stdout } = await execFileAsync("git", ["diff", "--binary", options.checkpointCommit, "--"], { cwd: options.agentPath, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
-  if (!stdout) return false;
-  try {
-    await new Promise<void>((resolve, reject) => {
-    const child = spawn("git", ["apply", "--3way", "--whitespace=nowarn", "-"], { cwd: options.sharedPath, stdio: ["pipe", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    child.once("error", reject);
-    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(stderr || "Agent changes conflict with shared workspace")));
-    child.stdin.end(stdout);
-    });
-  } catch (error) {
-    const proposalPath = path.join(options.sharedPath, ".multicode-agent-conflict.patch");
-    await writeFile(proposalPath, stdout, "utf8");
-    throw new Error(`${error instanceof Error ? error.message : String(error)}. Saved proposal at ${proposalPath}`);
-  }
-  return true;
-}
-
-async function createRoom(options: { agent: string; prompt?: string; model?: string; dryRun?: boolean }): Promise<void> {
+async function createRoom(options: { agent: string; prompt?: string; model?: string; dryRun?: boolean; includeSensitive?: boolean }): Promise<void> {
   if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
-  const room = await prepareRoom(options.dryRun);
+  const room = await prepareRoom(options.dryRun, options.includeSensitive);
   if (options.dryRun || !room.workspacePath) return;
+  const hosted = await prepareHostedWorkspace(room.roomId);
 
   const adapter = new CodexAppServerAdapter();
   const stop = installStopHandlers(async () => {
@@ -361,7 +754,7 @@ async function createRoom(options: { agent: string; prompt?: string; model?: str
   const eventTask = (async () => {
     for await (const event of adapter.events()) printAgentEvent(event);
   })();
-  const { threadId } = await adapter.start({ cwd: room.workspacePath, ...(options.model ? { model: options.model } : {}) });
+  const { threadId } = await adapter.start({ cwd: hosted.agentPath, ...(options.model ? { model: options.model } : {}) });
   console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
   if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
   else console.log(`${out.muted("Room is running locally. Pass")} ${out.command("--prompt")} ${out.muted("to begin a turn.")}`);
@@ -438,6 +831,7 @@ interface HostRoomOptions {
   publicUrl?: string;
   relay?: string;
   local?: boolean;
+  includeSensitive?: boolean;
 }
 
 async function hostRoom(options: HostRoomOptions): Promise<void> {
@@ -448,31 +842,72 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     return;
   }
   if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
-  const prepared = await prepareRoom();
+  const prepared = await prepareRoom(false, options.includeSensitive);
   if (!prepared.workspacePath || !prepared.baseCommit) return;
   const hosted = await prepareHostedWorkspace(prepared.roomId);
   const workspacePath = hosted.workspacePath;
   const agentPath = hosted.agentPath;
-  const checkpointCommit = hosted.checkpointCommit;
   const baseCommit = hosted.baseCommit;
+  const participantCode = localInviteCode();
+  const sessionSecret = roomSecret();
+  const localTransportKey = transportKey(sessionSecret, participantCode);
+  const authority = await RoomAuthority.create({
+    roomId: prepared.roomId,
+    editorSalt: participantCode,
+    secret: sessionSecret,
+    workspacePath,
+    sessionDirectory: hosted.sessionDirectory,
+  });
   let checkpointSequence = 0;
   let checkpointParent = baseCommit;
   let latestCheckpoint: WorkspaceCheckpoint | undefined;
+  let turnSequence = 0;
+  let activeTurnBase: AgentTurnSnapshot | undefined;
+  let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
   const adapter = new CodexAppServerAdapter();
-  const token = randomBytes(24).toString("base64url");
+  const roomParticipants = new Map<string, RoomParticipant>();
+  let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
+  const token = participantCode;
   const relay = new RoomRelay({
     roomId: prepared.roomId,
     token,
     hostName: options.name,
     onPrompt: async (prompt) => {
-      await adapter.sendPrompt({ promptId: prompt.promptId, text: prompt.text });
+      activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: prepared.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
+      let promptText = prompt.text; try { promptText = openPrompt(localTransportKey, prompt.promptId, prompt.text); } catch { /* Host-local input is already plaintext. */ }
+      await adapter.sendPrompt({ promptId: prompt.promptId, text: promptText });
     },
+    onCollaborationEvent: (participant, event) => authority.commit(participant.id, event),
+    onApproval: async (_participant, requestId, decision) => adapter.resolveApproval(requestId, decision),
     onCheckpointRequest: (participantId, sequence) => {
       if (!latestCheckpoint || latestCheckpoint.sequence !== sequence) throw new Error("Requested checkpoint is no longer available from the host");
-      relay.publishWorkspaceCheckpoint(latestCheckpoint, participantId);
+      relay.publishWorkspaceCheckpoint(sealCheckpoint(localTransportKey, latestCheckpoint), participantId);
     },
-    onRoomEvent: (message) => printRoomMessage(message, false),
+    onRoomEvent: (message) => {
+      if (message.type === "participant.joined") roomParticipants.set(message.participant.id, message.participant);
+      if (message.type === "participant.left") roomParticipants.delete(message.participantId);
+      if (message.type === "participant.capabilities") { const participant = roomParticipants.get(message.participantId); if (participant) participant.capabilities = message.capabilities; }
+      printRoomMessage(decryptPromptMessage(message, localTransportKey), false);
+    },
   });
+  const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
+  const ipc = new LocalIpcServer(ipcToken, async (payload) => {
+    const request = payload as { type?: string; text?: string; participantId?: string; capabilities?: Capability[] };
+    if (request.type === "status") return { roomId: prepared.roomId, mode: "local", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null };
+    if (request.type === "prompt" && request.text) { const promptId = randomUUID(); relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, request.text), promptId); return { queued: true }; }
+    if (request.type === "interrupt") { await adapter.interrupt(); return { interrupted: true }; }
+    if (request.type === "capabilities" && request.participantId && request.capabilities) { relay.setParticipantCapabilities(request.participantId, request.capabilities); return { updated: true }; }
+    if (request.type === "proposal.discard" && pendingConflict) {
+      const discarded = pendingConflict; pendingConflict = undefined; await Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); relay.publishAgentEvent({ ...discarded.event, status: "discarded" } as AgentEvent); return { discarded: true };
+    }
+    if (request.type === "proposal.retry") { await retryProposal(); return { resolved: true }; }
+    throw new Error("Unsupported session command");
+  });
+  await ipc.listen(process.platform === "win32" ? `\\\\.\\pipe\\multicode-${prepared.roomId}` : path.join(hosted.sessionDirectory, "daemon.sock"));
+  const previewWatcher = new AgentPreviewWatcher(agentPath, async (turnId, revision, diff) => {
+    relay.publishCollaborationEvent(authority.previewEvent(turnId, revision, diff));
+  });
+  const sharedWatcher = new SharedWorkspaceWatcher(workspacePath, async () => { for (const event of await authority.reconcileExternalWorkspace()) relay.publishCollaborationEvent(event); });
   const publishCheckpoint = async (force = false): Promise<void> => {
     const checkpoint = await createWorkspaceCheckpoint({
       cwd: workspacePath,
@@ -486,32 +921,68 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     checkpointSequence = checkpoint.sequence;
     checkpointParent = checkpoint.commit;
     latestCheckpoint = checkpoint;
-    relay.publishWorkspaceCheckpoint(checkpoint);
+    relay.publishWorkspaceCheckpoint(sealCheckpoint(localTransportKey, checkpoint));
+    await authority.compact();
+  };
+  retryProposal = async () => {
+    const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal"); let collaborationEvents: CollaborationEvent[] = [];
+    const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+    if (merge.status !== "merged" && merge.status !== "unchanged") throw new Error("The proposal still conflicts with current human changes");
+    for (const event of collaborationEvents) relay.publishCollaborationEvent(event); await publishCheckpoint(); pendingConflict = undefined;
+    await Promise.all([rm(proposal.proposalPath, { force: true }), rm(proposal.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); relay.publishAgentEvent({ ...proposal.event, status: "resolved" } as AgentEvent);
   };
 
   const eventTask = (async () => {
     for await (const event of adapter.events()) {
       printAgentEvent(event);
+      if (event.type === "turn.started") previewWatcher.beginTurn(event.turnId);
       if (event.type === "turn.completed") {
-        try { await applyAgentResult({ sharedPath: workspacePath, agentPath, checkpointCommit }); } catch (error) { console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`)); }
-        await publishCheckpoint();
+        let relayEvent: AgentEvent = event;
+        const turn = activeTurnBase;
+        activeTurnBase = undefined;
+        if (turn && (!event.status || event.status === "completed" || event.status === "success")) {
+          try {
+            let collaborationEvents: CollaborationEvent[] = [];
+            const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+            if (merge.status === "merged") {
+              for (const collaborationEvent of collaborationEvents) relay.publishCollaborationEvent(collaborationEvent);
+              await publishCheckpoint();
+            }
+            if (merge.status === "conflicted") {
+              console.error(err.warning(`Agent result has conflicts. Saved proposal at ${merge.proposalPath ?? "the session proposal directory"}`));
+              relayEvent = { ...event, status: "pending-conflict" };
+              if (merge.proposalPath) pendingConflict = { event, proposalPath: merge.proposalPath, turn };
+              if (merge.proposalPath) relay.publishCollaborationEvent(authority.proposalEvent(event.turnId, await readFile(merge.proposalPath, "utf8")));
+            }
+          } catch (error) {
+            console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`));
+            relayEvent = { ...event, status: "merge-failed" };
+          }
+        }
         const diff = await readWorkspaceDiff(workspacePath, event.turnId);
         relay.publishWorkspaceDiff(diff);
-        relay.publishAgentEvent(event);
+        relay.publishAgentEvent(relayEvent);
         continue;
       }
-      if (event.type === "command.exited") relay.publishCollaborationEvent(await agentPreviewEvent(agentPath, event.turnId));
+      if (event.type === "command.exited") previewWatcher.reconcileNow();
       relay.publishAgentEvent(event);
     }
+    await new Promise<void>(() => undefined);
   })();
   let input: Interface | undefined;
   let cleanupSignals: () => void = () => undefined;
   let shutdownTask: Promise<void> | undefined;
+  let stopping = false;
   const shutdown = (): Promise<void> => {
     shutdownTask ??= (async () => {
+      stopping = true;
       input?.close();
+      previewWatcher.close();
+      sharedWatcher.close();
+      await ipc.close();
       await relay.close();
       await adapter.stop();
+      await authority.close();
     })();
     return shutdownTask;
   };
@@ -522,6 +993,8 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       ...(options.model ? { model: options.model } : {}),
     });
     console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
+    previewWatcher.start();
+    sharedWatcher.start();
 
     const bound = await relay.listen({ host: options.listen, port: parsePort(options.port) });
     await publishCheckpoint(true);
@@ -530,7 +1003,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       listenHost: options.listen,
       port: bound.port,
       roomId: prepared.roomId,
-      token,
+      token: `${participantCode}.${sessionSecret}`,
     });
     console.log(out.success(`${out.label("Room")} ${out.value(prepared.roomId)} ${out.muted("listening on")} ${out.value(`${options.listen}:${bound.port}`)}`));
     console.log(`\n${out.label("Invite someone with")}`);
@@ -540,12 +1013,34 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     }
     console.log(`\n${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter. Shared prompts run in queue order.")}`);
 
-    input = promptInput((text) => relay.submitHostPrompt(text));
+    input = promptInput((text) => {
+      if (text === "/interrupt") { void adapter.interrupt(); return; }
+      const approvalCommand = /^\/approve\s+(\S+)\s+(accept|decline|cancel)$/.exec(text); if (approvalCommand) { void adapter.resolveApproval(approvalCommand[1] as string, approvalCommand[2] as "accept" | "decline" | "cancel"); return; }
+      if (text === "/participants") { for (const participant of roomParticipants.values()) console.error(`${participant.id}  ${participant.name}  [${participant.capabilities.join(", ")}]`); return; }
+      const capabilityCommand = /^\/(grant|revoke)\s+(\S+)\s+(viewer|editor|prompter|reviewer)$/.exec(text);
+      if (capabilityCommand) {
+        const participant = [...roomParticipants.values()].find((candidate) => candidate.id === capabilityCommand[2] || candidate.name === capabilityCommand[2]);
+        if (!participant) { console.error(err.warning("Participant not found.")); return; }
+        const capability = capabilityCommand[3] as Capability; const capabilities = new Set(participant.capabilities);
+        if (capabilityCommand[1] === "grant") capabilities.add(capability); else capabilities.delete(capability);
+        relay.setParticipantCapabilities(participant.id, [...capabilities]); return;
+      }
+      if (text === "/proposal show") { console.error(pendingConflict ? err.info("◆", `Pending proposal: ${pendingConflict.proposalPath}`) : err.muted("No pending proposal.")); return; }
+      if (text === "/proposal discard") {
+        if (!pendingConflict) { console.error(err.muted("No pending proposal.")); return; }
+        const discarded = pendingConflict; pendingConflict = undefined;
+        void Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]).then(() => relay.publishAgentEvent({ ...discarded.event, status: "discarded" } as AgentEvent)); return;
+      }
+      if (text === "/proposal retry") {
+        void retryProposal().catch((error: unknown) => console.error(err.error(`Proposal retry failed: ${error instanceof Error ? error.message : String(error)}`))); return;
+      }
+      const promptId = randomUUID(); relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, text), promptId);
+    });
     cleanupSignals = installStopHandlers(async () => {
       console.error(`\n${err.info("■", "Stopping shared room…")}`);
       await shutdown();
     });
-    if (options.prompt) relay.submitHostPrompt(options.prompt);
+    if (options.prompt) { const promptId = randomUUID(); relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, options.prompt), promptId); }
     await eventTask;
   } finally {
     cleanupSignals();
@@ -601,6 +1096,29 @@ async function createRemoteRoom(
   });
 }
 
+async function resumeRemoteRoom(relayUrl: string, roomId: string, resumeToken: string, timeoutMs = 25_000): Promise<WebSocket> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    const candidate = new WebSocket(remoteUrl(relayUrl, "/host"));
+    try {
+      await new Promise<void>((resolve, reject) => { candidate.once("open", resolve); candidate.once("error", reject); });
+      const resumed = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Relay resume timed out")), 5_000);
+        const receive = (data: WebSocket.RawData) => {
+          const message = JSON.parse(data.toString()) as RelayServerMessage;
+          if (message.type === "relay.room.created" && message.resumed) { clearTimeout(timer); candidate.off("message", receive); resolve(); }
+          else if (message.type === "room.error" && message.fatal) { clearTimeout(timer); candidate.off("message", receive); reject(new Error(message.message)); }
+        };
+        candidate.on("message", receive);
+      });
+      candidate.send(JSON.stringify({ type: "relay.room.resume", roomId, resumeToken }));
+      await resumed; return candidate;
+    } catch (error) { lastError = error; candidate.terminate(); await new Promise((resolve) => setTimeout(resolve, 1_000)); }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Could not resume the remote room");
+}
+
 async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
   const relayUrl = options.relay ?? defaultRelayUrl;
@@ -610,11 +1128,21 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   let input: Interface | undefined;
   let cleanupSignals: () => void = () => undefined;
   let shutdownTask: Promise<void> | undefined;
+  let previewWatcher: AgentPreviewWatcher | undefined;
+  let sharedWatcher: SharedWorkspaceWatcher | undefined;
+  let ipc: LocalIpcServer | undefined;
+  let authorityForShutdown: RoomAuthority | undefined;
+  let stopping = false;
   const shutdown = (): Promise<void> => {
     shutdownTask ??= (async () => {
+      stopping = true;
       input?.close();
+      previewWatcher?.close();
+      sharedWatcher?.close();
+      await ipc?.close();
       if (socket?.readyState === WebSocket.OPEN) socket.close(1000, "Host stopped room");
       await adapter.stop();
+      await authorityForShutdown?.close();
     })();
     return shutdownTask;
   };
@@ -623,22 +1151,58 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     socket = await openWebSocket(remoteUrl(relayUrl, "/host"));
     const created = await createRemoteRoom(socket, { name: options.name });
     const sessionSecret = roomSecret();
-    const prepared = await prepareRoom();
+    const relayTransportKey = transportKey(sessionSecret, created.code);
+    const prepared = await prepareRoom(false, options.includeSensitive);
     if (!prepared.workspacePath || !prepared.baseCommit) return;
     const hosted = await prepareHostedWorkspace(created.roomId);
     const workspacePath = hosted.workspacePath;
     const agentPath = hosted.agentPath;
-    const checkpointCommit = hosted.checkpointCommit;
-    // The Pi relay is the room authority and durably journals encrypted collaboration events.
+    const authority = await RoomAuthority.create({
+      roomId: created.roomId,
+      editorSalt: created.code,
+      secret: sessionSecret,
+      workspacePath,
+      sessionDirectory: hosted.sessionDirectory,
+    });
+    authorityForShutdown = authority;
+    const pendingRelayMessages: string[] = [];
+    const sendToRelay = (message: unknown): void => {
+      const encoded = JSON.stringify(message);
+      if (socket?.readyState === WebSocket.OPEN) socket.send(encoded);
+      else { pendingRelayMessages.push(encoded); if (pendingRelayMessages.length > 2_000) pendingRelayMessages.shift(); }
+    };
+    const flushRelayMessages = (): void => { while (socket?.readyState === WebSocket.OPEN && pendingRelayMessages.length) socket.send(pendingRelayMessages.shift() as string); };
     const baseCommit = hosted.baseCommit;
     let checkpointSequence = 0;
     let checkpointParent = baseCommit;
     let latestCheckpoint: WorkspaceCheckpoint | undefined;
+    let turnSequence = 0;
+    let activeTurnBase: AgentTurnSnapshot | undefined;
+    const processedPromptIds = new Set<string>();
+    let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
+    const roomParticipants = new Map<string, RoomParticipant>();
+    let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
+    const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
+    ipc = new LocalIpcServer(ipcToken, async (payload) => {
+      const request = payload as { type?: string; text?: string; participantId?: string; capabilities?: Capability[] };
+      if (request.type === "status") return { roomId: created.roomId, mode: "remote", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null, relayConnected: socket?.readyState === WebSocket.OPEN };
+      if (request.type === "prompt" && request.text) { const promptId = randomUUID(); sendToRelay({ type: "prompt.submit", promptId, text: sealPrompt(relayTransportKey, promptId, request.text) }); return { queued: true }; }
+      if (request.type === "interrupt") { await adapter.interrupt(); return { interrupted: true }; }
+      if (request.type === "capabilities" && request.participantId && request.capabilities) { sendToRelay({ type: "relay.participant.capabilities", participantId: request.participantId, capabilities: request.capabilities }); return { updated: true }; }
+      if (request.type === "proposal.discard" && pendingConflict) { const discarded = pendingConflict; pendingConflict = undefined; await Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); const event = { ...discarded.event, status: "discarded" } as AgentEvent; sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "discarded", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify(event))) }); return { discarded: true }; }
+      if (request.type === "proposal.retry") { await retryProposal(); return { resolved: true }; }
+      throw new Error("Unsupported session command");
+    });
+    await ipc.listen(process.platform === "win32" ? `\\\\.\\pipe\\multicode-${created.roomId}` : path.join(hosted.sessionDirectory, "daemon.sock"));
+    previewWatcher = new AgentPreviewWatcher(agentPath, async (turnId, revision, diff) => {
+      sendToRelay({ type: "relay.collab.event", event: authority.previewEvent(turnId, revision, diff) });
+    });
+    sharedWatcher = new SharedWorkspaceWatcher(workspacePath, async () => { for (const event of await authority.reconcileExternalWorkspace()) sendToRelay({ type: "relay.collab.event", event }); });
     const publishCheckpoint = async (force = false, targetParticipantId?: string): Promise<void> => {
-      if (!socket || socket.readyState !== WebSocket.OPEN) return;
       if (targetParticipantId) {
         if (!latestCheckpoint) throw new Error("Requested checkpoint is no longer available from the host");
-        await sendRemoteCheckpoint(socket, latestCheckpoint, targetParticipantId);
+        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("Relay is reconnecting");
+        await sendRemoteCheckpoint(socket, sealCheckpoint(relayTransportKey, latestCheckpoint), targetParticipantId);
         return;
       }
       const checkpoint = await createWorkspaceCheckpoint({ cwd: workspacePath, roomId: prepared.roomId, sequence: checkpointSequence + 1, baseCommit, parentCommit: checkpointParent, force });
@@ -646,29 +1210,61 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       checkpointSequence = checkpoint.sequence;
       checkpointParent = checkpoint.commit;
       latestCheckpoint = checkpoint;
-      await sendRemoteCheckpoint(socket, checkpoint);
+      if (socket?.readyState === WebSocket.OPEN) await sendRemoteCheckpoint(socket, sealCheckpoint(relayTransportKey, checkpoint));
+      await authority.compact();
+    };
+    retryProposal = async () => {
+      const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal"); let collaborationEvents: CollaborationEvent[] = [];
+      const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+      if (merge.status !== "merged" && merge.status !== "unchanged") throw new Error("The proposal still conflicts with current human changes");
+      for (const event of collaborationEvents) sendToRelay({ type: "relay.collab.event", event }); await publishCheckpoint(); pendingConflict = undefined;
+      await Promise.all([rm(proposal.proposalPath, { force: true }), rm(proposal.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); const resolved = { ...proposal.event, status: "resolved" } as AgentEvent;
+      sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "resolved", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify(resolved))) });
     };
     const eventTask = (async () => {
       for await (const event of adapter.events()) {
         printAgentEvent(event);
-        if (!socket || socket.readyState !== WebSocket.OPEN) continue;
+        if (event.type === "turn.started") previewWatcher?.beginTurn(event.turnId);
         if (event.type === "turn.completed") {
-          try { await applyAgentResult({ sharedPath: workspacePath, agentPath, checkpointCommit }); } catch (error) { console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`)); }
-          await publishCheckpoint();
-          const diff = await readWorkspaceDiff(workspacePath, event.turnId);
-          socket.send(JSON.stringify({ type: "relay.workspace.diff", diff }));
-          socket.send(JSON.stringify({ type: "relay.agent.event", event }));
+          let relayEvent: AgentEvent = event;
+          const turn = activeTurnBase;
+          activeTurnBase = undefined;
+          if (turn && (!event.status || event.status === "completed" || event.status === "success")) {
+            try {
+              let collaborationEvents: CollaborationEvent[] = [];
+              const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+              if (merge.status === "merged") {
+                for (const collaborationEvent of collaborationEvents) {
+                  sendToRelay({ type: "relay.collab.event", event: collaborationEvent });
+                }
+                await publishCheckpoint();
+              }
+              if (merge.status === "conflicted") {
+                console.error(err.warning(`Agent result has conflicts. Saved proposal at ${merge.proposalPath ?? "the session proposal directory"}`));
+                relayEvent = { ...event, status: "pending-conflict" };
+                if (merge.proposalPath) pendingConflict = { event, proposalPath: merge.proposalPath, turn };
+                if (merge.proposalPath) sendToRelay({ type: "relay.collab.event", event: authority.proposalEvent(event.turnId, await readFile(merge.proposalPath, "utf8")) });
+              }
+            } catch (error) {
+              console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`));
+              relayEvent = { ...event, status: "merge-failed" };
+            }
+          }
+          sendToRelay({ type: "relay.agent.encrypted", eventType: relayEvent.type, ...(relayEvent.type === "turn.completed" && relayEvent.status ? { status: relayEvent.status } : {}), payload: sealAgentEvent(relayTransportKey, relayEvent) });
         } else {
-          if (event.type === "command.exited") socket.send(JSON.stringify({ type: "relay.collab.event", event: await agentPreviewEvent(agentPath, event.turnId) }));
-          socket.send(JSON.stringify({ type: "relay.agent.event", event }));
+          if (event.type === "command.exited") previewWatcher?.reconcileNow();
+          sendToRelay({ type: "relay.agent.encrypted", eventType: event.type, payload: sealAgentEvent(relayTransportKey, event) });
         }
       }
+      await new Promise<void>(() => undefined);
     })();
     const { threadId } = await adapter.start({
       cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
     });
     console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
+    previewWatcher.start();
+    sharedWatcher.start();
     await publishCheckpoint(true);
     console.log(out.success(`${out.label("Remote room")} ${out.value(relayUrl)}`));
     const inviteToken = `${created.code}.${sessionSecret}`;
@@ -678,7 +1274,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     console.log(`  ${out.command(`multicode join ${inviteToken}${relayArgument} --name 'Their name'`)}`);
     console.log(`\n${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter. Shared prompts run in queue order.")}`);
 
-    socket.on("message", (data) => {
+    const handleRelayMessage = (data: WebSocket.RawData) => {
       let message: RelayServerMessage;
       try {
         message = JSON.parse(data.toString()) as RelayServerMessage;
@@ -687,46 +1283,87 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         return;
       }
       if (message.type === "relay.room.created") return;
+      if (message.type === "room.welcome") for (const participant of message.participants) if (!participant.host) roomParticipants.set(participant.id, participant);
+      if (message.type === "participant.joined") roomParticipants.set(message.participant.id, message.participant);
+      if (message.type === "participant.left") roomParticipants.delete(message.participantId);
+      if (message.type === "participant.capabilities") { const participant = roomParticipants.get(message.participantId); if (participant) participant.capabilities = message.capabilities; }
+      if (message.type === "collab.submitted") {
+        void authority.commit(message.participantId, message.event).then((event) => {
+          sendToRelay({ type: "relay.collab.event", event });
+        }).catch((error: unknown) => {
+          console.error(err.error(`Collaboration update rejected: ${error instanceof Error ? error.message : String(error)}`));
+        });
+        return;
+      }
       if (message.type === "workspace.checkpoint.request") {
         void publishCheckpoint(false, message.participantId).catch((error: unknown) => {
           console.error(err.error(`Unable to send requested checkpoint: ${error instanceof Error ? error.message : String(error)}`));
         });
         return;
       }
+      if (message.type === "approval.submitted") { void adapter.resolveApproval(message.requestId, message.decision); return; }
       if (message.type === "prompt.started") {
-        void adapter.sendPrompt({ promptId: message.prompt.promptId, text: message.prompt.text }).catch((error: unknown) => {
-          if (socket?.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({
-              type: "relay.prompt.failed",
-              promptId: message.prompt.promptId,
-              message: error instanceof Error ? error.message : String(error),
-            }));
-          }
+        if (processedPromptIds.has(message.prompt.promptId)) { sendToRelay({ type: "relay.prompt.failed", promptId: message.prompt.promptId, message: "Duplicate prompt replay rejected" }); return; }
+        processedPromptIds.add(message.prompt.promptId); if (processedPromptIds.size > 10_000) processedPromptIds.delete(processedPromptIds.keys().next().value as string);
+        void (async () => {
+          activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: created.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
+          await adapter.sendPrompt({ promptId: message.prompt.promptId, text: openPrompt(relayTransportKey, message.prompt.promptId, message.prompt.text) });
+        })().catch((error: unknown) => {
+          sendToRelay({ type: "relay.prompt.failed", promptId: message.prompt.promptId, message: error instanceof Error ? error.message : String(error) });
         });
       }
-      printRoomMessage(message, false);
+      printRoomMessage(decryptPromptMessage(message, relayTransportKey), false);
       if (message.type === "room.error" && message.fatal) void shutdown();
-    });
+    };
 
     const disconnected = new Promise<void>((resolve) => {
-      socket?.once("close", () => {
-        console.error(`\n${err.error("Disconnected from relay; the remote room has closed.")}`);
-        resolve();
-      });
+      const attach = (active: WebSocket): void => {
+        active.on("message", handleRelayMessage);
+        active.once("close", () => {
+          if (stopping || socket !== active) { if (stopping) resolve(); return; }
+          console.error(`\n${err.warning("Relay connection interrupted; attempting to resume the room…")}`);
+          void resumeRemoteRoom(relayUrl, created.roomId, created.resumeToken).then(async (resumed) => {
+            socket = resumed; attach(resumed); flushRelayMessages();
+            if (latestCheckpoint) await sendRemoteCheckpoint(resumed, sealCheckpoint(relayTransportKey, latestCheckpoint));
+            console.error(err.success("Remote room resumed."));
+          }).catch((error: unknown) => { console.error(err.error(`Remote room could not resume: ${error instanceof Error ? error.message : String(error)}`)); resolve(); });
+        });
+      };
+      attach(socket as WebSocket);
     });
     input = promptInput((text) => {
+      if (text === "/interrupt") { void adapter.interrupt(); return; }
+      const approvalCommand = /^\/approve\s+(\S+)\s+(accept|decline|cancel)$/.exec(text); if (approvalCommand) { void adapter.resolveApproval(approvalCommand[1] as string, approvalCommand[2] as "accept" | "decline" | "cancel"); return; }
+      if (text === "/participants") { for (const participant of roomParticipants.values()) console.error(`${participant.id}  ${participant.name}  [${participant.capabilities.join(", ")}]`); return; }
+      const capabilityCommand = /^\/(grant|revoke)\s+(\S+)\s+(viewer|editor|prompter|reviewer)$/.exec(text);
+      if (capabilityCommand) {
+        const participant = [...roomParticipants.values()].find((candidate) => candidate.id === capabilityCommand[2] || candidate.name === capabilityCommand[2]);
+        if (!participant) { console.error(err.warning("Participant not found.")); return; }
+        const capability = capabilityCommand[3] as Capability; const capabilities = new Set(participant.capabilities);
+        if (capabilityCommand[1] === "grant") capabilities.add(capability); else capabilities.delete(capability);
+        sendToRelay({ type: "relay.participant.capabilities", participantId: participant.id, capabilities: [...capabilities] }); return;
+      }
+      if (text === "/proposal show") { console.error(pendingConflict ? err.info("◆", `Pending proposal: ${pendingConflict.proposalPath}`) : err.muted("No pending proposal.")); return; }
+      if (text === "/proposal discard") {
+        if (!pendingConflict) { console.error(err.muted("No pending proposal.")); return; }
+        const discarded = pendingConflict; pendingConflict = undefined;
+        void Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]).then(() => sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "discarded", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify({ ...discarded.event, status: "discarded" }))) })); return;
+      }
+      if (text === "/proposal retry") {
+        void retryProposal().catch((error: unknown) => console.error(err.error(`Proposal retry failed: ${error instanceof Error ? error.message : String(error)}`))); return;
+      }
       if (socket?.readyState !== WebSocket.OPEN) {
         console.error(err.warning("Not connected; prompt was not sent."));
         return;
       }
-      socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
+      const promptId = randomUUID(); sendToRelay({ type: "prompt.submit", promptId, text: sealPrompt(relayTransportKey, promptId, text) });
     });
     cleanupSignals = installStopHandlers(async () => {
       console.error(`\n${err.info("■", "Stopping remote room…")}`);
       await shutdown();
     });
     if (options.prompt) {
-      socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: options.prompt }));
+      const promptId = randomUUID(); sendToRelay({ type: "prompt.submit", promptId, text: sealPrompt(relayTransportKey, promptId, options.prompt) });
     }
     await Promise.race([eventTask, disconnected]);
   } finally {
@@ -735,9 +1372,10 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   }
 }
 
-async function joinRoom(inviteOrCode: string, options: { name: string; relay?: string }): Promise<void> {
+async function joinRoom(inviteOrCode: string, options: { name: string; relay?: string; viewer?: boolean; bootstrapOnly?: boolean }): Promise<void> {
   let url: URL;
   let token: string;
+  let relayTransportKey: Buffer | undefined;
   if (/^wss?:\/\//i.test(inviteOrCode)) {
     url = new URL(inviteOrCode);
     if (url.protocol !== "ws:" && url.protocol !== "wss:") throw new Error("Invite must use ws:// or wss://");
@@ -750,6 +1388,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
     if (!/^[A-HJ-NP-Z2-9]{10}$/.test(canonicalCode)) throw new Error("Invalid room code");
     const roomCode = `${canonicalCode.slice(0, 5)}-${canonicalCode.slice(5)}`;
     token = roomCode;
+    relayTransportKey = transportKey(urlSecret, roomCode);
     url.hash = "";
     url.searchParams.delete("token");
   } else {
@@ -759,6 +1398,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
     const canonical = (roomCode ?? "").replace(/-/g, "").toUpperCase();
     if (!/^[A-HJ-NP-Z2-9]{10}$/.test(canonical)) throw new Error("Invalid room code");
     token = `${canonical.slice(0, 5)}-${canonical.slice(5)}`;
+    relayTransportKey = transportKey(roomKey, token);
     url = remoteUrl(relayUrl, `/rooms/${token}`);
   }
 
@@ -771,6 +1411,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   const checkpointReceiver = new CheckpointReceiver();
 
   const synchronize = async (roomId: string, checkpoint: WorkspaceCheckpoint): Promise<void> => {
+    if (relayTransportKey) checkpoint = openCheckpoint(relayTransportKey, checkpoint);
     workspaceState ??= await prepareParticipantWorkspace({
       cwd: process.cwd(),
       roomId,
@@ -789,13 +1430,17 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
       await synchronize(roomId, checkpoint);
       if (joined) return;
       joined = true;
-      console.log(`${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter to add it to the shared queue.")}`);
+      if (options.bootstrapOnly) { console.log(`${chalk.green("●")} ${out.label("Room workspace bootstrapped")}`); socket.close(1000, "Bootstrap complete"); return; }
+      console.log(`${chalk.green("●")} ${out.label(options.viewer ? "Joined as viewer" : "Ready for prompts")} ${out.muted(options.viewer ? "File and agent updates are read-only." : "Type a prompt and press Enter to add it to the shared queue.")}`);
+      if (options.viewer) return;
       input = promptInput((text) => {
         if (socket.readyState !== WebSocket.OPEN) {
           console.error(err.warning("Not connected; prompt was not sent."));
           return;
         }
-        socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
+        const approval = /^\/approve\s+(\S+)\s+(accept|decline|cancel)$/.exec(text);
+        if (approval) socket.send(JSON.stringify({ type: "approval.resolve", requestId: approval[1], decision: approval[2] }));
+        else { const promptId = randomUUID(); socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: relayTransportKey ? sealPrompt(relayTransportKey, promptId, text) : text })); }
       });
     }).catch((error: unknown) => {
       console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
@@ -804,7 +1449,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   };
 
   const closed = new Promise<void>((resolve, reject) => {
-    socket.send(JSON.stringify({ type: "room.join", token, name: options.name }));
+    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, requestedRole: options.viewer ? "viewer" : "editor" }));
     socket.on("message", (data) => {
       let message: RoomServerMessage;
       try {
@@ -813,7 +1458,13 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
         console.error(err.error("Received an invalid message from the room"));
         return;
       }
-      printRoomMessage(message);
+      if (message.type === "agent.encrypted") {
+        if (!relayTransportKey) { console.error(err.error("Received encrypted agent output without a room key")); return; }
+        try { printAgentEvent(JSON.parse(new TextDecoder().decode(openTransport(relayTransportKey, message.payload))) as AgentEvent); }
+        catch { console.error(err.error("Could not decrypt agent output")); }
+      } else {
+        printRoomMessage(relayTransportKey ? decryptPromptMessage(message, relayTransportKey) : message);
+      }
       if (message.type === "room.welcome" && !joined) {
         if (!message.latestCheckpoint) {
           console.error(err.error("Room has no workspace checkpoint; cannot synchronize safely."));
@@ -862,10 +1513,9 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   } finally {
     cleanupSignals();
     if (workspaceState) {
-      console.error(err.info("↻", "Restoring your original branch…"));
       await restoreParticipantWorkspace(workspaceState);
-      console.error(err.success(`${err.label("Restored")} ${err.value(workspaceState.originalBranch ?? workspaceState.originalHead.slice(0, 12))}`));
-      if (workspaceState.backupRef) console.error(err.success(`${err.label("Local changes preserved")} ${err.muted(workspaceState.backupRef)}`));
+      console.error(err.success(`${err.label("Original checkout unchanged")} ${err.value(workspaceState.originalRoot)}`));
+      console.error(err.info("↻", `Room workspace preserved for recovery/export: ${workspaceState.root}`));
     }
   }
 }
@@ -895,14 +1545,25 @@ async function serveSession(options: { session: string; socket?: string }): Prom
   const databaseUrl = process.env.MULTICODE_DATABASE_URL;
   const sessionDirectory = path.join(homedir(), ".multicode", "sessions", sanitizeRoomId(options.session));
   const token = await writeSessionToken(path.join(sessionDirectory, "token"));
-  const journal = databaseUrl ? new PostgresJournal(databaseUrl) : new FileJournal(path.join(sessionDirectory, "journal.jsonl"));
+  const secret = await loadOrCreateRoomSecret(path.join(sessionDirectory, "room-secret"), process.env.MULTICODE_ROOM_SECRET);
+  const epoch = await loadOrCreateSessionEpoch(path.join(sessionDirectory, "epoch"), process.env.MULTICODE_SESSION_EPOCH);
+  const journal = databaseUrl ? new PostgresJournal(databaseUrl) : new SqliteJournal(path.join(sessionDirectory, "session.db"));
   if (journal instanceof PostgresJournal) await journal.migrate();
+  const session = new HostSession(sanitizeRoomId(options.session), epoch, secret, journal);
+  const recovery = await session.recover();
   const socketPath = options.socket ?? (process.platform === "win32" ? `\\\\.\\pipe\\multicode-${sanitizeRoomId(options.session)}` : path.join(sessionDirectory, "daemon.sock"));
-  const ipc = new LocalIpcServer(token, async (payload) => ({ session: options.session, payload }));
+  const ipc = new LocalIpcServer(token, async (payload) => {
+    const request = payload as { type?: string; actorId?: string; fileId?: string; update?: string };
+    if (request.type === "document.update" && request.actorId && request.fileId && request.update) {
+      const result = await session.applyDocumentUpdate(request.actorId, request.fileId, Buffer.from(request.update, "base64url"));
+      return { ...result, update: Buffer.from(result.update).toString("base64url") };
+    }
+    return { session: options.session, status: "ready", recovery };
+  });
   await ipc.listen(socketPath);
   console.log(out.success(`${out.label("Session daemon")} ${out.value(options.session)} ${out.muted(`listening on ${socketPath}`)}`));
   await new Promise<void>((resolve) => {
-    const stop = async () => { await ipc.close(); if (journal instanceof PostgresJournal) await journal.close(); resolve(); };
+    const stop = async () => { await ipc.close(); if (journal instanceof PostgresJournal) await journal.close(); else journal.close(); resolve(); };
     process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
   });
 }
@@ -910,6 +1571,60 @@ async function serveSession(options: { session: string; socket?: string }): Prom
 async function cleanupRoomWorkspace(roomId: string, options: { force?: boolean }): Promise<void> {
   const removed = await cleanupParticipantWorkspace({ roomId, ...(options.force ? { force: true } : {}) });
   console.log(out.success(`${out.label("Removed room workspace")} ${out.value(removed)}`));
+}
+
+interface LiveSessionStatus { roomId: string; mode: string; workspacePath: string; agentPath: string; participants: RoomParticipant[]; pendingProposal: string | null; relayConnected?: boolean }
+
+async function sessionDirectoryFor(roomId?: string): Promise<{ roomId: string; directory: string }> {
+  const root = path.join(homedir(), ".multicode", "sessions");
+  if (roomId) { const safe = sanitizeRoomId(roomId); return { roomId: safe, directory: path.join(root, safe) }; }
+  const cwd = path.resolve(process.cwd());
+  for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory()) continue;
+    const directory = path.join(root, entry.name);
+    try {
+      const marker = JSON.parse(await readFile(path.join(directory, ".multicode-session.json"), "utf8")) as { repositoryRoot?: string; sharedPath?: string; agentPath?: string; roomId?: string };
+      if ([marker.repositoryRoot, marker.sharedPath, marker.agentPath].some((candidate) => candidate && path.resolve(candidate) === cwd)) return { roomId: marker.roomId ?? entry.name, directory };
+    } catch { /* Ignore unrelated or incomplete session directories. */ }
+  }
+  throw new Error("Specify a room ID, or run this command from a repository with a live MultiCode session");
+}
+
+async function liveSessionRequest<T>(roomId: string | undefined, payload: unknown, timeoutMs = 5_000): Promise<T> {
+  const session = await sessionDirectoryFor(roomId); const token = (await readFile(path.join(session.directory, "token"), "utf8")).trim();
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\multicode-${session.roomId}` : path.join(session.directory, "daemon.sock");
+  return requestLocalIpc<T>(socketPath, token, payload, timeoutMs);
+}
+
+async function showSessionStatus(roomId?: string): Promise<void> {
+  const status = await liveSessionRequest<LiveSessionStatus>(roomId, { type: "status" });
+  console.log(`${out.label("Room")} ${out.value(status.roomId)} ${out.muted(status.mode)}`);
+  console.log(`${out.label("Workspace")} ${status.workspacePath}`);
+  console.log(`${out.label("Relay")} ${status.relayConnected === false ? err.error("reconnecting") : out.success("connected")}`);
+  console.log(`${out.label("Participants")} ${status.participants.length || "none"}`);
+  if (status.pendingProposal) console.log(`${out.label("Pending proposal")} ${status.pendingProposal}`);
+}
+
+async function updateParticipantCapability(roomId: string | undefined, participantQuery: string, capability: Capability, grant: boolean): Promise<void> {
+  const status = await liveSessionRequest<LiveSessionStatus>(roomId, { type: "status" });
+  const participant = status.participants.find((candidate) => candidate.id === participantQuery || candidate.name === participantQuery);
+  if (!participant) throw new Error("Participant not found"); const capabilities = new Set(participant.capabilities);
+  if (grant) capabilities.add(capability); else capabilities.delete(capability);
+  await liveSessionRequest(roomId, { type: "capabilities", participantId: participant.id, capabilities: [...capabilities] });
+  console.log(out.success(`${grant ? "Granted" : "Revoked"} ${capability} ${grant ? "to" : "from"} ${participant.name}`));
+}
+
+async function exportRoom(roomId: string, options: { format: "patch" | "branch" | "commit"; output?: string; branch?: string }): Promise<void> {
+  const session = await sessionDirectoryFor(roomId);
+  const marker = JSON.parse(await readFile(path.join(session.directory, ".multicode-session.json"), "utf8")) as { repositoryRoot: string; sharedPath: string; baseCommit: string };
+  const checkpoint = await createWorkspaceCheckpoint({ cwd: marker.sharedPath, roomId: session.roomId, sequence: Date.now(), baseCommit: marker.baseCommit, parentCommit: marker.baseCommit, force: true });
+  if (!checkpoint) throw new Error("Could not capture room workspace");
+  if (options.format === "commit") { console.log(checkpoint.commit); return; }
+  if (options.format === "branch") {
+    const branch = options.branch ?? `multicode/export-${session.roomId}`; await execFileAsync("git", ["-C", marker.repositoryRoot, "branch", branch, checkpoint.commit]); console.log(out.success(`${out.label("Exported branch")} ${out.value(branch)}`)); return;
+  }
+  const patchText = (await execFileAsync("git", ["-C", marker.repositoryRoot, "diff", "--binary", marker.baseCommit, checkpoint.commit], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 })).stdout;
+  const output = path.resolve(options.output ?? `multicode-${session.roomId}.patch`); await writeFile(output, patchText, "utf8"); console.log(out.success(`${out.label("Exported patch")} ${out.value(output)}`));
 }
 
 const defaultName = (() => {
@@ -935,6 +1650,7 @@ room
   .option("--prompt <prompt>", "send an initial prompt")
   .option("--model <model>", "override the configured Codex model")
   .option("--dry-run", "validate the repository without starting Codex")
+  .option("--include-sensitive", "explicitly include tracked credential-like files")
   .action(createRoom);
 
 room
@@ -949,6 +1665,7 @@ room
   .option("--public-url <url>", "public ws:// or wss:// base URL for invitations")
   .option("--relay <url>", "central relay ws:// or wss:// URL")
   .option("--local", "host directly instead of using the central relay")
+  .option("--include-sensitive", "explicitly include tracked credential-like files")
   .action(hostRoom);
 
 room
@@ -957,6 +1674,8 @@ room
   .argument("<invite-or-code>", "room code or invite URL printed by the host")
   .option("--name <name>", "participant display name", defaultName)
   .option("--relay <url>", "central relay URL (or set MULTICODE_RELAY_URL)")
+  .option("--viewer", "join without edit or prompt permissions")
+  .option("--bootstrap-only", "prepare the room workspace and let another client own the live connection")
   .action(joinRoom);
 
 program
@@ -967,6 +1686,9 @@ program
   .option("--model <model>", "override the configured Codex model")
   .option("--name <name>", "host display name", defaultName)
   .option("--relay <url>", "override the central relay URL")
+  .option("--viewer", "join without edit or prompt permissions")
+  .option("--bootstrap-only", "prepare the room workspace and let another client own the live connection")
+  .option("--include-sensitive", "explicitly include tracked credential-like files")
   .action((options) => hostRoom({ ...options, listen: "127.0.0.1", port: "7337" }));
 
 program
@@ -983,6 +1705,19 @@ program
   .argument("<room-id>", "room identifier printed when joining")
   .option("--force", "remove the room workspace even when it contains local changes")
   .action(cleanupRoomWorkspace);
+
+program.command("status").description("Show a live room's daemon status").argument("[room-id]").action(showSessionStatus);
+program.command("prompt").description("Submit a prompt through a live room daemon").argument("<text>").option("--session <room-id>").action(async (text: string, options: { session?: string }) => { await liveSessionRequest(options.session, { type: "prompt", text }); console.log(out.success("Prompt queued")); });
+program.command("interrupt").description("Interrupt the active Codex turn").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "interrupt" }); console.log(out.success("Interrupt requested")); });
+program.command("participants").description("List participants and capabilities").option("--session <room-id>").action(async (options: { session?: string }) => { const status = await liveSessionRequest<LiveSessionStatus>(options.session, { type: "status" }); for (const participant of status.participants) console.log(`${participant.id}\t${participant.name}\t${participant.capabilities.join(",")}`); });
+program.command("grant").description("Grant a participant capability").argument("<participant>").argument("<capability>").option("--session <room-id>").action(async (participant: string, capability: string, options: { session?: string }) => { if (!["viewer", "editor", "prompter", "reviewer"].includes(capability)) throw new Error("Invalid capability"); await updateParticipantCapability(options.session, participant, capability as Capability, true); });
+program.command("revoke").description("Revoke a participant capability").argument("<participant>").argument("<capability>").option("--session <room-id>").action(async (participant: string, capability: string, options: { session?: string }) => { if (!["viewer", "editor", "prompter", "reviewer"].includes(capability)) throw new Error("Invalid capability"); await updateParticipantCapability(options.session, participant, capability as Capability, false); });
+const proposal = program.command("proposal").description("Inspect or discard a pending Codex proposal");
+proposal.command("show").option("--session <room-id>").action(async (options: { session?: string }) => { const status = await liveSessionRequest<LiveSessionStatus>(options.session, { type: "status" }); if (!status.pendingProposal) throw new Error("No pending proposal"); console.log(await readFile(status.pendingProposal, "utf8")); });
+proposal.command("discard").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "proposal.discard" }); console.log(out.success("Proposal discarded")); });
+proposal.command("resolve").description("Retry a manually resolved proposal against the newest human state").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "proposal.retry" }, 30_000); console.log(out.success("Proposal resolved")); });
+program.command("export").description("Export a preserved room as a patch, branch, or commit").argument("<room-id>").option("--format <format>", "patch, branch, or commit", "patch").option("--output <path>").option("--branch <name>").action(async (roomId: string, options: { format: string; output?: string; branch?: string }) => { if (!["patch", "branch", "commit"].includes(options.format)) throw new Error("Invalid export format"); await exportRoom(roomId, options as { format: "patch" | "branch" | "commit"; output?: string; branch?: string }); });
+program.command("leave").description("Remove a preserved room workspace").argument("<room-id>").option("--force").action(cleanupRoomWorkspace);
 
 const relay = program.command("relay", { hidden: true }).description("Run central relay infrastructure");
 relay

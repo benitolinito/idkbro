@@ -19,7 +19,7 @@
     "typecheck": "tsc -b --pretty false"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

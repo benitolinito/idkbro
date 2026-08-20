@@ -106,11 +106,12 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("room.join"),
     token: z.string().min(1),
     name: z.string().trim().min(1).max(64),
+    requestedRole: z.enum(["viewer", "editor"]).optional(),
   }),
   z.object({
     type: z.literal("prompt.submit"),
     promptId: z.string().min(1),
-    text: z.string().trim().min(1).max(100_000),
+    text: z.string().trim().min(1).max(200_000),
   }),
   z.object({
     type: z.literal("workspace.ack"),
@@ -122,11 +123,18 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     sequence: z.number().int().positive(),
   }),
   z.object({
+    type: z.literal("approval.resolve"),
+    requestId: z.union([z.string().min(1).max(128), z.number().int()]),
+    decision: z.enum(["accept", "decline", "cancel"]),
+  }),
+  z.object({
     type: z.literal("collab.publish"),
     event: z.object({
       id: z.string().uuid(),
-      kind: z.enum(["document.update", "presence.update", "agent.preview"]),
+      kind: z.enum(["document.subscribe", "document.snapshot", "document.update", "manifest.operation", "presence.update", "agent.preview"]),
       payload: z.string().min(1).max(256 * 1024),
+      sequence: z.number().int().positive().optional(),
+      committedAt: z.string().datetime().optional(),
     }),
   }),
 ]);
@@ -171,13 +179,24 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
     name: z.string().trim().min(1).max(64),
   }),
   z.object({
+    type: z.literal("relay.room.resume"),
+    roomId: z.string().min(1).max(64),
+    resumeToken: z.string().min(32).max(256),
+  }),
+  z.object({
     type: z.literal("prompt.submit"),
     promptId: z.string().min(1),
-    text: z.string().trim().min(1).max(100_000),
+    text: z.string().trim().min(1).max(200_000),
   }),
   z.object({
     type: z.literal("relay.agent.event"),
     event: z.object({ type: z.string().min(1) }).passthrough(),
+  }),
+  z.object({
+    type: z.literal("relay.agent.encrypted"),
+    eventType: z.string().min(1).max(64),
+    status: z.string().max(64).optional(),
+    payload: z.string().min(1).max(256 * 1024),
   }),
   z.object({
     type: z.literal("relay.workspace.diff"),
@@ -208,11 +227,23 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
     message: z.string().min(1).max(1_000),
   }),
   z.object({
+    type: z.literal("relay.participant.capabilities"),
+    participantId: z.string().min(1).max(128),
+    capabilities: z.array(z.enum(["viewer", "editor", "prompter", "reviewer"])).max(4),
+  }),
+  z.object({
     type: z.literal("relay.collab.event"),
     event: z.object({
       id: z.string().uuid(),
-      kind: z.enum(["document.update", "presence.update", "agent.preview"]),
+      kind: z.enum(["document.subscribe", "document.snapshot", "document.update", "manifest.operation", "presence.update", "agent.preview", "agent.proposal", "workspace.commit.prepare", "workspace.commit.finalize"]),
       payload: z.string().min(1).max(256 * 1024),
+      sequence: z.number().int().positive().optional(),
+      committedAt: z.string().datetime().optional(),
+      actorId: z.string().min(1).max(128).optional(),
+      recipientId: z.string().min(1).max(128).optional(),
+      transactionId: z.string().uuid().optional(),
+      partIndex: z.number().int().nonnegative().optional(),
+      partCount: z.number().int().positive().max(10_000).optional(),
     }),
   }),
 ]);
@@ -223,7 +254,10 @@ export interface RoomParticipant {
   joinedAt: string;
   host: boolean;
   synced: boolean;
+  capabilities: Capability[];
 }
+
+export type Capability = "viewer" | "editor" | "prompter" | "reviewer" | "host";
 
 export interface QueuedPrompt {
   promptId: string;
@@ -271,25 +305,35 @@ export type RelayHostMessage =
       type: "relay.room.create";
       name: string;
     }
+  | { type: "relay.room.resume"; roomId: string; resumeToken: string }
   | { type: "prompt.submit"; promptId: string; text: string }
   | { type: "relay.agent.event"; event: AgentEvent }
+  | { type: "relay.agent.encrypted"; eventType: string; status?: string; payload: string }
   | { type: "relay.workspace.diff"; diff: WorkspaceDiff }
   | { type: "relay.workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
   | { type: "relay.workspace.checkpoint.start"; checkpoint: WorkspaceCheckpointDescriptor; targetParticipantId?: string }
   | { type: "relay.workspace.checkpoint.chunk"; chunk: WorkspaceCheckpointChunk; targetParticipantId?: string }
   | { type: "relay.workspace.checkpoint.complete"; sequence: number; targetParticipantId?: string }
   | { type: "relay.prompt.failed"; promptId: string; message: string }
+  | { type: "relay.participant.capabilities"; participantId: string; capabilities: Capability[] }
   | { type: "relay.collab.event"; event: CollaborationEvent };
 
 export interface CollaborationEvent {
   id: string;
-  kind: "document.update" | "presence.update" | "agent.preview";
+  kind: "document.subscribe" | "document.snapshot" | "document.update" | "manifest.operation" | "presence.update" | "agent.preview" | "agent.proposal" | "workspace.commit.prepare" | "workspace.commit.finalize";
   payload: string;
+  sequence?: number | undefined;
+  committedAt?: string | undefined;
+  actorId?: string | undefined;
+  recipientId?: string | undefined;
+  transactionId?: string | undefined;
+  partIndex?: number | undefined;
+  partCount?: number | undefined;
 }
 
 export type RelayServerMessage =
   | RoomServerMessage
-  | { type: "relay.room.created"; roomId: string; code: string };
+  | { type: "relay.room.created"; roomId: string; code: string; resumeToken: string; resumed?: boolean };
 
 export type RoomServerMessage =
   | {
@@ -305,15 +349,19 @@ export type RoomServerMessage =
     }
   | { type: "participant.joined"; participant: RoomParticipant }
   | { type: "participant.left"; participantId: string; name: string }
+  | { type: "participant.capabilities"; participantId: string; capabilities: Capability[] }
   | { type: "prompt.queued"; prompt: QueuedPrompt; position: number }
   | { type: "prompt.started"; prompt: QueuedPrompt }
   | { type: "agent.event"; event: AgentEvent }
+  | { type: "agent.encrypted"; eventType: string; status?: string; payload: string }
   | { type: "workspace.diff"; diff: WorkspaceDiff }
   | { type: "workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
   | { type: "workspace.checkpoint.start"; checkpoint: WorkspaceCheckpointDescriptor }
   | { type: "workspace.checkpoint.chunk"; chunk: WorkspaceCheckpointChunk }
   | { type: "workspace.checkpoint.complete"; sequence: number }
   | { type: "workspace.checkpoint.request"; participantId: string; sequence: number }
+  | { type: "collab.submitted"; participantId: string; event: CollaborationEvent }
+  | { type: "approval.submitted"; participantId: string; requestId: string | number; decision: ApprovalDecision }
   | { type: "collab.event"; event: CollaborationEvent }
   | { type: "participant.synced"; participantId: string; sequence: number; commit: string }
   | { type: "room.error"; message: string; fatal?: boolean };

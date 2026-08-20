@@ -102,29 +102,55 @@ class CentralRoom {
     hash: ReturnType<typeof createHash>;
   }>();
   private readonly collabHistory: CollaborationEvent[] = [];
+  private collabTail: Promise<void> = Promise.resolve();
+  private readonly rateWindows = new WeakMap<WebSocket, Map<string, { startedAt: number; count: number }>>();
   private closed = false;
+  private hostDisconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private hostSocket: WebSocket;
   readonly host: RoomParticipant;
 
   constructor(
     readonly roomId: string,
     private readonly participantToken: string,
-    private readonly hostSocket: WebSocket,
+    readonly resumeToken: string,
+    hostSocket: WebSocket,
     hostName: string,
     readonly ownerIp: string,
     private readonly authenticationTimeoutMs: number,
     private readonly persistEvent: (event: { id: string; kind: string; payload: string }) => Promise<void>,
     private readonly onClosed: () => void,
   ) {
+    this.hostSocket = hostSocket;
     this.host = {
       id: "host",
       name: hostName,
       joinedAt: new Date().toISOString(),
       host: true,
       synced: true,
+      capabilities: ["viewer", "editor", "prompter", "reviewer", "host"],
     };
-    hostSocket.on("message", (data) => this.receiveHost(data.toString()));
-    hostSocket.once("close", () => this.close("Host disconnected"));
-    hostSocket.once("error", () => this.close("Host connection failed"));
+    this.attachHost(hostSocket);
+  }
+
+  get code(): string { return this.participantToken; }
+
+  resume(socket: WebSocket): void {
+    if (this.closed) { reject(socket, "Room is closed", 4004); return; }
+    if (this.hostSocket.readyState === WebSocket.OPEN) this.hostSocket.close(4000, "Host connection replaced");
+    this.hostSocket = socket; this.attachHost(socket);
+    send(socket, { type: "room.welcome", roomId: this.roomId, selfId: this.host.id, participants: [this.host, ...this.participants.values()], activePrompt: this.activePrompt, queue: [...this.queue], latestDiff: this.latestDiff, latestCheckpoint: this.latestCheckpoint, collabHistory: [...this.collabHistory] });
+  }
+
+  private attachHost(socket: WebSocket): void {
+    if (this.hostDisconnectTimer) clearTimeout(this.hostDisconnectTimer); this.hostDisconnectTimer = undefined;
+    socket.on("message", (data) => { if (this.hostSocket === socket) this.receiveHost(data.toString()); });
+    const disconnected = (code?: number) => {
+      if (this.hostSocket !== socket || this.closed) return;
+      if (code === 1000) { this.close("Host stopped room"); return; }
+      this.broadcast({ type: "room.error", message: "Host connection interrupted; waiting for it to resume" }, socket);
+      this.hostDisconnectTimer = setTimeout(() => this.close("Host did not reconnect"), 30_000); this.hostDisconnectTimer.unref();
+    };
+    socket.once("close", disconnected); socket.once("error", () => disconnected());
   }
 
   acceptParticipant(socket: WebSocket): void {
@@ -151,7 +177,7 @@ class CentralRoom {
         return;
       }
       clearTimeout(timer);
-      this.join(socket, parsed.data.name);
+      this.join(socket, parsed.data.name, parsed.data.requestedRole ?? "editor");
     };
     socket.once("message", authenticate);
     socket.once("close", () => clearTimeout(timer));
@@ -160,6 +186,7 @@ class CentralRoom {
   close(reason = "Room closed"): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.hostDisconnectTimer) clearTimeout(this.hostDisconnectTimer); this.hostDisconnectTimer = undefined;
     for (const socket of this.participants.keys()) {
       send(socket, { type: "room.error", message: reason, fatal: true });
       socket.close(1012, reason.slice(0, 120));
@@ -169,13 +196,14 @@ class CentralRoom {
     this.onClosed();
   }
 
-  private join(socket: WebSocket, name: string): void {
+  private join(socket: WebSocket, name: string, requestedRole: "viewer" | "editor"): void {
     const participant: RoomParticipant = {
       id: randomUUID(),
       name,
       joinedAt: new Date().toISOString(),
       host: false,
       synced: this.latestCheckpoint === null,
+      capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "editor", "prompter"],
     };
     this.participants.set(socket, participant);
     send(socket, {
@@ -240,7 +268,24 @@ class CentralRoom {
       return;
     }
     if (participantMessage.type === "collab.publish") {
-      void this.persistEvent(participantMessage.event).then(() => { this.collabHistory.push(participantMessage.event); if (this.collabHistory.length > 1000) this.collabHistory.shift(); this.broadcast({ type: "collab.event", event: participantMessage.event }, socket); }).catch(() => send(socket, { type: "room.error", message: "Collaboration event was not durably persisted" }));
+      const rate = participantMessage.event.kind === "presence.update" ? ["presence", 60, 10_000] as const
+        : participantMessage.event.kind === "manifest.operation" ? ["manifest", 30, 10_000] as const
+        : ["document", 300, 10_000] as const;
+      if (!this.allowRate(socket, rate[0], rate[1], rate[2])) { send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" }); return; }
+      if ((participantMessage.event.kind === "document.update" || participantMessage.event.kind === "manifest.operation") && !participant.capabilities.includes("editor")) {
+        send(socket, { type: "room.error", message: "Participant does not have editor capability" });
+        return;
+      }
+      send(this.hostSocket, { type: "collab.submitted", participantId: participant.id, event: participantMessage.event });
+      return;
+    }
+    if (participantMessage.type === "approval.resolve") {
+      if (!participant.capabilities.includes("reviewer")) { send(socket, { type: "room.error", message: "Participant does not have reviewer capability" }); return; }
+      send(this.hostSocket, { type: "approval.submitted", participantId: participant.id, requestId: participantMessage.requestId, decision: participantMessage.decision }); return;
+    }
+    if (!this.allowRate(socket, "prompt", 20, 60_000)) { send(socket, { type: "room.error", message: "Prompt rate limit exceeded" }); return; }
+    if (!participant.capabilities.includes("prompter")) {
+      send(socket, { type: "room.error", message: "Participant does not have prompter capability" });
       return;
     }
     this.enqueue({
@@ -282,11 +327,20 @@ class CentralRoom {
           return;
         }
         this.broadcast({ type: "agent.event", event: message.event }, this.hostSocket);
-        if (message.event.type === "turn.completed") {
+        if (message.event.type === "turn.completed" && message.event.status !== "pending-conflict") {
           this.activePrompt = null;
           this.dispatchNext();
-        } else if (message.event.type === "agent.exited") {
-          this.close("Host agent exited");
+        }
+        break;
+      case "relay.agent.encrypted":
+        if (!agentEventTypes.has(message.eventType as AgentEvent["type"])) {
+          send(this.hostSocket, { type: "room.error", message: "Unknown encrypted agent event" });
+          return;
+        }
+        this.broadcast({ type: "agent.encrypted", eventType: message.eventType, ...(message.status ? { status: message.status } : {}), payload: message.payload }, this.hostSocket);
+        if (message.eventType === "turn.completed" && message.status !== "pending-conflict") {
+          this.activePrompt = null;
+          this.dispatchNext();
         }
         break;
       case "relay.workspace.diff":
@@ -311,12 +365,42 @@ class CentralRoom {
         this.activePrompt = null;
         this.dispatchNext();
         break;
+      case "relay.participant.capabilities": {
+        const participant = [...this.participants.values()].find((candidate) => candidate.id === message.participantId);
+        if (!participant) { send(this.hostSocket, { type: "room.error", message: "Participant is no longer connected" }); break; }
+        participant.capabilities = [...new Set(message.capabilities)];
+        this.broadcast({ type: "participant.capabilities", participantId: participant.id, capabilities: participant.capabilities });
+        break;
+      }
       case "relay.collab.event":
-        void this.persistEvent(message.event).then(() => { this.collabHistory.push(message.event); if (this.collabHistory.length > 1000) this.collabHistory.shift(); this.broadcast({ type: "collab.event", event: message.event }, this.hostSocket); }).catch(() => send(this.hostSocket, { type: "room.error", message: "Collaboration event was not durably persisted" }));
+        if (message.event.recipientId) {
+          const target = [...this.participants.entries()].find(([, participant]) => participant.id === message.event.recipientId);
+          if (target) send(target[0], { type: "collab.event", event: message.event });
+          break;
+        }
+        if (message.event.kind === "presence.update" || message.event.kind === "document.snapshot" || message.event.kind === "document.subscribe") {
+          this.broadcast({ type: "collab.event", event: message.event }, this.hostSocket);
+          break;
+        }
+        this.collabTail = this.collabTail.then(async () => {
+          await this.persistEvent(message.event);
+          if (message.event.kind !== "document.update" || message.event.transactionId) {
+            this.collabHistory.push(message.event);
+            if (this.collabHistory.length > 1000) this.collabHistory.shift();
+          }
+          this.broadcast({ type: "collab.event", event: message.event }, this.hostSocket);
+        }).catch(() => send(this.hostSocket, { type: "room.error", message: "Collaboration event was not durably persisted" }));
         break;
       default:
         break;
     }
+  }
+
+  private allowRate(socket: WebSocket, key: string, limit: number, windowMs: number): boolean {
+    let windows = this.rateWindows.get(socket); if (!windows) { windows = new Map(); this.rateWindows.set(socket, windows); }
+    const now = Date.now(); let window = windows.get(key);
+    if (!window || now - window.startedAt >= windowMs) { window = { startedAt: now, count: 0 }; windows.set(key, window); }
+    window.count += 1; return window.count <= limit;
   }
 
   private enqueue(prompt: QueuedPrompt): void {
@@ -359,7 +443,7 @@ class CentralRoom {
       receivedBytes: 0,
       hash: createHash("sha256"),
     });
-    this.routeCheckpoint({ type: "workspace.checkpoint.start", checkpoint }, targetParticipantId);
+    if (targetParticipantId) this.routeCheckpoint({ type: "workspace.checkpoint.start", checkpoint }, targetParticipantId);
   }
 
   private acceptCheckpointChunk(chunk: WorkspaceCheckpointChunk, targetParticipantId?: string): void {
@@ -384,7 +468,7 @@ class CentralRoom {
     }
     transfer.hash.update(decoded);
     transfer.nextIndex += 1;
-    this.routeCheckpoint({ type: "workspace.checkpoint.chunk", chunk }, targetParticipantId);
+    if (targetParticipantId) this.routeCheckpoint({ type: "workspace.checkpoint.chunk", chunk }, targetParticipantId);
   }
 
   private completeCheckpointTransfer(sequence: number, targetParticipantId?: string): void {
@@ -402,10 +486,9 @@ class CentralRoom {
       return;
     }
     if (!targetParticipantId) {
-      this.latestCheckpoint = transfer.descriptor;
-      for (const participant of this.participants.values()) participant.synced = false;
+      void this.collabTail.then(() => { this.latestCheckpoint = transfer.descriptor; this.collabHistory.length = 0; });
     }
-    this.routeCheckpoint({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
+    if (targetParticipantId) this.routeCheckpoint({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
   }
 
   private participantSocket(participantId: string): WebSocket | undefined {
@@ -548,9 +631,14 @@ export class RelayServer {
         return;
       }
       const parsed = relayHostMessageSchema.safeParse(value);
-      if (!parsed.success || parsed.data.type !== "relay.room.create") {
-        reject(socket, "A valid relay.room.create message is required", 4001);
+      if (!parsed.success || (parsed.data.type !== "relay.room.create" && parsed.data.type !== "relay.room.resume")) {
+        reject(socket, "A valid relay.room.create or relay.room.resume message is required", 4001);
         return;
+      }
+      if (parsed.data.type === "relay.room.resume") {
+        const room = this.rooms.get(canonicalRoomCode(parsed.data.roomId));
+        if (!room || !secretMatches(room.resumeToken, parsed.data.resumeToken)) { reject(socket, "Invalid room resume credentials", 4003); return; }
+        room.resume(socket); send(socket, { type: "relay.room.created", roomId: room.roomId, code: room.code, resumeToken: room.resumeToken, resumed: true }); return;
       }
       if (this.rooms.size >= this.maxRooms) {
         reject(socket, "Relay room limit reached", 4013);
@@ -568,6 +656,7 @@ export class RelayServer {
       const room = new CentralRoom(
         roomId,
         code,
+        randomBytes(32).toString("base64url"),
         socket,
         creation.name,
         ownerIp,
@@ -579,7 +668,7 @@ export class RelayServer {
       try { await this.options.store?.roomOpened({ roomId, ownerIp }); } catch (error) {
         this.rooms.delete(roomId); room.close("Relay persistence failed"); reject(socket, error instanceof Error ? error.message : "Relay persistence failed", 1011); return;
       }
-      send(socket, { type: "relay.room.created", roomId, code });
+      send(socket, { type: "relay.room.created", roomId, code, resumeToken: room.resumeToken });
     })(); });
     socket.once("close", () => clearTimeout(timer));
   }

@@ -1,11 +1,11 @@
 # MultiCode
 
-MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in the current workspace; everyone can submit prompts and receives the same verified code checkpoints in real time.
+MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
 > [!IMPORTANT]
-> MultiCode is an early release. It includes a VS Code extension, CLI, and self-hosted relay, but there is no browser client or managed persistence yet.
+> MultiCode currently supports regular UTF-8 text files up to 96 KiB. Binary collaboration, symlinks, offline editing, and browser clients are intentionally outside the first release.
 
 ## How it works
 
@@ -13,17 +13,18 @@ The public relay defaults to `wss://multicode.luisagd.com`, so the normal workfl
 Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbound WSS ── Collaborator
 ```
 
-- Only the host runs Codex and writes to the authoritative workspace.
-- The relay generates a random `XXXXX-XXXXX` room code.
+- The host session daemon is the sole authority for manifests, Yjs documents, sequencing, permissions, proposals, and workspace commits.
+- The relay generates a random `XXXXX-XXXXX` locator; a separate high-entropy invitation secret encrypts application payloads end to end.
 - Each originating IP can host at most five active rooms.
-- Anyone with a room code can join and submit prompts.
+- Viewers, editors, prompters, and reviewers are independent capabilities controlled by the host.
 - Prompts from all participants execute through one FIFO queue.
-- Every participant checkout follows the same synchronized room branch and commit.
-- Late joiners receive the participants, active prompt, queue, and latest workspace checkpoint.
+- Every user works in a validated MultiCode-owned worktree; original checkouts are never switched, reset, stashed, or cleaned.
+- Human edits are durably committed before broadcast. Multi-file Codex results are buffered and finalized as one logical workspace transaction.
+- The public relay sees routing metadata and encrypted payload sizes, not source, prompts, agent output, previews, proposals, or checkpoint contents.
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) 20 or newer
+- [Node.js](https://nodejs.org/) 22.5 or newer (the session journal uses the built-in SQLite API in WAL mode)
 - Hosting: Git, an authenticated Codex CLI, and a repository with at least one commit
 - VS Code: version 1.96 or newer
 - Joining: a clone containing the host's base commit; Codex is not required
@@ -86,7 +87,7 @@ From the Git repository you want to work on:
 multicode host
 ```
 
-MultiCode creates isolated shared/agent worktrees, connects to the Raspberry Pi authority, and prints one complete invite token:
+MultiCode creates isolated shared/agent worktrees, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
 
 ```text
 Room token: K7MNP-4XQ2R.<room-secret>
@@ -102,7 +103,7 @@ The other person pastes the complete token:
 multicode join K7MNP-4XQ2R.<room-secret>
 ```
 
-Both people can now submit prompts and see the same agent activity. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
+Both people can now edit normal VS Code buffers, submit prompts, see participant presence, and follow encrypted agent activity. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
 
 Use names when desired:
 
@@ -112,7 +113,22 @@ multicode join K7MNP-4XQ2R.<room-secret> --name "Grace"
 ```
 
 > [!WARNING]
-> A room code is a temporary bearer credential. Anyone with the code can submit prompts to that room. Stop the host to invalidate it.
+> Share the complete token, not only its locator. The secret after the dot is the end-to-end encryption key and is never sent to the public relay.
+
+Host-terminal controls include `/participants`, `/grant <id-or-name> <capability>`, `/revoke ...`, `/interrupt`, `/approve <request> accept|decline|cancel`, and `/proposal show|retry|discard`.
+
+The same controls are available as authenticated thin-client commands:
+
+```bash
+multicode status [room-id]
+multicode prompt "implement the next step" --session <room-id>
+multicode interrupt --session <room-id>
+multicode participants --session <room-id>
+multicode grant <participant> reviewer --session <room-id>
+multicode proposal show|resolve|discard --session <room-id>
+multicode export <room-id> --format patch|branch|commit
+multicode leave <room-id>
+```
 
 ## Self-host the relay on a Raspberry Pi
 
@@ -215,9 +231,17 @@ is never switched, stashed, reset, or cleaned.
 Hosting from a MultiCode-managed `shared` or `agent` worktree is rejected to
 prevent accidentally nesting one room inside another.
 
-Participants receive an isolated room worktree and acknowledge encrypted
-checkpoints only after the Pi relay has durably recorded them. If the Pi is
-unreachable, host and join pause and retry; they never fork state locally.
+Participants receive an isolated room worktree. Bootstrap checkpoints are streamed from
+the host in bounded 128 KiB chunks and verified by byte count, SHA-256 hash, Git
+bundle verification, and expected commit before application. The relay retains
+only checkpoint metadata, so a late joiner explicitly requests the current
+bundle from the host.
+
+A checkpoint never resets a dirty participant room worktree. Live document and manifest updates do not use Git resets. Preserve or export
+those local changes first, then resynchronize. Leaving a room preserves its
+worktree by default; remove a clean preserved worktree explicitly with
+`multicode cleanup <room-id>`, or use `--force` only when its local changes may
+be discarded.
 
 Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
 
@@ -253,18 +277,19 @@ the same version only produce temporary Actions artifacts.
 
 | Package | Responsibility |
 | --- | --- |
-| `@multicode/cli` | Local, hosted, and participant commands |
+| `@multicode/cli` | Host daemon/controller and authenticated thin-client commands |
 | `@multicode/protocol` | Shared schemas and event types |
-| `@multicode/workspace` | Git inspection, checkpoints, branch backup, and synchronization |
+| `@multicode/session-core` | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC |
+| `@multicode/workspace` | Safe worktrees, bootstrap checkpoints, B/A/H merges, proposals, and transactional application |
 | `@multicode/agent-adapters` | Codex app-server integration |
 | `@multicode/relay` | Embedded and standalone WebSocket relays |
 | `multicode-vscode` | VS Code commands, session output, and status-bar controls |
 
 ## Current limitations
 
-- Only the Codex adapter is available.
-- Relay state is held in memory; restarting it closes active rooms.
-- A remote room closes if its host disconnects.
-- Approval requests are reported but cannot be resolved interactively through the CLI.
-- There is no browser client, automatic reconnect, or event replay after disconnect.
-- Participant room-branch and backup-ref cleanup is manual.
+- Only the Codex adapter is available, and only one Codex turn or pending proposal is allowed at a time.
+- The host device must remain online. A transient host relay connection can resume, but rooms do not survive the host device being offline.
+- Collaborative files must be regular UTF-8 files no larger than 96 KiB. Binary files and symlinks remain checkpoint/export-only.
+- Undo uses normal VS Code behavior; MultiCode does not promise per-user CRDT undo.
+- Conflict resolution is host-driven: reviewers inspect the encrypted proposal, manually resolve the shared files, then retry against the newest human state.
+- Relay process restarts are not persisted as live WebSocket rooms; host-local authoritative state and acknowledged edits remain recoverable from SQLite.

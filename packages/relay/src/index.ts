@@ -4,6 +4,8 @@ import {
   roomClientMessageSchema,
   checkpointChunkBytes,
   type AgentEvent,
+  type ApprovalDecision,
+  type CollaborationEvent,
   type QueuedPrompt,
   type RoomParticipant,
   type RoomServerMessage,
@@ -24,6 +26,8 @@ export interface RoomRelayOptions {
   token: string;
   hostName: string;
   onPrompt: (prompt: QueuedPrompt) => Promise<void>;
+  onCollaborationEvent: (participant: RoomParticipant, event: CollaborationEvent) => Promise<CollaborationEvent>;
+  onApproval?: (participant: RoomParticipant, requestId: string | number, decision: ApprovalDecision) => Promise<void>;
   onCheckpointRequest?: (participantId: string, sequence: number) => Promise<void> | void;
   onRoomEvent?: (message: RoomServerMessage) => void;
 }
@@ -31,6 +35,7 @@ export interface RoomRelayOptions {
 interface ConnectionState {
   participant?: RoomParticipant;
   authenticationTimer: NodeJS.Timeout;
+  rates: Map<string, { startedAt: number; count: number }>;
 }
 
 function tokenMatches(expected: string, received: string): boolean {
@@ -55,6 +60,7 @@ export class RoomRelay {
       joinedAt: new Date().toISOString(),
       host: true,
       synced: true,
+      capabilities: ["viewer", "editor", "prompter", "reviewer", "host"],
     };
   }
 
@@ -84,8 +90,7 @@ export class RoomRelay {
     return { host: options.host, port: address.port };
   }
 
-  submitHostPrompt(text: string): string {
-    const promptId = randomUUID();
+  submitHostPrompt(text: string, promptId = randomUUID()): string {
     this.enqueue({
       promptId,
       participantId: this.host.id,
@@ -98,7 +103,7 @@ export class RoomRelay {
 
   publishAgentEvent(event: AgentEvent): void {
     this.broadcast({ type: "agent.event", event });
-    if (event.type === "turn.completed") {
+    if (event.type === "turn.completed" && event.status !== "pending-conflict") {
       this.activePrompt = null;
       this.dispatchNext();
     } else if (event.type === "agent.exited") {
@@ -141,23 +146,33 @@ export class RoomRelay {
     }
     if (!targetParticipantId) {
       this.latestCheckpoint = checkpoint;
-      for (const state of this.connections.values()) {
-        if (state.participant) state.participant.synced = false;
-      }
     }
-    this.sendCheckpointMessage({ type: "workspace.checkpoint.start", checkpoint }, targetParticipantId);
+    if (targetParticipantId) this.sendCheckpointMessage({ type: "workspace.checkpoint.start", checkpoint }, targetParticipantId);
   }
 
   publishWorkspaceCheckpointChunk(chunk: WorkspaceCheckpointChunk, targetParticipantId?: string): void {
-    this.sendCheckpointMessage({ type: "workspace.checkpoint.chunk", chunk }, targetParticipantId);
+    if (targetParticipantId) this.sendCheckpointMessage({ type: "workspace.checkpoint.chunk", chunk }, targetParticipantId);
   }
 
   publishWorkspaceCheckpointComplete(sequence: number, targetParticipantId?: string): void {
-    this.sendCheckpointMessage({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
+    if (targetParticipantId) this.sendCheckpointMessage({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
   }
 
-  publishCollaborationEvent(event: import("@multicode/protocol").CollaborationEvent): void {
-    this.broadcast({ type: "collab.event", event });
+  publishCollaborationEvent(event: CollaborationEvent): void {
+    if (!event.recipientId) {
+      this.broadcast({ type: "collab.event", event });
+      return;
+    }
+    const target = [...this.connections.entries()].find(([, state]) => state.participant?.id === event.recipientId);
+    if (!target) return;
+    this.send(target[0], { type: "collab.event", event });
+  }
+
+  setParticipantCapabilities(participantId: string, capabilities: RoomParticipant["capabilities"]): void {
+    const participant = this.participants().find((candidate) => candidate.id === participantId);
+    if (!participant) throw new Error("Participant is no longer connected");
+    participant.capabilities = [...new Set(capabilities.filter((capability) => capability !== "host"))];
+    this.broadcast({ type: "participant.capabilities", participantId, capabilities: participant.capabilities });
   }
 
   async close(): Promise<void> {
@@ -178,7 +193,7 @@ export class RoomRelay {
       this.send(socket, { type: "room.error", message: "Join timed out", fatal: true });
       socket.close(4001, "Join timed out");
     }, 5_000);
-    this.connections.set(socket, { authenticationTimer });
+    this.connections.set(socket, { authenticationTimer, rates: new Map() });
 
     socket.on("message", (data) => this.receive(socket, data.toString()));
     socket.on("close", () => this.disconnect(socket));
@@ -213,7 +228,7 @@ export class RoomRelay {
         socket.close(4003, "Invalid room token");
         return;
       }
-      this.join(socket, state, parsed.data.name);
+      this.join(socket, state, parsed.data.name, parsed.data.requestedRole ?? "editor");
       return;
     }
 
@@ -250,7 +265,30 @@ export class RoomRelay {
     }
 
     if (parsed.data.type === "collab.publish") {
-      this.broadcast({ type: "collab.event", event: parsed.data.event }, socket);
+      const rate = parsed.data.event.kind === "presence.update" ? ["presence", 60, 10_000] as const
+        : parsed.data.event.kind === "manifest.operation" ? ["manifest", 30, 10_000] as const
+        : ["document", 300, 10_000] as const;
+      if (!this.allowRate(state, rate[0], rate[1], rate[2])) { this.send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" }); return; }
+      if ((parsed.data.event.kind === "document.update" || parsed.data.event.kind === "manifest.operation") && !state.participant.capabilities.includes("editor")) {
+        this.send(socket, { type: "room.error", message: "Participant does not have editor capability" });
+        return;
+      }
+      void this.options.onCollaborationEvent(state.participant, parsed.data.event).then((event) => {
+        this.publishCollaborationEvent(event);
+      }).catch((error: unknown) => {
+        this.send(socket, { type: "room.error", message: `Collaboration update rejected: ${error instanceof Error ? error.message : String(error)}` });
+      });
+      return;
+    }
+
+    if (parsed.data.type === "approval.resolve") {
+      if (!state.participant.capabilities.includes("reviewer")) { this.send(socket, { type: "room.error", message: "Participant does not have reviewer capability" }); return; }
+      void this.options.onApproval?.(state.participant, parsed.data.requestId, parsed.data.decision).catch((error: unknown) => this.send(socket, { type: "room.error", message: error instanceof Error ? error.message : String(error) })); return;
+    }
+
+    if (!this.allowRate(state, "prompt", 20, 60_000)) { this.send(socket, { type: "room.error", message: "Prompt rate limit exceeded" }); return; }
+    if (!state.participant.capabilities.includes("prompter")) {
+      this.send(socket, { type: "room.error", message: "Participant does not have prompter capability" });
       return;
     }
 
@@ -264,7 +302,7 @@ export class RoomRelay {
     this.enqueue(prompt);
   }
 
-  private join(socket: WebSocket, state: ConnectionState, name: string): void {
+  private join(socket: WebSocket, state: ConnectionState, name: string, requestedRole: "viewer" | "editor"): void {
     clearTimeout(state.authenticationTimer);
     const participant: RoomParticipant = {
       id: randomUUID(),
@@ -272,6 +310,7 @@ export class RoomRelay {
       joinedAt: new Date().toISOString(),
       host: false,
       synced: this.latestCheckpoint === null,
+      capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "editor", "prompter"],
     };
     state.participant = participant;
     this.send(socket, {
@@ -307,6 +346,12 @@ export class RoomRelay {
     return [...this.connections.values()].flatMap((state) =>
       state.participant ? [state.participant] : [],
     );
+  }
+
+  private allowRate(state: ConnectionState, key: string, limit: number, windowMs: number): boolean {
+    const now = Date.now(); let window = state.rates.get(key);
+    if (!window || now - window.startedAt >= windowMs) { window = { startedAt: now, count: 0 }; state.rates.set(key, window); }
+    window.count += 1; return window.count <= limit;
   }
 
   private sendCheckpointMessage(message: RoomServerMessage, targetParticipantId?: string): void {

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,7 +12,9 @@ import {
   createWorkspaceCheckpoint,
   inspectManagedRoomWorktree,
   inspectRepository,
+  mergeAgentWorkspace,
   prepareParticipantWorkspace,
+  prepareAgentTurnWorkspace,
   restoreParticipantWorkspace,
   sanitizeRoomId,
 } from "./index.js";
@@ -168,7 +170,54 @@ describe("v2 host room worktrees", () => {
     expect(await readFile(path.join(room.agentPath, "file.txt"), "utf8")).toBe("unsaved\n");
     expect(await readFile(path.join(repository, "file.txt"), "utf8")).toBe("unsaved\n");
     expect(await inspectManagedRoomWorktree(repository)).toBeNull();
-    expect(await inspectManagedRoomWorktree(room.sharedPath)).toMatchObject({ role: "shared", roomId: "room", repositoryRoot: repository });
-    expect(await inspectManagedRoomWorktree(room.agentPath)).toMatchObject({ role: "agent", roomId: "room", repositoryRoot: repository });
+    const repositoryRoot = await realpath(repository);
+    expect(await inspectManagedRoomWorktree(room.sharedPath)).toMatchObject({ role: "shared", roomId: "room", repositoryRoot });
+    expect(await inspectManagedRoomWorktree(room.agentPath)).toMatchObject({ role: "agent", roomId: "room", repositoryRoot });
+  });
+
+  it("merges independent human and agent edits including agent-created files", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-merge-repo-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-merge-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "agent.txt"), "base agent\n"); await writeFile(path.join(repository, "human.txt"), "base human\n");
+    await execFileAsync("git", ["-C", repository, "add", "."]); await execFileAsync("git", ["-C", repository, "commit", "-qm", "base"]);
+    const room = await createRoomWorktrees({ cwd: repository, roomId: "merge-room", dataDirectory });
+    const turn = await prepareAgentTurnWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, roomId: room.roomId, sequence: 1, baseCommit: room.baseCommit, parentCommit: room.checkpointCommit });
+    await writeFile(path.join(room.agentPath, "agent.txt"), "agent changed\n"); await writeFile(path.join(room.agentPath, "created.txt"), "new agent file\n");
+    await writeFile(path.join(room.sharedPath, "human.txt"), "human changed\n");
+
+    expect(await mergeAgentWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, sessionDirectory: room.sessionDirectory, roomId: room.roomId, baseCommit: room.baseCommit, turn, withCommitLock: async (operation) => operation() })).toMatchObject({ status: "merged" });
+    expect(await readFile(path.join(room.sharedPath, "agent.txt"), "utf8")).toBe("agent changed\n");
+    expect(await readFile(path.join(room.sharedPath, "human.txt"), "utf8")).toBe("human changed\n");
+    expect(await readFile(path.join(room.sharedPath, "created.txt"), "utf8")).toBe("new agent file\n");
+  }, 15_000);
+
+  it("keeps shared files untouched and writes an external proposal on conflict", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-conflict-repo-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-conflict-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "same.txt"), "base\n"); await execFileAsync("git", ["-C", repository, "add", "."]); await execFileAsync("git", ["-C", repository, "commit", "-qm", "base"]);
+    const room = await createRoomWorktrees({ cwd: repository, roomId: "conflict-room", dataDirectory });
+    const turn = await prepareAgentTurnWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, roomId: room.roomId, sequence: 1, baseCommit: room.baseCommit, parentCommit: room.checkpointCommit });
+    await writeFile(path.join(room.agentPath, "same.txt"), "agent\n"); await writeFile(path.join(room.sharedPath, "same.txt"), "human\n");
+
+    const result = await mergeAgentWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, sessionDirectory: room.sessionDirectory, roomId: room.roomId, baseCommit: room.baseCommit, turn, withCommitLock: async (operation) => operation() });
+    expect(result.status).toBe("conflicted"); expect(result.proposalPath).toContain(path.join(room.sessionDirectory, "proposals"));
+    expect(await readFile(path.join(room.sharedPath, "same.txt"), "utf8")).toBe("human\n");
+    expect(await readFile(result.proposalPath as string, "utf8")).toContain("+agent");
+  });
+
+  it("rolls the filesystem patch back when the durable workspace commit fails", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-rollback-repo-")); const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-rollback-data-"));
+    await execFileAsync("git", ["init", "-q", repository]); await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]); await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "file.txt"), "base\n"); await execFileAsync("git", ["-C", repository, "add", "."]); await execFileAsync("git", ["-C", repository, "commit", "-qm", "base"]);
+    const room = await createRoomWorktrees({ cwd: repository, roomId: "rollback-room", dataDirectory }); const turn = await prepareAgentTurnWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, roomId: room.roomId, sequence: 1, baseCommit: room.baseCommit, parentCommit: room.checkpointCommit });
+    await writeFile(path.join(room.agentPath, "file.txt"), "agent\n");
+    await expect(mergeAgentWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, sessionDirectory: room.sessionDirectory, roomId: room.roomId, baseCommit: room.baseCommit, turn, withCommitLock: async (operation) => operation(), onApplied: async () => { throw new Error("journal failed"); } })).rejects.toThrow(/journal failed/);
+    expect(await readFile(path.join(room.sharedPath, "file.txt"), "utf8")).toBe("base\n");
   });
 });
