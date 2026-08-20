@@ -39,7 +39,7 @@ build and install it from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.3.3.vsix
+code --install-extension apps/vscode/multicode-vscode-0.4.1.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
