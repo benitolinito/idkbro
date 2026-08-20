@@ -237,16 +237,19 @@ npm run build
 npm run package -w multicode-vscode
 ```
 
-Publish a downloadable GitHub Release by pushing a version tag that matches
-`apps/vscode/package.json`:
+Publish a downloadable GitHub Release by updating the extension version and
+pushing it to `main`:
 
 ```bash
-git tag v0.3.3
-git push origin v0.3.3
+npm version 0.4.0 --workspace multicode-vscode --no-git-tag-version
+git add apps/vscode/package.json package-lock.json
+git commit -m "release: v0.4.0"
+git push
 ```
 
-The release workflow verifies the version, runs all checks, and attaches the
-packaged VSIX to the repository's Releases page.
+The workflow runs all checks and publishes the packaged VSIX when that version
+does not already exist on the repository's Releases page. Further commits at
+the same version only produce temporary Actions artifacts.
 
 | Package | Responsibility |
 | --- | --- |
