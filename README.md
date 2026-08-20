@@ -1,6 +1,6 @@
 # MultiCode
 
-MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in an isolated agent worktree; everyone can submit prompts and receives the same verified code checkpoints.
+MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in the current workspace; everyone can submit prompts and receives the same verified code checkpoints in real time.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -36,18 +36,19 @@ Build and install the extension from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.2.0.vsix
+code --install-extension apps/vscode/multicode-vscode-0.3.2.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
 
 - **MultiCode: Host Room** — start Codex in the current workspace and copy the new room code to the clipboard.
 - **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
+- **MultiCode: Open Chat** — open the shared Codex-style conversation sidebar.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
 - **MultiCode: Check Setup** — check Node.js, Git, Codex, and the current repository.
 - **MultiCode: Stop or Leave Room** — end the current host or participant session.
 
-Room activity appears in the **MultiCode** output channel, and the status bar shows the current connection. The packaged VSIX includes the MultiCode CLI; hosts still need Git and an authenticated Codex CLI installed locally.
+Room activity appears in the MultiCode sidebar as a shared conversation with participants, queue state, streaming reasoning and responses, commands, and workspace diffs. The **MultiCode** output channel keeps the raw process logs, and the status bar shows the current connection. The packaged VSIX includes the MultiCode CLI; hosts still need Git and an authenticated Codex CLI installed locally.
 
 Settings are available for the participant display name, relay URL, and an optional custom MultiCode executable. See [`apps/vscode`](apps/vscode) for extension development details.
 
@@ -210,17 +211,9 @@ Run `multicode --help` for operator/development commands. End users only need
 The host and Codex use MultiCode-owned isolated worktrees. The original checkout
 is never switched, stashed, reset, or cleaned.
 
-Participants receive an isolated room worktree. Checkpoints are streamed from
-the host in bounded 128 KiB chunks and verified by byte count, SHA-256 hash, Git
-bundle verification, and expected commit before application. The relay retains
-only checkpoint metadata, so a late joiner explicitly requests the current
-bundle from the host.
-
-A checkpoint never resets a dirty participant room worktree. Preserve or export
-those local changes first, then resynchronize. Leaving a room preserves its
-worktree by default; remove a clean preserved worktree explicitly with
-`multicode cleanup <room-id>`, or use `--force` only when its local changes may
-be discarded.
+Participants receive an isolated room worktree and acknowledge encrypted
+checkpoints only after the Pi relay has durably recorded them. If the Pi is
+unreachable, host and join pause and retry; they never fork state locally.
 
 Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
 
@@ -256,4 +249,4 @@ npm run package -w multicode-vscode
 - A remote room closes if its host disconnects.
 - Approval requests are reported but cannot be resolved interactively through the CLI.
 - There is no browser client, automatic reconnect, or event replay after disconnect.
-- Exporting a preserved room worktree as a patch, branch, or commit is not yet automated.
+- Participant room-branch and backup-ref cleanup is manual.

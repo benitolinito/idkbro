@@ -2,7 +2,7 @@
   "name": "multicode-vscode",
   "displayName": "MultiCode",
   "description": "Host and join collaborative Codex sessions from VS Code.",
-  "version": "0.2.0",
+  "version": "0.3.2",
   "private": true,
   "publisher": "multicode",
   "license": "UNLICENSED",
@@ -23,18 +23,44 @@
   ],
   "main": "./dist/extension.js",
   "dependencies": {
+    "@multicode/protocol": "0.0.0",
     "ws": "^8.18.0",
     "yjs": "^13.6.27"
   },
   "activationEvents": [
     "onCommand:multicode.host",
     "onCommand:multicode.join",
+    "onCommand:multicode.openChat",
     "onCommand:multicode.sendPrompt",
     "onCommand:multicode.doctor",
-    "onCommand:multicode.stop"
+    "onCommand:multicode.stop",
+    "onView:multicode.chatView"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "multicode",
+          "title": "MultiCode",
+          "icon": "media/multicode.svg"
+        }
+      ]
+    },
+    "views": {
+      "multicode": [
+        {
+          "type": "webview",
+          "id": "multicode.chatView",
+          "name": "Shared Codex"
+        }
+      ]
+    },
     "commands": [
+      {
+        "command": "multicode.openChat",
+        "title": "MultiCode: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
       {
         "command": "multicode.host",
         "title": "MultiCode: Host Room",
@@ -68,6 +94,9 @@
     "menus": {
       "commandPalette": [
         {
+          "command": "multicode.openChat"
+        },
+        {
           "command": "multicode.sendPrompt",
           "when": "multicode.connected"
         },
@@ -88,6 +117,11 @@
           "type": "string",
           "default": "multicode",
           "description": "Path to the MultiCode CLI executable. The development checkout is detected automatically."
+        },
+        "multicode.codexExecutable": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to the Codex executable. Leave blank to detect the official Codex extension automatically."
         },
         "multicode.displayName": {
           "type": "string",

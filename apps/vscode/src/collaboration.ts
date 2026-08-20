@@ -3,6 +3,7 @@ import path from "node:path";
 import * as vscode from "vscode";
 import WebSocket from "ws";
 import * as Y from "yjs";
+import type { RoomServerMessage } from "@multicode/protocol";
 
 interface EncryptedUpdate { file: string; nonce: string; tag: string; ciphertext: string; }
 
@@ -19,7 +20,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private displayName = "";
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor() {
+  constructor(private readonly onRoomMessage?: (message: RoomServerMessage) => void) {
     this.disposables = [
       vscode.workspace.onDidChangeTextDocument((event) => void this.localChange(event.document)),
       vscode.window.onDidChangeTextEditorSelection((event) => this.publishPresence(event.textEditor.document, event.selections)),
@@ -75,7 +76,8 @@ export class CollaborationBridge implements vscode.Disposable {
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "document.update", payload: Buffer.from(JSON.stringify(this.encrypt(file, update))).toString("base64url") } }));
   }
   private async receive(raw: string): Promise<void> {
-    const message = JSON.parse(raw) as { type?: string; event?: { kind: string; payload: string } };
+    const message = JSON.parse(raw) as RoomServerMessage;
+    this.onRoomMessage?.(message);
     if (message.type === "room.welcome" && Array.isArray((message as any).collabHistory)) {
       for (const event of (message as any).collabHistory) await this.applyEvent(event);
       return;

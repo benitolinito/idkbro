@@ -1,11 +1,12 @@
 # MultiCode for VS Code
 
-Host or join a shared Codex session without leaving VS Code. The extension runs the existing MultiCode CLI, streams activity into the **MultiCode** output channel, and lets you submit prompts from the Command Palette or status bar.
+Host or join a shared Codex session without leaving VS Code. The extension includes a MultiCode activity-bar view with a shared conversation, streaming reasoning and responses, command and diff cards, participants, prompt queue state, and room controls. Raw process activity remains available in the **MultiCode** output channel.
 
 ## Commands
 
 - **MultiCode: Host Room** runs Codex in the current workspace and prints a room code.
 - **MultiCode: Join Room** safely switches this checkout to a synchronized room branch using a `XXXXX-XXXXX` room code.
+- **MultiCode: Open Chat** opens the shared conversation sidebar.
 - **MultiCode: Send Prompt** adds a prompt to the shared FIFO queue.
 - **MultiCode: Stop or Leave Room** ends the current process.
 - **MultiCode: Check Setup** runs the CLI diagnostics.

@@ -1,9 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import * as vscode from "vscode";
+import { MultiCodeChatView } from "./chat-view.js";
 import { CollaborationBridge } from "./collaboration.js";
+import { roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 
 type SessionMode = "host" | "join";
 
@@ -18,11 +20,22 @@ class MultiCodeController implements vscode.Disposable {
   private process: ChildProcessWithoutNullStreams | undefined;
   private mode: SessionMode | undefined;
   private roomCode: string | undefined;
+  private roomWorkspace: string | undefined;
   private stopping = false;
   private recentOutput = "";
-  private readonly collaboration = new CollaborationBridge();
+  readonly chat: MultiCodeChatView;
+  private readonly collaboration: CollaborationBridge;
 
   constructor(private readonly context: vscode.ExtensionContext) {
+    this.chat = new MultiCodeChatView(context.extensionUri, {
+      host: () => this.host(),
+      join: (token) => this.join(token),
+      stop: () => this.stop(),
+      submit: (text) => this.submitPrompt(text),
+      copyInvite: () => this.copyInvite(),
+      openOutput: () => this.openOutput(),
+    });
+    this.collaboration = new CollaborationBridge((message) => this.chat.handle(message));
     this.status.name = "MultiCode";
     this.status.command = "multicode.host";
     this.setIdle();
@@ -42,16 +55,20 @@ class MultiCodeController implements vscode.Disposable {
     this.startSession("host", args, cwd);
   }
 
-  async join(): Promise<void> {
+  async join(providedToken?: string): Promise<void> {
     if (!this.ensureIdle()) return;
-    const code = await vscode.window.showInputBox({
-      title: "Join a MultiCode room",
-      prompt: "Paste the room token shared by the host",
-      placeHolder: "K7MNP-4XQ2R.<room-secret>",
-      ignoreFocusOut: true,
-      validateInput: (value) => this.validRoomToken(value) ? undefined : "Paste the complete MultiCode room token",
-    });
+    const code = providedToken ?? await vscode.window.showInputBox({
+        title: "Join a MultiCode room",
+        prompt: "Paste the room token shared by the host",
+        placeHolder: "K7MNP-4XQ2R.<room-secret>",
+        ignoreFocusOut: true,
+        validateInput: (value) => this.validRoomToken(value) ? undefined : "Paste the complete MultiCode room token",
+      });
     if (!code) return;
+    if (!this.validRoomToken(code)) {
+      void vscode.window.showErrorMessage("Paste the complete MultiCode room token.");
+      return;
+    }
 
     const config = vscode.workspace.getConfiguration("multicode");
     const name = config.get<string>("displayName")?.trim() || this.defaultName();
@@ -75,7 +92,31 @@ class MultiCodeController implements vscode.Disposable {
       prompt: "Prompts from all participants run in queue order",
       ignoreFocusOut: true,
     });
-    if (prompt?.trim()) this.process.stdin.write(`${prompt.trim()}\n`);
+    if (prompt?.trim()) await this.submitPrompt(prompt);
+  }
+
+  async submitPrompt(text: string): Promise<void> {
+    const prompt = text.trim();
+    if (!prompt) return;
+    if (!this.process?.stdin.writable) {
+      void vscode.window.showWarningMessage("Join or host a MultiCode room before sending a prompt.");
+      return;
+    }
+    this.process.stdin.write(`${prompt}\n`);
+  }
+
+  async copyInvite(): Promise<void> {
+    if (!this.roomCode) return;
+    await vscode.env.clipboard.writeText(this.roomCode);
+    void vscode.window.showInformationMessage("MultiCode invite token copied.");
+  }
+
+  openOutput(): void {
+    this.output.show(true);
+  }
+
+  openChat(): void {
+    void vscode.commands.executeCommand(`${MultiCodeChatView.viewType}.focus`);
   }
 
   async doctor(): Promise<void> {
@@ -84,7 +125,7 @@ class MultiCodeController implements vscode.Disposable {
     this.output.show(true);
     this.output.appendLine("$ multicode doctor\n");
     const command = this.cliCommand();
-    const child = spawn(command.executable, [...command.prefixArgs, "doctor"], { cwd, env: process.env });
+    const child = spawn(command.executable, [...command.prefixArgs, "doctor"], { cwd, env: this.sessionEnvironment() });
     child.stdout.on("data", (data: Buffer) => this.output.append(data.toString()));
     child.stderr.on("data", (data: Buffer) => this.output.append(data.toString()));
     child.once("error", (error) => this.reportLaunchError(error));
@@ -96,6 +137,7 @@ class MultiCodeController implements vscode.Disposable {
   async stop(): Promise<void> {
     if (!this.process) return;
     this.stopping = true;
+    this.chat.stopping();
     this.status.text = "$(sync~spin) MultiCode: stopping";
     this.process.kill("SIGINT");
     const activeProcess = this.process;
@@ -118,6 +160,7 @@ class MultiCodeController implements vscode.Disposable {
 
   dispose(): void {
     if (this.process) this.process.kill("SIGTERM");
+    this.chat.dispose();
     this.collaboration.dispose();
     this.output.dispose();
     this.status.dispose();
@@ -128,15 +171,17 @@ class MultiCodeController implements vscode.Disposable {
     this.mode = mode;
     this.stopping = false;
     this.recentOutput = "";
+    this.roomWorkspace = undefined;
     this.output.clear();
-    this.output.show(true);
     this.output.appendLine(`$ multicode ${args.join(" ")}\n`);
+    this.chat.start(mode, mode === "join" ? this.roomCode?.slice(0, 11) : undefined);
+    this.openChat();
     this.status.text = `$(sync~spin) MultiCode: ${mode === "host" ? "hosting" : "joining"}`;
     this.status.tooltip = "Open MultiCode output";
     this.status.command = "multicode.sendPrompt";
     void vscode.commands.executeCommand("setContext", "multicode.connected", true);
 
-    const child = spawn(command.executable, [...command.prefixArgs, ...args], { cwd, env: process.env });
+    const child = spawn(command.executable, [...command.prefixArgs, ...args], { cwd, env: this.sessionEnvironment() });
     this.process = child;
     child.stdout.on("data", (data: Buffer) => this.handleOutput(data.toString()));
     child.stderr.on("data", (data: Buffer) => this.handleOutput(data.toString()));
@@ -148,6 +193,9 @@ class MultiCodeController implements vscode.Disposable {
       this.process = undefined;
       this.mode = undefined;
       this.roomCode = undefined;
+      this.roomWorkspace = undefined;
+      this.collaboration.disconnect();
+      this.chat.stopped(unexpected ? `Session ended unexpectedly (${signal ?? `code ${code ?? "unknown"}`})` : "Room closed");
       this.setIdle();
       void vscode.commands.executeCommand("setContext", "multicode.connected", false);
       if (unexpected) void vscode.window.showErrorMessage("The MultiCode session ended unexpectedly. See the MultiCode output for details.");
@@ -157,18 +205,16 @@ class MultiCodeController implements vscode.Disposable {
   private handleOutput(text: string): void {
     this.output.append(text);
     this.recentOutput = `${this.recentOutput}${text}`.slice(-2_000);
-    const workspaceMatch = this.recentOutput.match(/Room workspace\s+([^\r\n]+)/i);
-    if (workspaceMatch?.[1]) {
-      const roomWorkspace = workspaceMatch[1].trim();
-      if (path.isAbsolute(roomWorkspace) && vscode.workspace.workspaceFolders?.[0]?.uri.fsPath !== roomWorkspace) {
-        const folders = vscode.workspace.workspaceFolders?.length ?? 0;
-        void vscode.workspace.updateWorkspaceFolders(0, folders, { uri: vscode.Uri.file(roomWorkspace), name: "MultiCode room" });
-      }
+    const parsedWorkspace = roomWorkspaceFromOutput(this.recentOutput);
+    if (parsedWorkspace && !this.roomWorkspace) {
+      const roomWorkspace = parsedWorkspace.trim();
+      if (path.isAbsolute(roomWorkspace)) this.roomWorkspace = roomWorkspace;
     }
     if (this.mode === "host") {
-      const match = this.recentOutput.match(/Room token:\s*([A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}\.[A-Za-z0-9_-]{40,})/i);
-      if (match?.[1] && match[1] !== this.roomCode) {
-        this.roomCode = match[1];
+      const token = roomTokenFromOutput(this.recentOutput);
+      if (token && token !== this.roomCode) {
+        this.roomCode = token;
+        this.chat.ready(this.roomCode.slice(0, 11));
         this.status.text = `$(broadcast) MultiCode: ${this.roomCode.slice(0, 11)}`;
         this.status.tooltip = "Click to send a prompt";
         void vscode.env.clipboard.writeText(this.roomCode);
@@ -190,6 +236,35 @@ class MultiCodeController implements vscode.Disposable {
     const developmentCli = path.resolve(this.context.extensionPath, "../../packages/cli/dist/index.js");
     if (existsSync(developmentCli)) return { executable: "node", prefixArgs: [developmentCli] };
     return { executable: configured, prefixArgs: [] };
+  }
+
+  private sessionEnvironment(): NodeJS.ProcessEnv {
+    const env = { ...process.env };
+    const configured = vscode.workspace.getConfiguration("multicode").get<string>("codexExecutable")?.trim();
+    let codexDirectory = configured && path.isAbsolute(configured) && existsSync(configured)
+      ? path.dirname(configured)
+      : undefined;
+
+    if (!codexDirectory) {
+      const codexExtension = vscode.extensions.getExtension("openai.chatgpt");
+      if (codexExtension) {
+        const binRoot = path.join(codexExtension.extensionPath, "bin");
+        try {
+          for (const entry of readdirSync(binRoot, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            const directory = path.join(binRoot, entry.name);
+            const executable = path.join(directory, process.platform === "win32" ? "codex.exe" : "codex");
+            if (existsSync(executable)) { codexDirectory = directory; break; }
+          }
+        } catch { /* The Codex extension may use a different installation layout. */ }
+      }
+    }
+
+    if (codexDirectory) {
+      const pathKey = Object.keys(env).find((key) => key.toLocaleLowerCase() === "path") ?? "PATH";
+      env[pathKey] = [codexDirectory, env[pathKey]].filter(Boolean).join(path.delimiter);
+    }
+    return env;
   }
 
   private workspaceDirectory(required = true): string {
@@ -219,6 +294,7 @@ class MultiCodeController implements vscode.Disposable {
 
   private reportLaunchError(error: Error): void {
     this.output.appendLine(`\nUnable to launch MultiCode: ${error.message}`);
+    this.chat.fail(`Unable to launch MultiCode: ${error.message}`);
     void vscode.window.showErrorMessage(
       "Unable to launch the MultiCode CLI. Run npm run setup:cli or set multicode.executable in Settings.",
       "Open Settings",
@@ -238,8 +314,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const controller = new MultiCodeController(context);
   context.subscriptions.push(
     controller,
+    vscode.window.registerWebviewViewProvider(MultiCodeChatView.viewType, controller.chat, { webviewOptions: { retainContextWhenHidden: true } }),
     vscode.commands.registerCommand("multicode.host", () => controller.host()),
     vscode.commands.registerCommand("multicode.join", () => controller.join()),
+    vscode.commands.registerCommand("multicode.openChat", () => controller.openChat()),
     vscode.commands.registerCommand("multicode.sendPrompt", () => controller.sendPrompt()),
     vscode.commands.registerCommand("multicode.doctor", () => controller.doctor()),
     vscode.commands.registerCommand("multicode.stop", () => controller.stop()),

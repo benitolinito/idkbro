@@ -4,4 +4,9 @@ tsconfig.json
 **/*.map
 **/*.tsbuildinfo
 dist/*.mjs
+dist/*.d.ts
+dist/*.test.js
+dist/chat-model.js
+dist/chat-view.js
+dist/collaboration.js
 *.vsix
