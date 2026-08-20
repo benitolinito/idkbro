@@ -118,6 +118,10 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     commit: z.string().min(1).max(128),
   }),
   z.object({
+    type: z.literal("workspace.checkpoint.request"),
+    sequence: z.number().int().positive(),
+  }),
+  z.object({
     type: z.literal("collab.publish"),
     event: z.object({
       id: z.string().uuid(),
@@ -145,6 +149,22 @@ export const workspaceCheckpointSchema = z.object({
   createdAt: z.string().datetime(),
 });
 
+export const checkpointChunkBytes = 128 * 1024;
+export const maxCheckpointBytes = 32 * 1024 * 1024;
+export const maxCheckpointChunks = Math.ceil(maxCheckpointBytes / checkpointChunkBytes);
+
+export const workspaceCheckpointDescriptorSchema = workspaceCheckpointSchema.omit({ bundle: true }).extend({
+  bundleBytes: z.number().int().nonnegative().max(maxCheckpointBytes),
+  bundleHash: z.string().regex(/^[a-f0-9]{64}$/),
+  chunkCount: z.number().int().positive().max(maxCheckpointChunks),
+});
+
+export const workspaceCheckpointChunkSchema = z.object({
+  sequence: z.number().int().positive(),
+  index: z.number().int().nonnegative().max(maxCheckpointChunks - 1),
+  data: z.string().min(1).max(Math.ceil(checkpointChunkBytes / 3) * 4),
+});
+
 export const relayHostMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("relay.room.create"),
@@ -166,6 +186,21 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("relay.workspace.checkpoint"),
     checkpoint: workspaceCheckpointSchema,
+  }),
+  z.object({
+    type: z.literal("relay.workspace.checkpoint.start"),
+    checkpoint: workspaceCheckpointDescriptorSchema,
+    targetParticipantId: z.string().min(1).max(128).optional(),
+  }),
+  z.object({
+    type: z.literal("relay.workspace.checkpoint.chunk"),
+    chunk: workspaceCheckpointChunkSchema,
+    targetParticipantId: z.string().min(1).max(128).optional(),
+  }),
+  z.object({
+    type: z.literal("relay.workspace.checkpoint.complete"),
+    sequence: z.number().int().positive(),
+    targetParticipantId: z.string().min(1).max(128).optional(),
   }),
   z.object({
     type: z.literal("relay.prompt.failed"),
@@ -214,6 +249,23 @@ export interface WorkspaceCheckpoint {
   createdAt: string;
 }
 
+export interface WorkspaceCheckpointDescriptor {
+  sequence: number;
+  baseCommit: string;
+  commit: string;
+  ref: string;
+  bundleBytes: number;
+  bundleHash: string;
+  chunkCount: number;
+  createdAt: string;
+}
+
+export interface WorkspaceCheckpointChunk {
+  sequence: number;
+  index: number;
+  data: string;
+}
+
 export type RelayHostMessage =
   | {
       type: "relay.room.create";
@@ -223,6 +275,9 @@ export type RelayHostMessage =
   | { type: "relay.agent.event"; event: AgentEvent }
   | { type: "relay.workspace.diff"; diff: WorkspaceDiff }
   | { type: "relay.workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
+  | { type: "relay.workspace.checkpoint.start"; checkpoint: WorkspaceCheckpointDescriptor; targetParticipantId?: string }
+  | { type: "relay.workspace.checkpoint.chunk"; chunk: WorkspaceCheckpointChunk; targetParticipantId?: string }
+  | { type: "relay.workspace.checkpoint.complete"; sequence: number; targetParticipantId?: string }
   | { type: "relay.prompt.failed"; promptId: string; message: string }
   | { type: "relay.collab.event"; event: CollaborationEvent };
 
@@ -245,7 +300,7 @@ export type RoomServerMessage =
       activePrompt: QueuedPrompt | null;
       queue: QueuedPrompt[];
       latestDiff: WorkspaceDiff | null;
-      latestCheckpoint: WorkspaceCheckpoint | null;
+      latestCheckpoint: WorkspaceCheckpointDescriptor | WorkspaceCheckpoint | null;
       collabHistory: CollaborationEvent[];
     }
   | { type: "participant.joined"; participant: RoomParticipant }
@@ -255,6 +310,10 @@ export type RoomServerMessage =
   | { type: "agent.event"; event: AgentEvent }
   | { type: "workspace.diff"; diff: WorkspaceDiff }
   | { type: "workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
+  | { type: "workspace.checkpoint.start"; checkpoint: WorkspaceCheckpointDescriptor }
+  | { type: "workspace.checkpoint.chunk"; chunk: WorkspaceCheckpointChunk }
+  | { type: "workspace.checkpoint.complete"; sequence: number }
+  | { type: "workspace.checkpoint.request"; participantId: string; sequence: number }
   | { type: "collab.event"; event: CollaborationEvent }
   | { type: "participant.synced"; participantId: string; sequence: number; commit: string }
   | { type: "room.error"; message: string; fatal?: boolean };

@@ -2,12 +2,15 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import {
   roomClientMessageSchema,
+  checkpointChunkBytes,
   type AgentEvent,
   type QueuedPrompt,
   type RoomParticipant,
   type RoomServerMessage,
   type WorkspaceDiff,
   type WorkspaceCheckpoint,
+  type WorkspaceCheckpointChunk,
+  type WorkspaceCheckpointDescriptor,
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
 
@@ -21,6 +24,7 @@ export interface RoomRelayOptions {
   token: string;
   hostName: string;
   onPrompt: (prompt: QueuedPrompt) => Promise<void>;
+  onCheckpointRequest?: (participantId: string, sequence: number) => Promise<void> | void;
   onRoomEvent?: (message: RoomServerMessage) => void;
 }
 
@@ -41,7 +45,7 @@ export class RoomRelay {
   private readonly queue: QueuedPrompt[] = [];
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
-  private latestCheckpoint: WorkspaceCheckpoint | null = null;
+  private latestCheckpoint: WorkspaceCheckpointDescriptor | null = null;
   private readonly host: RoomParticipant;
 
   constructor(private readonly options: RoomRelayOptions) {
@@ -107,15 +111,49 @@ export class RoomRelay {
     this.broadcast({ type: "workspace.diff", diff });
   }
 
-  publishWorkspaceCheckpoint(checkpoint: WorkspaceCheckpoint): void {
-    if (this.latestCheckpoint && checkpoint.sequence <= this.latestCheckpoint.sequence) {
+  publishWorkspaceCheckpoint(checkpoint: WorkspaceCheckpoint, targetParticipantId?: string): void {
+    const bundle = Buffer.from(checkpoint.bundle, "base64");
+    const chunkCount = Math.ceil(bundle.byteLength / checkpointChunkBytes);
+    const descriptor: WorkspaceCheckpointDescriptor = {
+      sequence: checkpoint.sequence,
+      baseCommit: checkpoint.baseCommit,
+      commit: checkpoint.commit,
+      ref: checkpoint.ref,
+      bundleBytes: bundle.byteLength,
+      bundleHash: createHash("sha256").update(bundle).digest("hex"),
+      chunkCount,
+      createdAt: checkpoint.createdAt,
+    };
+    this.publishWorkspaceCheckpointStart(descriptor, targetParticipantId);
+    for (let index = 0; index < chunkCount; index += 1) {
+      this.publishWorkspaceCheckpointChunk({
+        sequence: checkpoint.sequence,
+        index,
+        data: bundle.subarray(index * checkpointChunkBytes, (index + 1) * checkpointChunkBytes).toString("base64"),
+      }, targetParticipantId);
+    }
+    this.publishWorkspaceCheckpointComplete(checkpoint.sequence, targetParticipantId);
+  }
+
+  publishWorkspaceCheckpointStart(checkpoint: WorkspaceCheckpointDescriptor, targetParticipantId?: string): void {
+    if (!targetParticipantId && this.latestCheckpoint && checkpoint.sequence <= this.latestCheckpoint.sequence) {
       throw new Error("Workspace checkpoint sequence must increase");
     }
-    this.latestCheckpoint = checkpoint;
-    for (const state of this.connections.values()) {
-      if (state.participant) state.participant.synced = false;
+    if (!targetParticipantId) {
+      this.latestCheckpoint = checkpoint;
+      for (const state of this.connections.values()) {
+        if (state.participant) state.participant.synced = false;
+      }
     }
-    this.broadcast({ type: "workspace.checkpoint", checkpoint });
+    this.sendCheckpointMessage({ type: "workspace.checkpoint.start", checkpoint }, targetParticipantId);
+  }
+
+  publishWorkspaceCheckpointChunk(chunk: WorkspaceCheckpointChunk, targetParticipantId?: string): void {
+    this.sendCheckpointMessage({ type: "workspace.checkpoint.chunk", chunk }, targetParticipantId);
+  }
+
+  publishWorkspaceCheckpointComplete(sequence: number, targetParticipantId?: string): void {
+    this.sendCheckpointMessage({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
   }
 
   publishCollaborationEvent(event: import("@multicode/protocol").CollaborationEvent): void {
@@ -200,6 +238,17 @@ export class RoomRelay {
       return;
     }
 
+    if (parsed.data.type === "workspace.checkpoint.request") {
+      if (!this.latestCheckpoint || parsed.data.sequence !== this.latestCheckpoint.sequence) {
+        this.send(socket, { type: "room.error", message: "Requested workspace checkpoint is no longer available" });
+        return;
+      }
+      void Promise.resolve(this.options.onCheckpointRequest?.(state.participant.id, parsed.data.sequence)).catch((error: unknown) => {
+        this.send(socket, { type: "room.error", message: error instanceof Error ? error.message : String(error) });
+      });
+      return;
+    }
+
     if (parsed.data.type === "collab.publish") {
       this.broadcast({ type: "collab.event", event: parsed.data.event }, socket);
       return;
@@ -258,6 +307,16 @@ export class RoomRelay {
     return [...this.connections.values()].flatMap((state) =>
       state.participant ? [state.participant] : [],
     );
+  }
+
+  private sendCheckpointMessage(message: RoomServerMessage, targetParticipantId?: string): void {
+    if (!targetParticipantId) {
+      this.broadcast(message);
+      return;
+    }
+    const target = [...this.connections.entries()].find(([, state]) => state.participant?.id === targetParticipantId);
+    if (!target) throw new Error("Checkpoint target participant is no longer connected");
+    this.send(target[0], message);
   }
 
   private enqueue(prompt: QueuedPrompt): void {

@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   applyWorkspaceCheckpoint,
+  cleanupParticipantWorkspace,
   createTaskWorktree,
   createRoomWorktrees,
   createWorkspaceCheckpoint,
@@ -84,6 +85,70 @@ describe("workspace checkpoints", () => {
     await restoreParticipantWorkspace(state);
     expect(await readFile(path.join(participant, "local.txt"), "utf8")).toBe("keep me\n");
     expect((await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim()).toBe(originalHead);
+  });
+
+  it("refuses to overwrite dirty participant room worktrees", async () => {
+    const host = await mkdtemp(path.join(tmpdir(), "multicode-dirty-host-"));
+    const participant = await mkdtemp(path.join(tmpdir(), "multicode-dirty-participant-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-dirty-data-"));
+    await execFileAsync("git", ["init", "-q", host]);
+    await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(host, "shared.txt"), "initial\n");
+    await execFileAsync("git", ["-C", host, "add", "shared.txt"]);
+    await execFileAsync("git", ["-C", host, "commit", "-qm", "initial"]);
+    const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
+    await execFileAsync("git", ["clone", "-q", host, participant]);
+    const state = await prepareParticipantWorkspace({ cwd: participant, roomId: "room-dirty", baseCommit, dataDirectory });
+
+    await writeFile(path.join(host, "shared.txt"), "remote\n");
+    const checkpoint = await createWorkspaceCheckpoint({ cwd: host, roomId: "room-dirty", sequence: 1, baseCommit });
+    expect(checkpoint).not.toBeNull();
+    if (!checkpoint) throw new Error("Expected a checkpoint");
+    await writeFile(path.join(state.root, "shared.txt"), "local\n");
+    await writeFile(path.join(state.root, "untracked.txt"), "preserve me\n");
+
+    await expect(applyWorkspaceCheckpoint(state, checkpoint)).rejects.toThrow(/unacknowledged local changes/);
+    expect(await readFile(path.join(state.root, "shared.txt"), "utf8")).toBe("local\n");
+    expect(await readFile(path.join(state.root, "untracked.txt"), "utf8")).toBe("preserve me\n");
+    expect((await execFileAsync("git", ["-C", state.root, "rev-parse", "HEAD"])).stdout.trim()).toBe(baseCommit);
+  });
+
+  it("rejects a tampered room ownership marker", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-marker-repo-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-marker-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await execFileAsync("git", ["-C", repository, "commit", "--allow-empty", "-qm", "initial"]);
+    const baseCommit = (await execFileAsync("git", ["-C", repository, "rev-parse", "HEAD"])).stdout.trim();
+    const state = await prepareParticipantWorkspace({ cwd: repository, roomId: "room-marker", baseCommit, dataDirectory });
+    const marker = JSON.parse(await readFile(state.markerPath, "utf8")) as Record<string, unknown>;
+    await writeFile(state.markerPath, JSON.stringify({ ...marker, repositoryRoot: "/tmp/not-the-repository" }));
+
+    await expect(restoreParticipantWorkspace(state)).rejects.toThrow(/validated MultiCode room worktree/);
+  });
+
+  it("removes a preserved room workspace only through explicit cleanup", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-cleanup-repo-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-cleanup-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "file.txt"), "original\n");
+    await execFileAsync("git", ["-C", repository, "add", "file.txt"]);
+    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
+    const baseCommit = (await execFileAsync("git", ["-C", repository, "rev-parse", "HEAD"])).stdout.trim();
+    const state = await prepareParticipantWorkspace({ cwd: repository, roomId: "room-cleanup", baseCommit, dataDirectory });
+
+    await writeFile(path.join(state.root, "local.txt"), "keep until forced\n");
+    await expect(cleanupParticipantWorkspace({ roomId: state.roomId, dataDirectory })).rejects.toThrow(/unacknowledged local changes/);
+    expect(await readFile(path.join(state.root, "local.txt"), "utf8")).toBe("keep until forced\n");
+
+    const removed = await cleanupParticipantWorkspace({ roomId: state.roomId, dataDirectory, force: true });
+    expect(removed).toBe(state.root);
+    await expect(readFile(state.markerPath, "utf8")).rejects.toThrow();
+    expect(await readFile(path.join(repository, "file.txt"), "utf8")).toBe("original\n");
   });
 });
 

@@ -1,6 +1,6 @@
 # MultiCode
 
-MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in the current workspace; everyone can submit prompts and receives the same verified code checkpoints in real time.
+MultiCode lets multiple people collaborate around one coding-agent session from VS Code or the terminal. The host runs Codex in an isolated agent worktree; everyone can submit prompts and receives the same verified code checkpoints.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -210,9 +210,17 @@ Run `multicode --help` for operator/development commands. End users only need
 The host and Codex use MultiCode-owned isolated worktrees. The original checkout
 is never switched, stashed, reset, or cleaned.
 
-Participants receive an isolated room worktree and acknowledge encrypted
-checkpoints only after the Pi relay has durably recorded them. If the Pi is
-unreachable, host and join pause and retry; they never fork state locally.
+Participants receive an isolated room worktree. Checkpoints are streamed from
+the host in bounded 128 KiB chunks and verified by byte count, SHA-256 hash, Git
+bundle verification, and expected commit before application. The relay retains
+only checkpoint metadata, so a late joiner explicitly requests the current
+bundle from the host.
+
+A checkpoint never resets a dirty participant room worktree. Preserve or export
+those local changes first, then resynchronize. Leaving a room preserves its
+worktree by default; remove a clean preserved worktree explicitly with
+`multicode cleanup <room-id>`, or use `--force` only when its local changes may
+be discarded.
 
 Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
 
@@ -248,4 +256,4 @@ npm run package -w multicode-vscode
 - A remote room closes if its host disconnects.
 - Approval requests are reported but cannot be resolved interactively through the CLI.
 - There is no browser client, automatic reconnect, or event replay after disconnect.
-- Participant room-branch and backup-ref cleanup is manual.
+- Exporting a preserved room worktree as a patch, branch, or commit is not yet automated.

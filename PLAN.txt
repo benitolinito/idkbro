@@ -1,0 +1,796 @@
+Full MultiCode real-time collaboration plan
+This is the implementation plan I would use against the current 3008a83 baseline.
+The final product will use:
+- Real local VS Code workspaces for every user.
+- Yjs for Google Docs–style human text collaboration.
+- A dedicated host daemon as the authoritative session.
+- Git checkpoints for bootstrap and recovery only.
+- A separate Codex worktree.
+- Near-real-time, read-only Codex previews.
+- Short merge-time locks and an all-or-nothing workspace commit.
+1. Target experience
+Human collaboration
+Both users can:
+- Open and edit the same files in normal VS Code editors.
+- See changes within a few hundred milliseconds.
+- See cursors, selections, presence, and active files.
+- Create, rename, move, and delete files.
+- Use IntelliSense, formatters, debugging, terminals, and other extensions.
+- Continue editing while Codex works.
+Codex collaboration
+Both users can:
+- Submit or approve prompts.
+- See Codex messages and command output live.
+- Follow Codex’s changing files in a read-only diff view.
+- Continue editing shared files while Codex works separately.
+- See a clean Codex turn merged automatically or sent to conflict review.
+Codex changes will be near-real-time file snapshots, not character-by-character model typing.
+2. Final architecture
+Original host checkout
+        │
+        │ capture initial snapshot
+        ▼
+Host collaborative worktree ◀────▶ Host VS Code
+        │
+        │ local IPC
+        ▼
+┌─────────────────────────────────────────────┐
+│ Host session daemon                         │
+│                                             │
+│ • authoritative manifest                   │
+│ • per-file Yjs documents                   │
+│ • operation sequencer                      │
+│ • durable journal and snapshots            │
+│ • participant permissions                  │
+│ • Codex controller                         │
+│ • preview generator                        │
+│ • three-way merge engine                   │
+│ • workspace transaction coordinator        │
+└─────────────────────────────────────────────┘
+        │                         │
+        │ encrypted WebSocket     │ isolated filesystem
+        ▼                         ▼
+Public/self-hosted relay      Codex agent worktree
+        │                         │
+        ▼                         ▼
+Participant client           Codex app-server
+        │
+        ▼
+Participant room worktree ◀──▶ Participant VS Code
+The original host and participant checkouts are never reset or switched after room creation. All collaboration happens in isolated room worktrees.
+3. Non-negotiable correctness rules
+1. The host session daemon is the only authority for room state.
+2. An edit is guaranteed only after the daemon durably records it.
+3. Original user checkouts are never modified during collaboration.
+4. Codex never writes directly into the collaborative worktree.
+5. Codex previews never modify Yjs or shared files.
+6. A Codex turn is committed completely or not at all.
+7. Locks are enforced by the sequencer, not merely by VS Code UI.
+8. A slow participant cannot block the entire prompt queue.
+9. The public relay is treated as untrusted.
+10. The first release permits only one active or pending Codex turn.
+Phase 0: Make the pulled checkpoint system safe
+The latest code added valuable Git checkpoint functionality, but the current participant application uses git reset --hard and git clean -fd: [workspace/index.ts (line 197)](/Users/benlin/Documents/idk-bro/packages/workspace/src/index.ts:197).
+That is safe for a read-only participant, but it would destroy edits made after joining.
+Changes
+- Replace in-place participant branch switching with an isolated room worktree.
+- Never stash, switch, reset, or clean the participant’s original checkout.
+- Make destructive operations legal only inside a validated MultiCode-owned worktree.
+- Add a marker file containing the room ID, repository identity, and creation nonce.
+- Verify that marker and canonical path before any reset or cleanup.
+- Refuse to update a dirty room worktree unless its changes are already acknowledged by the session.
+- Preserve abandoned room worktrees until the user explicitly removes them.
+Checkpoint role
+Keep the existing temporary-index checkpoint creation because it can capture staged, unstaged, and untracked files without modifying the user’s index.
+Use Git checkpoints for:
+- Initial room creation.
+- Late-join bootstrap.
+- Crash recovery.
+- Periodic compaction.
+- Exporting the final room result.
+Do not use full Git bundles for live file updates.
+Relay corrections
+- Stop retaining large source bundles in relay room memory.
+- Have a joining client request the current checkpoint from the host daemon.
+- Chunk checkpoint transfers instead of sending one 36 MiB JSON message.
+- Add per-frame, per-room, and global relay quotas.
+- Replace command-completion checkpoints with lightweight preview reconciliation.
+- Remove the requirement that every participant acknowledge every checkpoint before the next prompt starts.
+Exit gate
+- Original participant checkout remains byte-for-byte unchanged.
+- Dirty participant room mirrors cannot be silently reset.
+- A malicious path cannot cause cleanup outside the room directory.
+- Existing checkpoint and relay tests continue passing.
+Phase 1: Native VS Code collaboration feasibility spike
+Use normal VS Code editors and real filesystem workspaces. Do not start by building a custom Monaco editor.
+Prototype
+Implement one collaboratively editable UTF-8 file across two VS Code extension-host processes:
+- Capture local changes with onDidChangeTextDocument.
+- Convert changes into Yjs operations.
+- Send binary Yjs updates through a prototype provider.
+- Apply remote changes with WorkspaceEdit.
+- Mark update origins to prevent echo loops.
+- Show remote selections using decorations.
+- Debounce room-workspace autosave.
+Test matrix
+Test:
+- Concurrent edits in the same line.
+- Concurrent insertions at the same position.
+- Undo and redo.
+- Multicursor.
+- Paste and large replacement.
+- Format document and format-on-save.
+- Rename symbol/code actions.
+- Snippets.
+- IME composition.
+- Autosave and manual save.
+- Revert.
+- Closing and reopening a file.
+- Extension reconnect.
+- Split editors.
+- External filesystem modification.
+Undo decision
+The expected first-release decision is:
+- Preserve the native VS Code editor and ecosystem.
+- Use normal VS Code undo behavior.
+- Do not promise “undo only my own edits.”
+If per-user CRDT undo is mandatory and cannot be implemented reliably, then reconsider a custom Monaco editor. That option owns substantially more save, backup, undo, and hot-exit behavior according to the VS Code Custom Editor API.
+Exit gate
+Proceed only if remote updates do not corrupt text, create feedback loops, or break ordinary language tooling.
+Phase 2: Protocol v2
+The current protocol only supports prompts, checkpoints, and acknowledgements: [protocol/index.ts (line 100)](/Users/benlin/Documents/idk-bro/packages/protocol/src/index.ts:100).
+Create a versioned protocol that separates control messages from binary data.
+Common envelope
+Every message includes:
+interface Envelope {
+  protocolVersion: 2;
+  roomId: string;
+  sessionEpoch: string;
+  messageId: string;
+  actorId: string;
+  sequence?: number;
+  correlationId?: string;
+  payloadType: string;
+  payloadLength?: number;
+  payloadHash?: string;
+}
+Message families
+Session
+- session.hello
+- session.join
+- session.resume
+- session.welcome
+- session.snapshot
+- session.error
+- session.goodbye
+Participants and permissions
+- participant.joined
+- participant.left
+- participant.presence
+- participant.permission.requested
+- participant.permission.granted
+- participant.permission.revoked
+Workspace manifest
+- manifest.snapshot
+- manifest.operation
+- manifest.ack
+- manifest.resync
+Operations include create, rename, move, delete, chmod, and document-epoch replacement.
+Documents
+- document.subscribe
+- document.unsubscribe
+- document.snapshot
+- document.update
+- document.ack
+- document.resync
+- document.locked
+- document.unlocked
+Awareness
+- awareness.update
+- awareness.expired
+Agent
+- agent.prompt.proposed
+- agent.prompt.approved
+- agent.turn.started
+- agent.event
+- agent.preview.updated
+- agent.preview.removed
+- agent.turn.completed
+- agent.turn.failed
+- agent.turn.interrupted
+Merge and commit
+- workspace.commit.prepare
+- workspace.commit.part
+- workspace.commit.finalize
+- workspace.commit.abort
+- agent.merge.started
+- agent.merge.completed
+- agent.merge.conflicted
+- agent.proposal.updated
+- agent.proposal.discarded
+Transport behavior
+- JSON for small control messages.
+- Binary frames for Yjs updates and file chunks.
+- Proposed chunk size: 256 KiB.
+- Hash every complete payload.
+- Acknowledge durable document and manifest operations.
+- Maintain bounded per-client send queues.
+- Disconnect clients that exceed backpressure limits.
+- Use sequence-based resume when history is available.
+- Fall back to a snapshot when replay history was compacted.
+- Keep protocol v1 and v2 on separate endpoints during migration.
+Phase 3: Dedicated session daemon
+Create @multicode/session-core and a multicode-session executable.
+Responsibilities
+The daemon owns:
+- Room lifecycle.
+- Relay connection.
+- Participant authentication.
+- Operation sequencing.
+- Workspace manifest.
+- Yjs documents.
+- Durable storage.
+- Worktree materialization.
+- Checkpoint generation.
+- Codex process lifecycle.
+- Preview state.
+- Merge proposals.
+- Workspace transactions.
+The CLI and VS Code extension become clients of the daemon.
+Local IPC
+Use:
+- Unix domain sockets on macOS/Linux.
+- Named pipes on Windows.
+- A random local authentication token.
+- Token files accessible only to the current OS user.
+- Request IDs, subscriptions, cancellation, and heartbeats.
+Durable storage
+Use SQLite in WAL mode inside the daemon for:
+- Sessions.
+- Participants and permissions.
+- Manifest revisions.
+- Document updates.
+- Workspace operations.
+- Checkpoints.
+- Codex turns.
+- Pending proposals.
+- Workspace commits.
+Store large snapshots and blobs in content-addressed files keyed by SHA-256.
+A document update is acknowledged only after its SQLite transaction commits.
+Crash recovery
+On restart:
+1. Load the last compacted snapshot.
+2. Replay later journal entries.
+3. Verify content hashes.
+4. Finish or roll back incomplete workspace commits.
+5. Reconcile the collaborative worktree.
+6. Mark interrupted Codex turns as failed/pending review.
+7. Reconnect to the relay using a host resume token.
+An agent crash must not close the human collaboration room.
+Phase 4: Safe room worktrees and bootstrap
+Host room creation
+1. Inspect the original repository.
+2. Reject active merge/rebase/cherry-pick/revert operations.
+3. Capture the current workspace with the existing temporary-index mechanism.
+4. Create a hidden initial checkpoint commit.
+5. Create an isolated collaborative worktree at that commit.
+6. Create an isolated agent worktree at the same commit.
+7. Start the daemon.
+8. Open the collaborative worktree in a new VS Code window.
+9. Leave the original checkout untouched.
+Suggested layout:
+~/.multicode/sessions/<room-id>/
+  session.db
+  token
+  blobs/
+  snapshots/
+  shared/
+  agent/
+  logs/
+Participant join
+For the first release, require a clone containing the host’s base commit.
+1. Connect to the room.
+2. Authenticate.
+3. Fetch the current verified checkpoint.
+4. Create a new isolated participant worktree.
+5. Open it in a new VS Code window.
+6. Subscribe to manifest and document state.
+7. Catch up from the checkpoint sequence.
+8. Mark the participant ready.
+Later, support joining without a clone through a content-only snapshot.
+Leaving
+- Disconnect from live collaboration.
+- Preserve the room worktree by default.
+- Offer explicit “Remove Room Workspace.”
+- Never alter the user’s original branch.
+- Provide “Export Room Changes” as a patch, branch, or commit.
+Phase 5: Authoritative human collaboration
+Workspace model
+interface FileRecord {
+  fileId: string;
+  path: string;
+  kind: "text" | "binary";
+  encoding: "utf-8" | "binary";
+  mode: number;
+  size: number;
+  contentHash: string;
+  documentEpoch: number;
+  deleted: boolean;
+}
+Use:
+- Stable fileId across renames.
+- documentEpoch when a file is deleted/recreated or replaced incompatibly.
+- Monotonic manifestRevision for structure.
+- One Yjs document per editable text file.
+- Centralized, sequenced manifest operations.
+Text edit flow
+1. User edits the local VS Code buffer.
+2. Extension updates its local Yjs document.
+3. Client sends the Yjs update and operation ID.
+4. Daemon validates epoch, permissions, limits, and lock state.
+5. Daemon commits the update to the journal.
+6. Daemon assigns a room sequence.
+7. Daemon acknowledges the sender.
+8. Daemon broadcasts the update.
+9. Other clients apply it to Yjs and their VS Code buffers.
+10. Disk projectors save the updated file.
+Unacknowledged edits remain speculative. Rejected updates trigger resynchronization.
+File operations
+Creates, renames, moves, and deletes go through the daemon, not directly through Yjs.
+Use compare-and-swap against:
+- Manifest revision.
+- File ID.
+- Document epoch.
+- Expected source path.
+- Expected content hash where appropriate.
+External changes
+Watch every room worktree for edits made by:
+- Terminal commands.
+- Formatters that write directly.
+- Build tools.
+- Other extensions.
+- External editors.
+Classify writes using content hashes and materialization generations:
+- Known daemon write: ignore.
+- Unknown write matching current state: ignore.
+- Unknown divergent write: import as a human workspace operation.
+- Concurrent divergence: three-way merge or conflict.
+Presence
+Use Yjs awareness for ephemeral:
+- Active file.
+- Cursor position.
+- Selection.
+- Display name and color.
+- Typing status.
+- Follow target.
+Expire awareness automatically after disconnect.
+Roles
+- viewer: files, presence, agent output, previews.
+- editor: human file edits.
+- prompter: submit prompts.
+- reviewer: resolve conflicts and approve proposals.
+- host: permissions, agent controls, room termination.
+Roles are independent capabilities.
+Phase 6: Codex isolation and turn checkpoints
+The current code starts Codex in the host checkout. Replace that with the persistent agent worktree.
+Turn state machine
+idle
+  → checkpointing
+  → preparing-agent
+  → running
+  → settling
+  → merging
+  → committed
+     or pending-conflict
+     or failed
+     or interrupted
+Turn start
+1. Accept or approve the prompt.
+2. Insert a checkpoint barrier into the room sequencer.
+3. Record cutoff sequence N.
+4. Capture immutable base B:
+B:
+- cutoff sequence
+- manifest revision
+- file IDs and paths
+- file content hashes
+- document state vectors
+- Git tree/commit
+5. Continue admitting later human edits as state H.
+6. Materialize exactly B in the agent worktree.
+7. Verify agent-worktree hashes.
+8. Start the Codex turn.
+No whole-turn human locks are used.
+Phase 7: Live Codex preview
+Preview source
+The filesystem watcher is the primary source because the current adapter exposes messages and command events but no normalized patch stream: [codex.ts (line 68)](/Users/benlin/Documents/idk-bro/packages/agent-adapters/src/codex.ts:68).
+Official OpenAI documentation describes apply-patch operations for the Responses API, but this does not guarantee equivalent Codex app-server events. OpenAI Responses API reference.
+Watcher behavior
+- Watch only the agent worktree.
+- Exclude .git, dependency directories, caches, outputs, and sensitive paths.
+- Debounce for approximately 150–300 ms.
+- Read a file only after two stable metadata observations.
+- Compute preview changes relative to B.
+- Reconcile the entire changed-file set periodically.
+- Trigger immediate reconciliation after command completion.
+- Detect creates, deletes, and probable renames.
+- Hash every preview state.
+Preview identity
+interface AgentPreview {
+  roomId: string;
+  turnId: string;
+  previewRevision: number;
+  fileId?: string;
+  path: string;
+  operation: "create" | "update" | "delete" | "rename";
+  baseHash?: string;
+  contentHash?: string;
+  patch?: Uint8Array;
+  truncated: boolean;
+}
+Clients discard stale preview revisions.
+VS Code presentation
+- Read-only side-by-side diff.
+- Shared state on the left.
+- Codex preview on the right.
+- “Preview—not merged” banner.
+- Follow Codex mode.
+- Changed-file tree.
+- Create/delete/rename indicators.
+- Command output linked to affected files where detectable.
+Preview content never enters Yjs.
+Phase 8: Optimistic three-way merge
+At turn completion:
+1. Wait for a short filesystem quiet period.
+2. Reconcile the agent worktree.
+3. Capture final agent state A.
+4. Determine changed set B → A.
+5. Capture current human state H₁.
+6. Merge B, A, and H₁ outside any lock.
+7. Record expected file and manifest revisions from H₁.
+Merge cases
+Human state	Agent state	Result
+Human unchanged	Agent changed	Accept agent change
+Human changed	Agent unchanged	Keep human change
+Both changed, clean merge	Both	Use merged result
+Both changed, conflict	Both	Pending proposal
+Agent deletes, human edits	Conflict	Pending proposal
+Agent renames, human edits same file	Preserve stable file ID and merge	
+Binary changed by both	Conflict	Manual review
+File mode changed	Apply only if content merge is otherwise valid	
+
+
+Use Git rename detection for B → A, but preserve MultiCode stable file IDs.
+Phase 9: Short locks and atomic workspace commit
+Optimistic lock algorithm
+After computing a clean merge:
+1. Ask the sequencer to lock the complete changed-file set.
+2. Compare current revisions against H₁.
+3. If anything changed, release locks and recompute.
+4. If they match, queue later updates to affected files.
+5. Commit the prepared workspace transaction.
+6. Release locks.
+7. Replay queued human updates.
+Locks include:
+- Stable file IDs.
+- Source and destination paths for renames.
+- Parent paths for creates/deletes.
+- Document epochs.
+- Expected manifest revision.
+The lock should normally last only for the durable commit, not for merge computation or user review.
+Logical workspace transaction
+Because Yjs transactions are document-scoped, add a transaction above Yjs:
+workspace.commit.prepare
+workspace.commit.part × N
+workspace.commit.finalize
+Clients buffer all parts until finalize.
+The daemon:
+1. Stages all new manifest and document states.
+2. Writes one durable workspace-commit journal record.
+3. Applies merged text as Yjs transactions against H₁.
+4. Updates file records and manifest revision.
+5. Broadcasts commit parts.
+6. Broadcasts finalize.
+7. Materializes the collaborative worktree.
+8. Replays queued updates.
+9. Resets the agent worktree to the accepted shared state.
+Filesystem writes are not physically atomic across multiple files, so crash recovery uses the durable commit journal to finish materialization. User-visible state remains logically atomic.
+Queued edits
+- Yjs text updates are replayed after the commit.
+- Rename updates follow the stable file ID.
+- Delete plus queued edit becomes a conflict.
+- Epoch mismatch causes client resync.
+- No acknowledged human operation is silently discarded.
+Phase 10: Conflict proposals
+If any file conflicts:
+- Apply none of the Codex turn.
+- Release locks immediately.
+- Preserve B, A, and the conflict metadata.
+- Keep the preview available.
+- Create a pending proposal.
+- Allow humans to continue editing.
+Resolution flow
+1. Reviewer selects human, agent, merged, or manually edited content.
+2. Daemon captures the newest human state H₂.
+3. Rebase the resolution against H₂.
+4. Reacquire compare-and-swap locks.
+5. If the state changed again, retry.
+6. Commit through the same workspace transaction mechanism.
+Do not apply a resolution calculated against stale human state.
+While a proposal is pending:
+- Block new Codex turns for the first release.
+- Continue human editing.
+- Allow discard.
+- Allow export as a patch or branch.
+Interrupted or failed Codex turns never auto-merge.
+Phase 11: Security and privacy
+Initial release
+Start with:
+- Local relay or trusted self-hosted relay.
+- Explicit warning that source content is synchronized.
+- Viewer/editor/host permissions.
+- Strict path and payload validation.
+Public relay release
+Add application-level end-to-end encryption.
+Encrypt:
+- Document updates.
+- Checkpoints and snapshots.
+- Prompts.
+- Agent output.
+- Codex previews.
+- Awareness data.
+- Conflict proposals.
+The relay should only see routing metadata and encrypted payload sizes.
+A ten-character room code should only locate a room. It should not be the encryption key. Secure invitations should include a high-entropy key in a URL fragment that is never sent to the relay.
+Filesystem security
+Reject or require explicit approval for:
+- Symlinks.
+- Paths escaping the room root.
+- Device files and sockets.
+- Unsupported encodings.
+- Oversized files.
+- Binary editing.
+- Case-collision paths.
+- Reserved Windows paths.
+Default exclusions:
+- .git
+- .env*
+- private keys and credential files
+- node_modules
+- build outputs
+- caches
+- dependency stores
+- files ignored by room policy
+Tracked sensitive files require explicit confirmation before hosting.
+Resource security
+- Rate-limit joins, prompts, document updates, and awareness messages.
+- Cap Yjs update sizes.
+- Cap open documents per participant.
+- Bound replay history.
+- Bound relay queues and room memory.
+- Validate binary frame length before allocation.
+- Disconnect clients that repeatedly send malformed updates.
+Phase 12: VS Code UX
+Host flow
+1. Run “MultiCode: Host Room.”
+2. Review shared-file exclusions.
+3. Daemon creates room worktrees.
+4. A new VS Code window opens on the collaborative worktree.
+5. Room code/link is copied.
+6. Status bar displays room, participants, and agent status.
+Join flow
+1. Run “MultiCode: Join Room.”
+2. Paste invite link or code.
+3. Request editor/viewer role.
+4. Create isolated room worktree.
+5. Open it in a new window.
+6. Display synchronization progress.
+7. Begin document and presence subscriptions.
+UI surfaces
+- Participant list.
+- Role management.
+- Shared prompt queue.
+- Agent activity stream.
+- Agent changed-file tree.
+- Follow Codex.
+- Follow participant.
+- Read-only preview diffs.
+- Merge status.
+- Conflict editor.
+- Reconnect status.
+- Unacknowledged-edit warning.
+- Room cleanup/export commands.
+Use three visually distinct states:
+- Shared and committed.
+- Codex preview.
+- Pending conflict proposal.
+Phase 13: CLI behavior
+Keep CLI support as a thin client of the same daemon/protocol.
+Commands:
+multicode host
+multicode join
+multicode status
+multicode prompt
+multicode interrupt
+multicode participants
+multicode grant
+multicode revoke
+multicode proposal show
+multicode proposal resolve
+multicode export
+multicode leave
+multicode cleanup
+multicode relay serve
+CLI users receive real file synchronization through their room worktree, but cursor and selection presence remain VS Code features.
+Phase 14: Testing strategy
+Unit tests
+- Protocol schema validation.
+- Binary frame parsing.
+- Capability checks.
+- Path normalization.
+- Manifest operations.
+- Document epochs.
+- Yjs update journaling.
+- Snapshot compaction.
+- Preview revision ordering.
+- Three-way merge cases.
+- Lock compare-and-swap.
+- Workspace transaction recovery.
+- Encryption envelopes.
+Property/model tests
+Randomly interleave:
+- Human edits from multiple clients.
+- Renames and deletes.
+- Agent modifications.
+- Locks.
+- Disconnects.
+- Duplicate and delayed messages.
+- Snapshot compaction.
+- Crashes.
+Verify:
+- All connected clients converge.
+- No acknowledged edit is lost.
+- Invalid epochs never mutate state.
+- Agent commits appear all-or-nothing.
+- Locks cannot remain permanently orphaned.
+Integration tests
+Run:
+- Host daemon.
+- Relay.
+- Two or more clients.
+- Temporary Git repositories.
+- Fake Codex adapter.
+- Controlled filesystem watcher.
+Test initial join, late join, reconnect, preview, merge, conflict, interruption, and recovery.
+VS Code end-to-end tests
+Use two extension-host processes to verify:
+- Simultaneous editing.
+- Remote cursor rendering.
+- Autosave.
+- Formatting.
+- File creation and rename.
+- Preview viewing.
+- Conflict resolution.
+- Window reload and reconnect.
+Fault injection
+Crash after every workspace-commit step:
+- Before journal write.
+- After journal write.
+- During Yjs application.
+- During disk materialization.
+- Before finalize broadcast.
+- After finalize but before cleanup.
+Recovery must produce either the complete old state or complete committed state.
+Security tests
+- Path traversal.
+- Symlink escape.
+- Oversized frames.
+- Malformed Yjs updates.
+- Replay attacks.
+- Stale capabilities.
+- Unauthorized writes.
+- Relay memory exhaustion.
+- Checkpoint hash mismatch.
+Phase 15: Acceptance criteria
+The feature is ready when:
+- Two humans can edit the same UTF-8 file concurrently and converge.
+- Typical remote human edits appear within 500 ms.
+- Codex preview updates appear within 500 ms after a stable filesystem write.
+- Original host and participant checkouts remain unchanged.
+- Every acknowledged edit survives reconnect and daemon restart.
+- Slow participants do not block prompt execution.
+- Codex never modifies the collaborative worktree during a turn.
+- A multi-file Codex turn becomes visible completely or not at all.
+- Human edits during Codex work survive merge or create an explicit conflict.
+- Failed and interrupted turns never auto-merge.
+- Stale previews cannot replace newer previews.
+- The public relay cannot read encrypted source payloads.
+- All supported crash points recover deterministically.
+Latency figures are engineering targets, not hard network guarantees.
+MVP scope
+Included
+- Host plus several participants.
+- Normal VS Code editors.
+- UTF-8 regular text files.
+- Real-time human text collaboration.
+- Presence, cursors, and selections.
+- File create/rename/delete.
+- One Codex turn at a time.
+- Live read-only Codex previews.
+- Automatic clean merges.
+- Pending conflict proposals.
+- Host-online reconnect.
+- Trusted/self-hosted relay operation.
+- Git checkpoint bootstrap and recovery.
+Deferred
+- Exact per-user Google Docs undo.
+- Offline editing.
+- Peer-to-peer transport.
+- Binary collaborative editing.
+- Symlink synchronization.
+- Concurrent Codex agents.
+- Multiple stacked pending proposals.
+- Browser editor.
+- Rooms that survive the host device being offline.
+- Joining without a repository clone.
+- Automatic merge back into every user’s original branch.
+Recommended PR order
+1. Protect participant work and move synchronization into isolated worktrees.
+2. Add room-worktree lifecycle and cleanup.
+3. Add protocol v2 framing and version negotiation.
+4. Unify local and hosted relay routing.
+5. Add session daemon and authenticated local IPC.
+6. Add SQLite journal, snapshots, and crash recovery.
+7. Complete the native VS Code/Yjs feasibility spike.
+8. Add collaboration core and single-file text synchronization.
+9. Add presence, permissions, and reconnect.
+10. Add centralized file-manifest operations.
+11. Add disk projection and external-write ingestion.
+12. Refactor Git checkpoints into bootstrap/recovery only.
+13. Restore isolated Codex worktree execution.
+14. Add filesystem-based Codex previews.
+15. Add B/A/H merge engine and changed-file detection.
+16. Add compare-and-swap locks and workspace transactions.
+17. Add pending proposal and conflict UI.
+18. Add public-relay encryption and security limits.
+19. Add fault injection, performance testing, and rollout documentation.
+The first engineering task should be PR 1: stop applying checkpoints to an active participant checkout. That removes the largest current data-loss risk and establishes the isolated room-worktree structure needed by every later phase.
+
+
+8:59 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Approve for me
+
+
+
+
+
+
+
+5.6 SolHigh
+
+
+
+
+
+
+
+
+
+
+Work locallyLocal

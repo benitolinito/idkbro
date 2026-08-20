@@ -262,13 +262,64 @@ export async function prepareParticipantWorkspace(options: {
 }
 
 async function verifyParticipantWorktree(state: ParticipantWorkspaceState): Promise<void> {
-  const marker = JSON.parse(await readFile(state.markerPath, "utf8")) as Record<string, unknown>;
-  const root = await realpath(state.root);
-  if (root !== state.root || root === state.originalRoot || marker.roomId !== state.roomId || marker.workspacePath !== root || marker.creationNonce !== state.creationNonce) {
+  const [root, originalRoot, markerPath] = await Promise.all([
+    realpath(state.root),
+    realpath(state.originalRoot),
+    realpath(state.markerPath),
+  ]);
+  const expectedMarkerPath = path.join(path.dirname(root), ".multicode-room.json");
+  if (
+    root !== path.resolve(state.root)
+    || originalRoot !== path.resolve(state.originalRoot)
+    || markerPath !== expectedMarkerPath
+    || path.basename(root) !== "workspace"
+    || path.basename(path.dirname(root)) !== state.roomId
+  ) {
     throw new Error("Refusing destructive operation outside the validated MultiCode room worktree");
   }
-  const worktrees = await git(state.originalRoot, ["worktree", "list", "--porcelain"]);
+
+  let marker: Record<string, unknown>;
+  try {
+    marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+  } catch {
+    throw new Error("Refusing destructive operation because the MultiCode room marker is invalid");
+  }
+  if (
+    marker.version !== 2
+    || marker.roomId !== state.roomId
+    || marker.repositoryRoot !== originalRoot
+    || marker.workspacePath !== root
+    || marker.creationNonce !== state.creationNonce
+    || typeof state.creationNonce !== "string"
+    || state.creationNonce.length < 32
+    || root === originalRoot
+  ) {
+    throw new Error("Refusing destructive operation outside the validated MultiCode room worktree");
+  }
+
+  const [worktreeCommonDirectory, originalCommonDirectory] = await Promise.all([
+    git(root, ["rev-parse", "--git-common-dir"]),
+    git(originalRoot, ["rev-parse", "--git-common-dir"]),
+  ]);
+  const [canonicalWorktreeCommonDirectory, canonicalOriginalCommonDirectory] = await Promise.all([
+    realpath(path.resolve(root, worktreeCommonDirectory)),
+    realpath(path.resolve(originalRoot, originalCommonDirectory)),
+  ]);
+  if (canonicalWorktreeCommonDirectory !== canonicalOriginalCommonDirectory) {
+    throw new Error("Refusing destructive operation because the room marker belongs to another repository");
+  }
+
+  const worktrees = await git(originalRoot, ["worktree", "list", "--porcelain"]);
   if (!worktrees.split("\n").some((line) => line === `worktree ${root}`)) throw new Error("Room worktree is no longer registered by Git");
+}
+
+async function assertParticipantWorktreeClean(state: ParticipantWorkspaceState): Promise<void> {
+  const status = await git(state.root, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  if (status) {
+    throw new Error(
+      "Room workspace has unacknowledged local changes; refusing to reset it. Preserve or export those changes before resynchronizing",
+    );
+  }
 }
 
 export async function applyWorkspaceCheckpoint(state: ParticipantWorkspaceState, checkpoint: WorkspaceCheckpoint): Promise<void> {
@@ -282,6 +333,7 @@ export async function applyWorkspaceCheckpoint(state: ParticipantWorkspaceState,
     await git(state.root, ["fetch", bundlePath, `${checkpoint.ref}:${localRef}`]);
     const receivedCommit = await git(state.root, ["rev-parse", localRef]);
     if (receivedCommit !== checkpoint.commit) throw new Error("Received checkpoint hash does not match the host");
+    await assertParticipantWorktreeClean(state);
     await git(state.root, ["reset", "--hard", checkpoint.commit]);
     await git(state.root, ["clean", "-fd"]);
   } finally {
@@ -293,4 +345,42 @@ export async function restoreParticipantWorkspace(state: ParticipantWorkspaceSta
   // Joining never touches the original checkout, so leaving deliberately preserves
   // the room worktree for recovery/export instead of switching or stashing anything.
   await verifyParticipantWorktree(state);
+}
+
+/** Explicitly removes a preserved participant room worktree after validating its marker and repository identity. */
+export async function cleanupParticipantWorkspace(options: {
+  roomId: string;
+  dataDirectory?: string;
+  force?: boolean;
+}): Promise<string> {
+  const roomId = sanitizeRoomId(options.roomId);
+  const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
+  const roomDirectory = path.join(dataDirectory, "rooms", roomId);
+  const markerPath = path.join(roomDirectory, ".multicode-room.json");
+  let marker: Record<string, unknown>;
+  try {
+    marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+  } catch {
+    throw new Error(`No valid preserved MultiCode room workspace exists for ${roomId}`);
+  }
+  if (typeof marker.repositoryRoot !== "string" || typeof marker.workspacePath !== "string" || typeof marker.creationNonce !== "string") {
+    throw new Error(`No valid preserved MultiCode room workspace exists for ${roomId}`);
+  }
+  const repository = await inspectRepository(marker.repositoryRoot);
+  const state: ParticipantWorkspaceState = {
+    root: marker.workspacePath,
+    originalRoot: marker.repositoryRoot,
+    originalBranch: repository.branch,
+    originalHead: repository.head,
+    roomBranch: `multicode/room-${roomId}`,
+    backupRef: null,
+    roomId,
+    markerPath,
+    creationNonce: marker.creationNonce,
+  };
+  await verifyParticipantWorktree(state);
+  if (!options.force) await assertParticipantWorktreeClean(state);
+  await git(state.originalRoot, ["worktree", "remove", ...(options.force ? ["--force"] : []), state.root]);
+  await rm(path.dirname(state.root), { recursive: true, force: false });
+  return state.root;
 }

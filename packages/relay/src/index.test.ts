@@ -162,7 +162,8 @@ describe("RoomRelay", () => {
       bundle: "bundle",
       createdAt: new Date().toISOString(),
     });
-    await client.messages.next("workspace.checkpoint");
+    await client.messages.next("workspace.checkpoint.start");
+    await client.messages.next("workspace.checkpoint.complete");
     client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
     await client.messages.next("prompt.started");
     expect(dispatched).toEqual(["Continue"]);

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { homedir, networkInterfaces, userInfo } from "node:os";
 import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
@@ -10,10 +10,20 @@ import chalk, { chalkStderr } from "chalk";
 import { Command } from "commander";
 import { CodexAppServerAdapter } from "@multicode/agent-adapters";
 import { FileJournal, HostSession, LocalIpcServer, PostgresJournal, roomSecret, writeSessionToken } from "@multicode/session-core";
-import type { AgentEvent, RelayServerMessage, RoomServerMessage, WorkspaceCheckpoint, WorkspaceDiff } from "@multicode/protocol";
+import {
+  checkpointChunkBytes,
+  type AgentEvent,
+  type RelayServerMessage,
+  type RoomServerMessage,
+  type WorkspaceCheckpoint,
+  type WorkspaceCheckpointChunk,
+  type WorkspaceCheckpointDescriptor,
+  type WorkspaceDiff,
+} from "@multicode/protocol";
 import { PostgresRelayRoomStore, RelayServer, RoomRelay } from "@multicode/relay";
 import {
   applyWorkspaceCheckpoint,
+  cleanupParticipantWorkspace,
   createRoomWorktrees,
   createWorkspaceCheckpoint,
   inspectRepository,
@@ -194,6 +204,97 @@ async function agentPreviewEvent(cwd: string, revision: string) {
   return { id: randomUUID(), kind: "agent.preview" as const, payload: Buffer.from(diff.text.slice(0, 180_000)).toString("base64url") };
 }
 
+function checkpointTransfer(checkpoint: WorkspaceCheckpoint): {
+  descriptor: WorkspaceCheckpointDescriptor;
+  chunks: WorkspaceCheckpointChunk[];
+} {
+  const bundle = Buffer.from(checkpoint.bundle, "base64");
+  const chunks: WorkspaceCheckpointChunk[] = [];
+  for (let offset = 0, index = 0; offset < bundle.byteLength; offset += checkpointChunkBytes, index += 1) {
+    chunks.push({
+      sequence: checkpoint.sequence,
+      index,
+      data: bundle.subarray(offset, offset + checkpointChunkBytes).toString("base64"),
+    });
+  }
+  return {
+    descriptor: {
+      sequence: checkpoint.sequence,
+      baseCommit: checkpoint.baseCommit,
+      commit: checkpoint.commit,
+      ref: checkpoint.ref,
+      bundleBytes: bundle.byteLength,
+      bundleHash: createHash("sha256").update(bundle).digest("hex"),
+      chunkCount: chunks.length,
+      createdAt: checkpoint.createdAt,
+    },
+    chunks,
+  };
+}
+
+async function sendSocketMessage(socket: WebSocket, message: unknown): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    socket.send(JSON.stringify(message), (error) => error ? reject(error) : resolve());
+  });
+}
+
+async function sendRemoteCheckpoint(socket: WebSocket, checkpoint: WorkspaceCheckpoint, targetParticipantId?: string): Promise<void> {
+  const transfer = checkpointTransfer(checkpoint);
+  const target = targetParticipantId ? { targetParticipantId } : {};
+  await sendSocketMessage(socket, { type: "relay.workspace.checkpoint.start", checkpoint: transfer.descriptor, ...target });
+  for (const chunk of transfer.chunks) {
+    await sendSocketMessage(socket, { type: "relay.workspace.checkpoint.chunk", chunk, ...target });
+  }
+  await sendSocketMessage(socket, { type: "relay.workspace.checkpoint.complete", sequence: checkpoint.sequence, ...target });
+}
+
+class CheckpointReceiver {
+  private active: { descriptor: WorkspaceCheckpointDescriptor; chunks: Buffer[]; receivedBytes: number } | undefined;
+
+  start(descriptor: WorkspaceCheckpointDescriptor): void {
+    this.active = { descriptor, chunks: [], receivedBytes: 0 };
+  }
+
+  chunk(chunk: WorkspaceCheckpointChunk): void {
+    const active = this.active;
+    if (!active || chunk.sequence !== active.descriptor.sequence || chunk.index !== active.chunks.length) {
+      this.active = undefined;
+      throw new Error("Invalid checkpoint chunk ordering");
+    }
+    const decoded = Buffer.from(chunk.data, "base64");
+    if (decoded.byteLength > checkpointChunkBytes || decoded.toString("base64") !== chunk.data) {
+      this.active = undefined;
+      throw new Error("Invalid checkpoint chunk encoding or size");
+    }
+    active.receivedBytes += decoded.byteLength;
+    if (active.receivedBytes > active.descriptor.bundleBytes) {
+      this.active = undefined;
+      throw new Error("Checkpoint transfer exceeds its declared size");
+    }
+    active.chunks.push(decoded);
+  }
+
+  complete(sequence: number): WorkspaceCheckpoint {
+    const active = this.active;
+    this.active = undefined;
+    if (!active || sequence !== active.descriptor.sequence || active.chunks.length !== active.descriptor.chunkCount) {
+      throw new Error("Incomplete checkpoint transfer");
+    }
+    const bundle = Buffer.concat(active.chunks);
+    if (bundle.byteLength !== active.descriptor.bundleBytes || createHash("sha256").update(bundle).digest("hex") !== active.descriptor.bundleHash) {
+      throw new Error("Checkpoint transfer failed integrity validation");
+    }
+    return {
+      sequence: active.descriptor.sequence,
+      baseCommit: active.descriptor.baseCommit,
+      commit: active.descriptor.commit,
+      ref: active.descriptor.ref,
+      bundle: bundle.toString("base64"),
+      createdAt: active.descriptor.createdAt,
+    };
+  }
+}
+
 async function prepareRoom(dryRun = false): Promise<{
   roomId: string;
   workspacePath?: string;
@@ -351,6 +452,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const baseCommit = hosted.baseCommit;
   let checkpointSequence = 0;
   let checkpointParent = baseCommit;
+  let latestCheckpoint: WorkspaceCheckpoint | undefined;
   const adapter = new CodexAppServerAdapter();
   const token = randomBytes(24).toString("base64url");
   const relay = new RoomRelay({
@@ -359,6 +461,10 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     hostName: options.name,
     onPrompt: async (prompt) => {
       await adapter.sendPrompt({ promptId: prompt.promptId, text: prompt.text });
+    },
+    onCheckpointRequest: (participantId, sequence) => {
+      if (!latestCheckpoint || latestCheckpoint.sequence !== sequence) throw new Error("Requested checkpoint is no longer available from the host");
+      relay.publishWorkspaceCheckpoint(latestCheckpoint, participantId);
     },
     onRoomEvent: (message) => printRoomMessage(message, false),
   });
@@ -374,6 +480,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     if (!checkpoint) return;
     checkpointSequence = checkpoint.sequence;
     checkpointParent = checkpoint.commit;
+    latestCheckpoint = checkpoint;
     relay.publishWorkspaceCheckpoint(checkpoint);
   };
 
@@ -521,20 +628,20 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const baseCommit = hosted.baseCommit;
     let checkpointSequence = 0;
     let checkpointParent = baseCommit;
-    const publishCheckpoint = async (force = false): Promise<void> => {
+    let latestCheckpoint: WorkspaceCheckpoint | undefined;
+    const publishCheckpoint = async (force = false, targetParticipantId?: string): Promise<void> => {
       if (!socket || socket.readyState !== WebSocket.OPEN) return;
-      const checkpoint = await createWorkspaceCheckpoint({
-        cwd: workspacePath,
-        roomId: prepared.roomId,
-        sequence: checkpointSequence + 1,
-        baseCommit,
-        parentCommit: checkpointParent,
-        force,
-      });
+      if (targetParticipantId) {
+        if (!latestCheckpoint) throw new Error("Requested checkpoint is no longer available from the host");
+        await sendRemoteCheckpoint(socket, latestCheckpoint, targetParticipantId);
+        return;
+      }
+      const checkpoint = await createWorkspaceCheckpoint({ cwd: workspacePath, roomId: prepared.roomId, sequence: checkpointSequence + 1, baseCommit, parentCommit: checkpointParent, force });
       if (!checkpoint) return;
       checkpointSequence = checkpoint.sequence;
       checkpointParent = checkpoint.commit;
-      socket.send(JSON.stringify({ type: "relay.workspace.checkpoint", checkpoint }));
+      latestCheckpoint = checkpoint;
+      await sendRemoteCheckpoint(socket, checkpoint);
     };
     const eventTask = (async () => {
       for await (const event of adapter.events()) {
@@ -575,6 +682,12 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         return;
       }
       if (message.type === "relay.room.created") return;
+      if (message.type === "workspace.checkpoint.request") {
+        void publishCheckpoint(false, message.participantId).catch((error: unknown) => {
+          console.error(err.error(`Unable to send requested checkpoint: ${error instanceof Error ? error.message : String(error)}`));
+        });
+        return;
+      }
       if (message.type === "prompt.started") {
         void adapter.sendPrompt({ promptId: message.prompt.promptId, text: message.prompt.text }).catch((error: unknown) => {
           if (socket?.readyState === WebSocket.OPEN) {
@@ -650,6 +763,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   let input: Interface | undefined;
   let workspaceState: ParticipantWorkspaceState | undefined;
   let syncTask = Promise.resolve();
+  const checkpointReceiver = new CheckpointReceiver();
 
   const synchronize = async (roomId: string, checkpoint: WorkspaceCheckpoint): Promise<void> => {
     workspaceState ??= await prepareParticipantWorkspace({
@@ -663,6 +777,25 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "workspace.ack", sequence: checkpoint.sequence, commit: checkpoint.commit }));
     }
+  };
+
+  const queueSynchronization = (roomId: string, checkpoint: WorkspaceCheckpoint): void => {
+    syncTask = syncTask.then(async () => {
+      await synchronize(roomId, checkpoint);
+      if (joined) return;
+      joined = true;
+      console.log(`${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter to add it to the shared queue.")}`);
+      input = promptInput((text) => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          console.error(err.warning("Not connected; prompt was not sent."));
+          return;
+        }
+        socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
+      });
+    }).catch((error: unknown) => {
+      console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
+      socket.close(4005, "Workspace synchronization failed");
+    });
   };
 
   const closed = new Promise<void>((resolve, reject) => {
@@ -684,29 +817,28 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
         }
         joinedRoomId = message.roomId;
         const initialCheckpoint = message.latestCheckpoint;
-        syncTask = syncTask.then(async () => {
-          await synchronize(message.roomId, initialCheckpoint);
-          joined = true;
-          console.log(`${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter to add it to the shared queue.")}`);
-          input = promptInput((text) => {
-            if (socket.readyState !== WebSocket.OPEN) {
-              console.error(err.warning("Not connected; prompt was not sent."));
-              return;
-            }
-            socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text }));
-          });
-        }).catch((error: unknown) => {
-          console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
-          socket.close(4005, "Workspace synchronization failed");
-        });
+        if ("bundle" in initialCheckpoint) queueSynchronization(message.roomId, initialCheckpoint);
+        else socket.send(JSON.stringify({ type: "workspace.checkpoint.request", sequence: initialCheckpoint.sequence }));
       }
       if (message.type === "workspace.checkpoint") {
         const roomId = joinedRoomId;
         if (!roomId) return;
-        syncTask = syncTask.then(() => synchronize(roomId, message.checkpoint)).catch((error: unknown) => {
-          console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
-          socket.close(4005, "Workspace synchronization failed");
-        });
+        queueSynchronization(roomId, message.checkpoint);
+      }
+      if (message.type === "workspace.checkpoint.start") checkpointReceiver.start(message.checkpoint);
+      if (message.type === "workspace.checkpoint.chunk") {
+        try { checkpointReceiver.chunk(message.chunk); } catch (error) {
+          console.error(err.error(error instanceof Error ? error.message : String(error)));
+          socket.close(4005, "Invalid checkpoint transfer");
+        }
+      }
+      if (message.type === "workspace.checkpoint.complete") {
+        const roomId = joinedRoomId;
+        if (!roomId) return;
+        try { queueSynchronization(roomId, checkpointReceiver.complete(message.sequence)); } catch (error) {
+          console.error(err.error(error instanceof Error ? error.message : String(error)));
+          socket.close(4005, "Invalid checkpoint transfer");
+        }
       }
       if (message.type === "room.error" && message.fatal) socket.close();
     });
@@ -768,6 +900,11 @@ async function serveSession(options: { session: string; socket?: string }): Prom
     const stop = async () => { await ipc.close(); if (journal instanceof PostgresJournal) await journal.close(); resolve(); };
     process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
   });
+}
+
+async function cleanupRoomWorkspace(roomId: string, options: { force?: boolean }): Promise<void> {
+  const removed = await cleanupParticipantWorkspace({ roomId, ...(options.force ? { force: true } : {}) });
+  console.log(out.success(`${out.label("Removed room workspace")} ${out.value(removed)}`));
 }
 
 const defaultName = (() => {
@@ -834,6 +971,13 @@ program
   .option("--name <name>", "participant display name", defaultName)
   .option("--relay <url>", "override the central relay URL")
   .action(joinRoom);
+
+program
+  .command("cleanup")
+  .description("Remove a preserved participant room workspace")
+  .argument("<room-id>", "room identifier printed when joining")
+  .option("--force", "remove the room workspace even when it contains local changes")
+  .action(cleanupRoomWorkspace);
 
 const relay = program.command("relay", { hidden: true }).description("Run central relay infrastructure");
 relay

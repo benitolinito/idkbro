@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { RelayServerMessage } from "@multicode/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -121,5 +121,54 @@ describe("RelayServer", () => {
     sockets.push(replacement.socket);
     replacement.socket.send(JSON.stringify({ type: "relay.room.create", name: "Replacement" }));
     expect((await replacement.messages.next("relay.room.created")).code).toMatch(/^[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}$/);
+  });
+
+  it("streams late-join checkpoints from the host without retaining the bundle", async () => {
+    const server = new RelayServer({});
+    servers.push(server);
+    const { port } = await server.listen({ host: "127.0.0.1", port: 0 });
+    const host = await open(`ws://127.0.0.1:${port}/host`);
+    sockets.push(host.socket);
+    host.socket.send(JSON.stringify({ type: "relay.room.create", name: "Ada" }));
+    const created = await host.messages.next("relay.room.created");
+    const bundle = Buffer.from("checkpoint bundle contents");
+    const checkpoint = {
+      sequence: 1,
+      baseCommit: "base",
+      commit: "checkpoint",
+      ref: "refs/multicode/checkpoints/room",
+      bundleBytes: bundle.byteLength,
+      bundleHash: createHash("sha256").update(bundle).digest("hex"),
+      chunkCount: 1,
+      createdAt: new Date().toISOString(),
+    };
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.start", checkpoint }));
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.chunk", chunk: { sequence: 1, index: 0, data: bundle.toString("base64") } }));
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.complete", sequence: 1 }));
+
+    const participant = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`);
+    sockets.push(participant.socket);
+    participant.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" }));
+    const welcome = await participant.messages.next("room.welcome");
+    expect(welcome.latestCheckpoint).toEqual(checkpoint);
+    expect(welcome.latestCheckpoint && "bundle" in welcome.latestCheckpoint).toBe(false);
+    await host.messages.next("participant.joined");
+
+    participant.socket.send(JSON.stringify({ type: "workspace.checkpoint.request", sequence: 1 }));
+    const request = await host.messages.next("workspace.checkpoint.request");
+    expect(request.sequence).toBe(1);
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.start", checkpoint, targetParticipantId: request.participantId }));
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.chunk", chunk: { sequence: 1, index: 0, data: bundle.toString("base64") }, targetParticipantId: request.participantId }));
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.complete", sequence: 1, targetParticipantId: request.participantId }));
+
+    expect((await participant.messages.next("workspace.checkpoint.start")).checkpoint).toEqual(checkpoint);
+    expect((await participant.messages.next("workspace.checkpoint.chunk")).chunk.data).toBe(bundle.toString("base64"));
+    expect((await participant.messages.next("workspace.checkpoint.complete")).sequence).toBe(1);
+
+    const invalidCheckpoint = { ...checkpoint, sequence: 2, bundleHash: "0".repeat(64) };
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.start", checkpoint: invalidCheckpoint }));
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.chunk", chunk: { sequence: 2, index: 0, data: bundle.toString("base64") } }));
+    host.socket.send(JSON.stringify({ type: "relay.workspace.checkpoint.complete", sequence: 2 }));
+    expect((await host.messages.next("room.error")).message).toMatch(/integrity validation/);
   });
 });
