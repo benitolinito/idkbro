@@ -1,18 +1,20 @@
 #!/usr/bin/env node
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { homedir, networkInterfaces, userInfo } from "node:os";
 import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
+import { writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import chalk, { chalkStderr } from "chalk";
 import { Command } from "commander";
 import { CodexAppServerAdapter } from "@multicode/agent-adapters";
-import { LocalIpcServer, PostgresJournal, writeSessionToken } from "@multicode/session-core";
+import { FileJournal, HostSession, LocalIpcServer, PostgresJournal, roomSecret, writeSessionToken } from "@multicode/session-core";
 import type { AgentEvent, RelayServerMessage, RoomServerMessage, WorkspaceCheckpoint, WorkspaceDiff } from "@multicode/protocol";
 import { PostgresRelayRoomStore, RelayServer, RoomRelay } from "@multicode/relay";
 import {
   applyWorkspaceCheckpoint,
+  createRoomWorktrees,
   createWorkspaceCheckpoint,
   inspectRepository,
   prepareParticipantWorkspace,
@@ -187,6 +189,11 @@ async function readWorkspaceDiff(cwd: string, revision: string): Promise<Workspa
   };
 }
 
+async function agentPreviewEvent(cwd: string, revision: string) {
+  const diff = await readWorkspaceDiff(cwd, revision);
+  return { id: randomUUID(), kind: "agent.preview" as const, payload: Buffer.from(diff.text.slice(0, 180_000)).toString("base64url") };
+}
+
 async function prepareRoom(dryRun = false): Promise<{
   roomId: string;
   workspacePath?: string;
@@ -206,6 +213,33 @@ async function prepareRoom(dryRun = false): Promise<{
   console.log(out.success(`${out.label("Workspace")} ${out.value(repository.root)}`));
   console.log(out.success(`${out.label("Branch")} ${out.value(repository.branch ?? "detached HEAD")}`));
   return { roomId, workspacePath: repository.root, baseCommit: repository.head };
+}
+
+async function prepareHostedWorkspace(roomId: string): Promise<{ workspacePath: string; agentPath: string; baseCommit: string; checkpointCommit: string }> {
+  const room = await createRoomWorktrees({ cwd: process.cwd(), roomId });
+  console.log(out.success(`${out.label("Room workspace")} ${out.value(room.sharedPath)}`));
+  console.log(out.success(`${out.label("Codex workspace")} ${out.value(room.agentPath)}`));
+  return { workspacePath: room.sharedPath, agentPath: room.agentPath, baseCommit: room.baseCommit, checkpointCommit: room.checkpointCommit };
+}
+
+async function applyAgentResult(options: { sharedPath: string; agentPath: string; checkpointCommit: string }): Promise<boolean> {
+  const { stdout } = await execFileAsync("git", ["diff", "--binary", options.checkpointCommit, "--"], { cwd: options.agentPath, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+  if (!stdout) return false;
+  try {
+    await new Promise<void>((resolve, reject) => {
+    const child = spawn("git", ["apply", "--3way", "--whitespace=nowarn", "-"], { cwd: options.sharedPath, stdio: ["pipe", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(stderr || "Agent changes conflict with shared workspace")));
+    child.stdin.end(stdout);
+    });
+  } catch (error) {
+    const proposalPath = path.join(options.sharedPath, ".multicode-agent-conflict.patch");
+    await writeFile(proposalPath, stdout, "utf8");
+    throw new Error(`${error instanceof Error ? error.message : String(error)}. Saved proposal at ${proposalPath}`);
+  }
+  return true;
 }
 
 async function createRoom(options: { agent: string; prompt?: string; model?: string; dryRun?: boolean }): Promise<void> {
@@ -310,8 +344,11 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
   const prepared = await prepareRoom();
   if (!prepared.workspacePath || !prepared.baseCommit) return;
-  const workspacePath = prepared.workspacePath;
-  const baseCommit = prepared.baseCommit;
+  const hosted = await prepareHostedWorkspace(prepared.roomId);
+  const workspacePath = hosted.workspacePath;
+  const agentPath = hosted.agentPath;
+  const checkpointCommit = hosted.checkpointCommit;
+  const baseCommit = hosted.baseCommit;
   let checkpointSequence = 0;
   let checkpointParent = baseCommit;
   const adapter = new CodexAppServerAdapter();
@@ -344,13 +381,14 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     for await (const event of adapter.events()) {
       printAgentEvent(event);
       if (event.type === "turn.completed") {
+        try { await applyAgentResult({ sharedPath: workspacePath, agentPath, checkpointCommit }); } catch (error) { console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`)); }
         await publishCheckpoint();
         const diff = await readWorkspaceDiff(workspacePath, event.turnId);
         relay.publishWorkspaceDiff(diff);
         relay.publishAgentEvent(event);
         continue;
       }
-      if (event.type === "command.exited") await publishCheckpoint();
+      if (event.type === "command.exited") relay.publishCollaborationEvent(await agentPreviewEvent(agentPath, event.turnId));
       relay.publishAgentEvent(event);
     }
   })();
@@ -368,7 +406,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
 
   try {
     const { threadId } = await adapter.start({
-      cwd: workspacePath,
+      cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
     });
     console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
@@ -404,12 +442,18 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
 }
 
 async function openWebSocket(url: URL): Promise<WebSocket> {
-  const socket = new WebSocket(url);
-  await new Promise<void>((resolve, reject) => {
-    socket.once("open", resolve);
-    socket.once("error", reject);
-  });
-  return socket;
+  let announced = false;
+  for (;;) {
+    const socket = new WebSocket(url);
+    try {
+      await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+      return socket;
+    } catch {
+      socket.terminate();
+      if (!announced) { console.error(err.warning("Relay unavailable; waiting for it to come back…")); announced = true; }
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+    }
+  }
 }
 
 async function createRemoteRoom(
@@ -466,10 +510,15 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   try {
     socket = await openWebSocket(remoteUrl(relayUrl, "/host"));
     const created = await createRemoteRoom(socket, { name: options.name });
+    const sessionSecret = roomSecret();
     const prepared = await prepareRoom();
     if (!prepared.workspacePath || !prepared.baseCommit) return;
-    const workspacePath = prepared.workspacePath;
-    const baseCommit = prepared.baseCommit;
+    const hosted = await prepareHostedWorkspace(created.roomId);
+    const workspacePath = hosted.workspacePath;
+    const agentPath = hosted.agentPath;
+    const checkpointCommit = hosted.checkpointCommit;
+    // The Pi relay is the room authority and durably journals encrypted collaboration events.
+    const baseCommit = hosted.baseCommit;
     let checkpointSequence = 0;
     let checkpointParent = baseCommit;
     const publishCheckpoint = async (force = false): Promise<void> => {
@@ -492,27 +541,29 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         printAgentEvent(event);
         if (!socket || socket.readyState !== WebSocket.OPEN) continue;
         if (event.type === "turn.completed") {
+          try { await applyAgentResult({ sharedPath: workspacePath, agentPath, checkpointCommit }); } catch (error) { console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`)); }
           await publishCheckpoint();
           const diff = await readWorkspaceDiff(workspacePath, event.turnId);
           socket.send(JSON.stringify({ type: "relay.workspace.diff", diff }));
           socket.send(JSON.stringify({ type: "relay.agent.event", event }));
         } else {
-          if (event.type === "command.exited") await publishCheckpoint();
+          if (event.type === "command.exited") socket.send(JSON.stringify({ type: "relay.collab.event", event: await agentPreviewEvent(agentPath, event.turnId) }));
           socket.send(JSON.stringify({ type: "relay.agent.event", event }));
         }
       }
     })();
     const { threadId } = await adapter.start({
-      cwd: workspacePath,
+      cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
     });
     console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
     await publishCheckpoint(true);
     console.log(out.success(`${out.label("Remote room")} ${out.value(relayUrl)}`));
-    console.log(`\n${out.label("Room code")} ${chalk.bold.cyan(created.code)}`);
+    const inviteToken = `${created.code}.${sessionSecret}`;
+    console.log(`\n${out.label("Room token")} ${chalk.bold.cyan(inviteToken)}`);
     console.log(`\n${out.label("Invite someone with")}`);
     const relayArgument = relayUrl === defaultRelayUrl ? "" : ` --relay '${relayUrl}'`;
-    console.log(`  ${out.command(`multicode join ${created.code}${relayArgument} --name 'Their name'`)}`);
+    console.log(`  ${out.command(`multicode join ${inviteToken}${relayArgument} --name 'Their name'`)}`);
     console.log(`\n${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter. Shared prompts run in queue order.")}`);
 
     socket.on("message", (data) => {
@@ -575,17 +626,25 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
     const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
     token = fragment.get("token") ?? url.searchParams.get("token") ?? "";
     if (!token) throw new Error("Invite URL is missing its room token");
+    const [urlCode, urlSecret] = token.split(".", 2);
+    if (!urlSecret || !/^[A-Za-z0-9_-]{40,}$/.test(urlSecret)) throw new Error("Invalid room token");
+    const canonicalCode = (urlCode ?? "").replace(/-/g, "").toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{10}$/.test(canonicalCode)) throw new Error("Invalid room code");
+    const roomCode = `${canonicalCode.slice(0, 5)}-${canonicalCode.slice(5)}`;
+    token = roomCode;
     url.hash = "";
     url.searchParams.delete("token");
   } else {
     const relayUrl = options.relay ?? defaultRelayUrl;
-    const canonical = inviteOrCode.replace(/-/g, "").toUpperCase();
+    const [roomCode, roomKey] = inviteOrCode.split(".", 2);
+    if (!roomKey || !/^[A-Za-z0-9_-]{40,}$/.test(roomKey)) throw new Error("Invalid room token");
+    const canonical = (roomCode ?? "").replace(/-/g, "").toUpperCase();
     if (!/^[A-HJ-NP-Z2-9]{10}$/.test(canonical)) throw new Error("Invalid room code");
     token = `${canonical.slice(0, 5)}-${canonical.slice(5)}`;
     url = remoteUrl(relayUrl, `/rooms/${token}`);
   }
 
-  const socket = new WebSocket(url);
+  const socket = await openWebSocket(url);
   let joined = false;
   let joinedRoomId: string | undefined;
   let input: Interface | undefined;
@@ -598,6 +657,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
       roomId,
       baseCommit: checkpoint.baseCommit,
     });
+    if (workspaceState) console.error(`\n${err.label("Room workspace")} ${workspaceState.root}`);
     await applyWorkspaceCheckpoint(workspaceState, checkpoint);
     console.error(`\n${err.success(`${err.label("Workspace synchronized")} ${err.muted(`${checkpoint.commit.slice(0, 12)} · checkpoint ${checkpoint.sequence}`)}`)}`);
     if (socket.readyState === WebSocket.OPEN) {
@@ -606,7 +666,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   };
 
   const closed = new Promise<void>((resolve, reject) => {
-    socket.once("open", () => socket.send(JSON.stringify({ type: "room.join", token, name: options.name })));
+    socket.send(JSON.stringify({ type: "room.join", token, name: options.name }));
     socket.on("message", (data) => {
       let message: RoomServerMessage;
       try {
@@ -696,17 +756,16 @@ async function serveRelay(options: { host: string; port: string; maxRooms: strin
 
 async function serveSession(options: { session: string; socket?: string }): Promise<void> {
   const databaseUrl = process.env.MULTICODE_DATABASE_URL;
-  if (!databaseUrl) throw new Error("MULTICODE_DATABASE_URL is required to start a v2 session daemon");
   const sessionDirectory = path.join(homedir(), ".multicode", "sessions", sanitizeRoomId(options.session));
   const token = await writeSessionToken(path.join(sessionDirectory, "token"));
-  const journal = new PostgresJournal(databaseUrl);
-  await journal.migrate();
+  const journal = databaseUrl ? new PostgresJournal(databaseUrl) : new FileJournal(path.join(sessionDirectory, "journal.jsonl"));
+  if (journal instanceof PostgresJournal) await journal.migrate();
   const socketPath = options.socket ?? (process.platform === "win32" ? `\\\\.\\pipe\\multicode-${sanitizeRoomId(options.session)}` : path.join(sessionDirectory, "daemon.sock"));
   const ipc = new LocalIpcServer(token, async (payload) => ({ session: options.session, payload }));
   await ipc.listen(socketPath);
   console.log(out.success(`${out.label("Session daemon")} ${out.value(options.session)} ${out.muted(`listening on ${socketPath}`)}`));
   await new Promise<void>((resolve) => {
-    const stop = async () => { await ipc.close(); await journal.close(); resolve(); };
+    const stop = async () => { await ipc.close(); if (journal instanceof PostgresJournal) await journal.close(); resolve(); };
     process.once("SIGINT", () => void stop()); process.once("SIGTERM", () => void stop());
   });
 }
@@ -726,7 +785,7 @@ const program = new Command()
 
 program.command("doctor").description("Check local prerequisites").action(doctor);
 
-const room = program.command("room").description("Manage collaboration rooms");
+const room = program.command("room", { hidden: true }).description("Internal room commands");
 room
   .command("create")
   .description("Create a local agent room in the current workspace")
@@ -771,12 +830,12 @@ program
 program
   .command("join")
   .description(`Join a shared room through ${defaultRelayUrl}`)
-  .argument("<code>", "room code printed by the host")
+  .argument("<full-token>", "complete room token printed by the host")
   .option("--name <name>", "participant display name", defaultName)
   .option("--relay <url>", "override the central relay URL")
   .action(joinRoom);
 
-const relay = program.command("relay").description("Run central relay infrastructure");
+const relay = program.command("relay", { hidden: true }).description("Run central relay infrastructure");
 relay
   .command("serve")
   .description("Serve authenticated rooms for remote hosts and participants")
@@ -787,7 +846,7 @@ relay
   .action(serveRelay);
 
 program
-  .command("session")
+  .command("session", { hidden: true })
   .description("Run the protocol-v2 host session daemon")
   .requiredOption("--session <room-id>", "room/session identifier")
   .option("--socket <path>", "local IPC socket or named pipe")

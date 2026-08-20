@@ -118,6 +118,10 @@ export class RoomRelay {
     this.broadcast({ type: "workspace.checkpoint", checkpoint });
   }
 
+  publishCollaborationEvent(event: import("@multicode/protocol").CollaborationEvent): void {
+    this.broadcast({ type: "collab.event", event });
+  }
+
   async close(): Promise<void> {
     if (!this.server) return;
     for (const [socket, state] of this.connections) {
@@ -196,6 +200,11 @@ export class RoomRelay {
       return;
     }
 
+    if (parsed.data.type === "collab.publish") {
+      this.broadcast({ type: "collab.event", event: parsed.data.event }, socket);
+      return;
+    }
+
     const prompt: QueuedPrompt = {
       promptId: parsed.data.promptId,
       participantId: state.participant.id,
@@ -225,6 +234,7 @@ export class RoomRelay {
       queue: [...this.queue],
       latestDiff: this.latestDiff,
       latestCheckpoint: this.latestCheckpoint,
+      collabHistory: [],
     });
     this.broadcast({ type: "participant.joined", participant }, socket);
   }

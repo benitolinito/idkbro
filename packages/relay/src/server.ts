@@ -13,6 +13,7 @@ import {
   type RoomServerMessage,
   type WorkspaceDiff,
   type WorkspaceCheckpoint,
+  type CollaborationEvent,
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
 import type { RelayRoomStore } from "./store.js";
@@ -85,6 +86,7 @@ class CentralRoom {
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
   private latestCheckpoint: WorkspaceCheckpoint | null = null;
+  private readonly collabHistory: CollaborationEvent[] = [];
   private closed = false;
   readonly host: RoomParticipant;
 
@@ -95,6 +97,7 @@ class CentralRoom {
     hostName: string,
     readonly ownerIp: string,
     private readonly authenticationTimeoutMs: number,
+    private readonly persistEvent: (event: { id: string; kind: string; payload: string }) => Promise<void>,
     private readonly onClosed: () => void,
   ) {
     this.host = {
@@ -169,6 +172,7 @@ class CentralRoom {
       queue: [...this.queue],
       latestDiff: this.latestDiff,
       latestCheckpoint: this.latestCheckpoint,
+      collabHistory: [...this.collabHistory],
     });
     this.broadcast({ type: "participant.joined", participant }, socket);
 
@@ -190,10 +194,11 @@ class CentralRoom {
       send(socket, { type: "room.error", message: "Invalid participant message" });
       return;
     }
+    const participantMessage = parsed.data;
     const participant = this.participants.get(socket);
     if (!participant) return;
-    if (parsed.data.type === "workspace.ack") {
-      if (!this.latestCheckpoint || parsed.data.sequence !== this.latestCheckpoint.sequence || parsed.data.commit !== this.latestCheckpoint.commit) {
+    if (participantMessage.type === "workspace.ack") {
+      if (!this.latestCheckpoint || participantMessage.sequence !== this.latestCheckpoint.sequence || participantMessage.commit !== this.latestCheckpoint.commit) {
         send(socket, { type: "room.error", message: "Workspace acknowledgement does not match the latest checkpoint" });
         return;
       }
@@ -201,17 +206,21 @@ class CentralRoom {
       this.broadcast({
         type: "participant.synced",
         participantId: participant.id,
-        sequence: parsed.data.sequence,
-        commit: parsed.data.commit,
+        sequence: participantMessage.sequence,
+        commit: participantMessage.commit,
       });
       this.dispatchNext();
       return;
     }
+    if (participantMessage.type === "collab.publish") {
+      void this.persistEvent(participantMessage.event).then(() => { this.collabHistory.push(participantMessage.event); if (this.collabHistory.length > 1000) this.collabHistory.shift(); this.broadcast({ type: "collab.event", event: participantMessage.event }, socket); }).catch(() => send(socket, { type: "room.error", message: "Collaboration event was not durably persisted" }));
+      return;
+    }
     this.enqueue({
-      promptId: parsed.data.promptId,
+      promptId: participantMessage.promptId,
       participantId: participant.id,
       participantName: participant.name,
-      text: parsed.data.text,
+      text: participantMessage.text,
       submittedAt: new Date().toISOString(),
     });
   }
@@ -271,6 +280,9 @@ class CentralRoom {
         this.broadcast({ type: "room.error", message: `Prompt failed on host: ${message.message}` });
         this.activePrompt = null;
         this.dispatchNext();
+        break;
+      case "relay.collab.event":
+        void this.persistEvent(message.event).then(() => { this.collabHistory.push(message.event); if (this.collabHistory.length > 1000) this.collabHistory.shift(); this.broadcast({ type: "collab.event", event: message.event }, this.hostSocket); }).catch(() => send(this.hostSocket, { type: "room.error", message: "Collaboration event was not durably persisted" }));
         break;
       default:
         break;
@@ -438,6 +450,7 @@ export class RelayServer {
         creation.name,
         ownerIp,
         this.authenticationTimeoutMs,
+        (event) => this.options.store?.appendEvent(roomId, event) ?? Promise.resolve(),
         () => { this.rooms.delete(roomId); void this.options.store?.roomClosed(roomId); },
       );
       this.rooms.set(roomId, room);

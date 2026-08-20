@@ -130,6 +130,17 @@ describe("RoomRelay", () => {
     expect(error).toMatchObject({ message: "Invalid room token", fatal: true });
   });
 
+  it("broadcasts collaboration updates without checkpoint gating", async () => {
+    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const first = await connect(port, "secret-token", "Grace");
+    const second = await connect(port, "secret-token", "Linus");
+    sockets.push(first.socket, second.socket);
+    first.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "document.update", payload: "opaque-update" } }));
+    expect((await second.messages.next("collab.event")).event).toMatchObject({ kind: "document.update", payload: "opaque-update" });
+  });
+
   it("does not let a slow workspace checkpoint acknowledgement block prompts", async () => {
     const dispatched: string[] = [];
     const relay = new RoomRelay({

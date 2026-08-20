@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import * as vscode from "vscode";
+import { CollaborationBridge } from "./collaboration.js";
 
 type SessionMode = "host" | "join";
 
@@ -19,6 +20,7 @@ class MultiCodeController implements vscode.Disposable {
   private roomCode: string | undefined;
   private stopping = false;
   private recentOutput = "";
+  private readonly collaboration = new CollaborationBridge();
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.status.name = "MultiCode";
@@ -44,20 +46,21 @@ class MultiCodeController implements vscode.Disposable {
     if (!this.ensureIdle()) return;
     const code = await vscode.window.showInputBox({
       title: "Join a MultiCode room",
-      prompt: "Enter the room code shared by the host",
-      placeHolder: "K7MNP-4XQ2R",
+      prompt: "Paste the room token shared by the host",
+      placeHolder: "K7MNP-4XQ2R.<room-secret>",
       ignoreFocusOut: true,
-      validateInput: (value) => this.validRoomCode(value) ? undefined : "Enter a 10-character MultiCode room code",
+      validateInput: (value) => this.validRoomToken(value) ? undefined : "Paste the complete MultiCode room token",
     });
     if (!code) return;
 
     const config = vscode.workspace.getConfiguration("multicode");
     const name = config.get<string>("displayName")?.trim() || this.defaultName();
     const relay = config.get<string>("relayUrl")?.trim();
-    const args = ["join", this.normalizeRoomCode(code), "--name", name];
+    const args = ["join", code.trim(), "--name", name];
     if (relay) args.push("--relay", relay);
-    this.roomCode = this.normalizeRoomCode(code);
+    this.roomCode = code.trim();
     this.startSession("join", args, this.workspaceDirectory(false));
+    this.collaboration.connect(relay || "wss://multicode.luisagd.com", code.trim(), name);
   }
 
   async sendPrompt(): Promise<void> {
@@ -101,8 +104,21 @@ class MultiCodeController implements vscode.Disposable {
     }, 10_000);
   }
 
+  async openProposal(): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!root) return;
+    const proposal = vscode.Uri.joinPath(root, ".multicode-agent-conflict.patch");
+    try {
+      await vscode.workspace.fs.stat(proposal);
+      await vscode.window.showTextDocument(proposal, { preview: false });
+    } catch {
+      void vscode.window.showInformationMessage("There is no pending agent conflict proposal in this room.");
+    }
+  }
+
   dispose(): void {
     if (this.process) this.process.kill("SIGTERM");
+    this.collaboration.dispose();
     this.output.dispose();
     this.status.dispose();
   }
@@ -141,14 +157,24 @@ class MultiCodeController implements vscode.Disposable {
   private handleOutput(text: string): void {
     this.output.append(text);
     this.recentOutput = `${this.recentOutput}${text}`.slice(-2_000);
+    const workspaceMatch = this.recentOutput.match(/Room workspace\s+([^\r\n]+)/i);
+    if (workspaceMatch?.[1]) {
+      const roomWorkspace = workspaceMatch[1].trim();
+      if (path.isAbsolute(roomWorkspace) && vscode.workspace.workspaceFolders?.[0]?.uri.fsPath !== roomWorkspace) {
+        const folders = vscode.workspace.workspaceFolders?.length ?? 0;
+        void vscode.workspace.updateWorkspaceFolders(0, folders, { uri: vscode.Uri.file(roomWorkspace), name: "MultiCode room" });
+      }
+    }
     if (this.mode === "host") {
-      const match = this.recentOutput.match(/Room code:\s*([A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5})/i);
+      const match = this.recentOutput.match(/Room token:\s*([A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}\.[A-Za-z0-9_-]{40,})/i);
       if (match?.[1]) {
-        this.roomCode = match[1].toUpperCase();
-        this.status.text = `$(broadcast) MultiCode: ${this.roomCode}`;
+        this.roomCode = match[1];
+        this.status.text = `$(broadcast) MultiCode: ${this.roomCode.slice(0, 11)}`;
         this.status.tooltip = "Click to send a prompt";
         void vscode.env.clipboard.writeText(this.roomCode);
-        void vscode.window.showInformationMessage(`MultiCode room ${this.roomCode} is ready. The code was copied to your clipboard.`);
+        void vscode.window.showInformationMessage("MultiCode room is ready. Its invite token was copied to your clipboard.");
+        const relay = vscode.workspace.getConfiguration("multicode").get<string>("relayUrl")?.trim() || "wss://multicode.luisagd.com";
+        this.collaboration.connect(relay, this.roomCode, this.defaultName());
       }
     } else if (this.recentOutput.includes("Joined room")) {
       this.status.text = `$(people) MultiCode: ${this.roomCode ?? "joined"}`;
@@ -179,13 +205,8 @@ class MultiCodeController implements vscode.Disposable {
     return false;
   }
 
-  private validRoomCode(value: string): boolean {
-    return /^[A-HJ-NP-Z2-9]{5}-?[A-HJ-NP-Z2-9]{5}$/i.test(value.trim());
-  }
-
-  private normalizeRoomCode(value: string): string {
-    const compact = value.trim().replace(/-/g, "").toUpperCase();
-    return `${compact.slice(0, 5)}-${compact.slice(5)}`;
+  private validRoomToken(value: string): boolean {
+    return /^[A-HJ-NP-Z2-9]{5}-[A-HJ-NP-Z2-9]{5}\.[A-Za-z0-9_-]{40,}$/i.test(value.trim());
   }
 
   private defaultName(): string {
@@ -222,6 +243,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("multicode.sendPrompt", () => controller.sendPrompt()),
     vscode.commands.registerCommand("multicode.doctor", () => controller.doctor()),
     vscode.commands.registerCommand("multicode.stop", () => controller.stop()),
+    vscode.commands.registerCommand("multicode.openProposal", () => controller.openProposal()),
   );
 }
 

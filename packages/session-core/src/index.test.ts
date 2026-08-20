@@ -38,3 +38,13 @@ describe("host session durability", () => {
     expect(session.documents.document("file").getText("content").toString()).toBe("durable");
   });
 });
+
+describe("encrypted collaboration payloads", () => {
+  it("cannot be decrypted with another room secret", () => {
+    const first = deriveRoomKey(roomSecret(), "room", "epoch");
+    const second = deriveRoomKey(roomSecret(), "room", "epoch");
+    const payload = encryptPayload(first, utf8("Yjs update"), "room:message");
+    expect(new TextDecoder().decode(decryptPayload(first, payload, "room:message"))).toBe("Yjs update");
+    expect(() => decryptPayload(second, payload, "room:message")).toThrow();
+  });
+});

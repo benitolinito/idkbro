@@ -22,6 +22,10 @@
     "pair programming"
   ],
   "main": "./dist/extension.js",
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yjs": "^13.6.27"
+  },
   "activationEvents": [
     "onCommand:multicode.host",
     "onCommand:multicode.join",
@@ -54,6 +58,11 @@
         "command": "multicode.stop",
         "title": "MultiCode: Stop or Leave Room",
         "icon": "$(debug-stop)"
+      },
+      {
+        "command": "multicode.openProposal",
+        "title": "MultiCode: Open Agent Conflict Proposal",
+        "icon": "$(git-pull-request)"
       }
     ],
     "menus": {
@@ -64,6 +73,10 @@
         },
         {
           "command": "multicode.stop",
+          "when": "multicode.connected"
+        },
+        {
+          "command": "multicode.openProposal",
           "when": "multicode.connected"
         }
       ]

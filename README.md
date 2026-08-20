@@ -83,20 +83,20 @@ From the Git repository you want to work on:
 multicode host
 ```
 
-MultiCode starts Codex in the current checkout, connects to `multicode.luisagd.com`, and prints a room code:
+MultiCode creates isolated shared/agent worktrees, connects to the Raspberry Pi authority, and prints one complete invite token:
 
 ```text
-Room code: K7MNP-4XQ2R
+Room token: K7MNP-4XQ2R.<room-secret>
 ```
 
 Type prompts into the host terminal at any time.
 
 ### 2. Join the room
 
-The other person pastes the code:
+The other person pastes the complete token:
 
 ```bash
-multicode join K7MNP-4XQ2R
+multicode join K7MNP-4XQ2R.<room-secret>
 ```
 
 Both people can now submit prompts and see the same agent activity. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
@@ -105,7 +105,7 @@ Use names when desired:
 
 ```bash
 multicode host --name "Ada"
-multicode join K7MNP-4XQ2R --name "Grace"
+multicode join K7MNP-4XQ2R.<room-secret> --name "Grace"
 ```
 
 > [!WARNING]
@@ -114,10 +114,8 @@ multicode join K7MNP-4XQ2R --name "Grace"
 ## Self-host the relay on a Raspberry Pi
 
 > [!IMPORTANT]
-> Protocol v2 introduces the host session daemon and PostgreSQL-backed encrypted
-> journal. Set `MULTICODE_POSTGRES_USER` and `MULTICODE_POSTGRES_PASSWORD` before
-> starting the deployment. The database stores encrypted room records only; a
-> host daemon needs a TLS-protected `MULTICODE_DATABASE_URL` to acknowledge edits.
+> PostgreSQL is relay infrastructure, configured once by the relay operator. It
+> is never a requirement for people who host or join a room from the CLI or VS Code.
 
 The included deployment is a completely separate Compose project. It does not modify or join an existing Compose project or Docker network.
 
@@ -126,6 +124,8 @@ The included deployment is a completely separate Compose project. It does not mo
 ```bash
 git clone https://github.com/benitolinito/idkbro ~/multicode-relay
 cd ~/multicode-relay
+cp deploy/.env.example deploy/.env
+# Edit deploy/.env and replace the database password.
 
 docker compose -f deploy/compose.yaml up -d --build
 ```
@@ -192,45 +192,27 @@ MULTICODE_POSTGRES_PASSWORD=use-a-long-random-secret
 
 The relay uses Cloudflare's `CF-Connecting-IP` header when enforcing the per-IP limit and falls back to the direct socket address outside Cloudflare.
 
-## Advanced usage
-
-### Protocol-v2 session daemon
-
-The v2 daemon owns local room state and exposes a user-only local IPC socket. It
-requires PostgreSQL and creates a token under `~/.multicode/sessions/<room>/`:
-
-```bash
-MULTICODE_DATABASE_URL='postgresql://…?sslmode=require' \
-  multicode session --session my-room
-```
-
-Room source, prompts, document updates, and previews are encrypted before they
-are written to PostgreSQL or forwarded through a relay. Invite URLs carry their
-room key in the URL fragment; do not share a room code separately from its invite.
+The host creates all room state automatically. Collaborators never configure
+databases, worktrees, encryption keys, ports, or relay credentials.
 
 Override the public relay:
 
 ```bash
 MULTICODE_RELAY_URL=wss://another-relay.example.com multicode host
-multicode join K7MNP-4XQ2R --relay wss://another-relay.example.com
+multicode join K7MNP-4XQ2R.<room-secret> --relay wss://another-relay.example.com
 ```
 
-Host directly without the central relay:
-
-```bash
-multicode room host \
-  --local \
-  --listen 0.0.0.0 \
-  --port 7337
-```
-
-Run `multicode --help` for the full command tree. During development, every command can also be run without linking by using `npm run multicode -- <command>` from the MultiCode checkout.
+Run `multicode --help` for operator/development commands. End users only need
+`multicode host` and `multicode join <full-token>`.
 
 ## Git safety model
 
-The host agent works directly in the current checkout. After each completed turn, MultiCode creates a checkpoint commit through a temporary Git index, so the host's branch, index, and working tree are not changed by checkpoint creation.
+The host and Codex use MultiCode-owned isolated worktrees. The original checkout
+is never switched, stashed, reset, or cleaned.
 
-Participants save staged, unstaged, and untracked work before joining, then switch to `multicode/room-<room-id>`. Checkpoints are transferred as verified Git bundles and applied with the exact host commit hash. The next prompt waits until every connected participant acknowledges the latest checkpoint. When leaving, MultiCode switches back to the original branch and reapplies saved work; a durable backup ref under `refs/multicode/backups/` remains available for recovery.
+Participants receive an isolated room worktree and acknowledge encrypted
+checkpoints only after the Pi relay has durably recorded them. If the Pi is
+unreachable, host and join pause and retry; they never fork state locally.
 
 Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
 

@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, hkdfSync, randomBytes, randomUUID, sign, verify } from "node:crypto";
-import { mkdir, chmod, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, chmod, readFile, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import path from "node:path";
 import { Pool } from "pg";
@@ -68,6 +68,20 @@ export interface JournalEntry {
 
 export interface DurableJournal {
   append(envelope: EnvelopeV2, payload: EncryptedPayload): Promise<JournalEntry>;
+}
+
+/** Host-local fallback used when a room is running without a reachable relay database. */
+export class FileJournal implements DurableJournal {
+  private sequence = 0;
+  constructor(private readonly file: string) {}
+  async append(envelope: EnvelopeV2, payload: EncryptedPayload): Promise<JournalEntry> {
+    await mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    try { const existing = await readFile(this.file, "utf8"); this.sequence = Math.max(this.sequence, ...existing.trim().split("\n").filter(Boolean).map((line) => Number((JSON.parse(line) as JournalEntry).sequence))); } catch { /* new journal */ }
+    const sequence = ++this.sequence;
+    const entry: JournalEntry = { roomId: envelope.roomId, sequence, envelope: { ...envelope, sequence }, payload, createdAt: new Date().toISOString() };
+    await appendFile(this.file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+    return entry;
+  }
 }
 
 export class PostgresJournal {

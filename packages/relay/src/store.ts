@@ -4,6 +4,7 @@ import { Pool } from "pg";
 export interface RelayRoomStore {
   migrate(): Promise<void>;
   roomOpened(room: { roomId: string; ownerIp: string }): Promise<void>;
+  appendEvent(roomId: string, event: { id: string; kind: string; payload: string }): Promise<void>;
   roomClosed(roomId: string): Promise<void>;
   close(): Promise<void>;
 }
@@ -18,6 +19,18 @@ export class PostgresRelayRoomStore implements RelayRoomStore {
     await this.pool.query(`CREATE TABLE IF NOT EXISTS multicode_relay_rooms (
       room_id text PRIMARY KEY, owner_ip_hash text NOT NULL, opened_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz
     )`);
+    await this.pool.query(`CREATE TABLE IF NOT EXISTS multicode_relay_events (
+      room_id text NOT NULL REFERENCES multicode_relay_rooms(room_id) ON DELETE CASCADE,
+      event_id uuid NOT NULL,
+      kind text NOT NULL,
+      payload text NOT NULL,
+      sequence bigserial NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (room_id, event_id)
+    )`);
+  }
+  async appendEvent(roomId: string, event: { id: string; kind: string; payload: string }): Promise<void> {
+    await this.pool.query("INSERT INTO multicode_relay_events (room_id, event_id, kind, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING", [roomId, event.id, event.kind, event.payload]);
   }
   async roomOpened(room: { roomId: string; ownerIp: string }): Promise<void> {
     const ownerIpHash = createHash("sha256").update(room.ownerIp).digest("hex");

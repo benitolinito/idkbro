@@ -117,6 +117,14 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     sequence: z.number().int().positive(),
     commit: z.string().min(1).max(128),
   }),
+  z.object({
+    type: z.literal("collab.publish"),
+    event: z.object({
+      id: z.string().uuid(),
+      kind: z.enum(["document.update", "presence.update", "agent.preview"]),
+      payload: z.string().min(1).max(256 * 1024),
+    }),
+  }),
 ]);
 
 export type RoomClientMessage = z.infer<typeof roomClientMessageSchema>;
@@ -164,6 +172,14 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
     promptId: z.string().min(1),
     message: z.string().min(1).max(1_000),
   }),
+  z.object({
+    type: z.literal("relay.collab.event"),
+    event: z.object({
+      id: z.string().uuid(),
+      kind: z.enum(["document.update", "presence.update", "agent.preview"]),
+      payload: z.string().min(1).max(256 * 1024),
+    }),
+  }),
 ]);
 
 export interface RoomParticipant {
@@ -207,7 +223,14 @@ export type RelayHostMessage =
   | { type: "relay.agent.event"; event: AgentEvent }
   | { type: "relay.workspace.diff"; diff: WorkspaceDiff }
   | { type: "relay.workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
-  | { type: "relay.prompt.failed"; promptId: string; message: string };
+  | { type: "relay.prompt.failed"; promptId: string; message: string }
+  | { type: "relay.collab.event"; event: CollaborationEvent };
+
+export interface CollaborationEvent {
+  id: string;
+  kind: "document.update" | "presence.update" | "agent.preview";
+  payload: string;
+}
 
 export type RelayServerMessage =
   | RoomServerMessage
@@ -223,6 +246,7 @@ export type RoomServerMessage =
       queue: QueuedPrompt[];
       latestDiff: WorkspaceDiff | null;
       latestCheckpoint: WorkspaceCheckpoint | null;
+      collabHistory: CollaborationEvent[];
     }
   | { type: "participant.joined"; participant: RoomParticipant }
   | { type: "participant.left"; participantId: string; name: string }
@@ -231,6 +255,7 @@ export type RoomServerMessage =
   | { type: "agent.event"; event: AgentEvent }
   | { type: "workspace.diff"; diff: WorkspaceDiff }
   | { type: "workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
+  | { type: "collab.event"; event: CollaborationEvent }
   | { type: "participant.synced"; participantId: string; sequence: number; commit: string }
   | { type: "room.error"; message: string; fatal?: boolean };
 
