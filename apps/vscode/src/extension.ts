@@ -36,6 +36,7 @@ class MultiCodeController implements vscode.Disposable {
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.chat = new MultiCodeChatView(context.extensionUri, {
+      back: () => this.backToStart(),
       host: () => this.host(),
       join: (token) => this.join(token),
       stop: () => this.stop(),
@@ -198,7 +199,7 @@ class MultiCodeController implements vscode.Disposable {
   async stop(): Promise<void> {
     if (!this.process) {
       await this.forgetWorkspaceHandoff();
-      this.collaboration.disconnect(); this.roomWorkspaceReady = false; this.setIdle(); void vscode.commands.executeCommand("setContext", "multicode.connected", false); return;
+      this.collaboration.disconnect(); this.roomWorkspaceReady = false; this.chat.stopped(); this.setIdle(); void vscode.commands.executeCommand("setContext", "multicode.connected", false); return;
     }
     this.stopping = true;
     this.chat.stopping();
@@ -428,6 +429,22 @@ class MultiCodeController implements vscode.Disposable {
     if (!this.process && !this.roomWorkspaceReady) return true;
     void vscode.window.showWarningMessage("A MultiCode session is already running. Stop it before starting another.");
     return false;
+  }
+
+  private async backToStart(): Promise<void> {
+    if (this.process || this.roomWorkspaceReady) throw new Error("Stop the active MultiCode session before returning to the start screen");
+    await this.forgetWorkspaceHandoff();
+    this.collaboration.disconnect();
+    this.mode = undefined;
+    this.roomCode = undefined;
+    this.roomWorkspace = undefined;
+    this.roomWorkspaceReady = false;
+    this.pendingCollaboration = undefined;
+    this.openingRoomWorkspace = undefined;
+    this.stopping = false;
+    this.recentOutput = "";
+    this.setIdle();
+    void vscode.commands.executeCommand("setContext", "multicode.connected", false);
   }
 
   private validRoomToken(value: string): boolean {

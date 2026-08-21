@@ -29,6 +29,7 @@ export interface ChatSnapshot {
   activePrompt?: { id: string; name: string; text: string };
   timeline: TimelineItem[];
   canApprove: boolean;
+  canReturnToStart: boolean;
 }
 
 const maxTimelineItems = 300;
@@ -84,6 +85,19 @@ export class ChatModel {
     this.selfId = undefined;
     this.reasoningItems.clear();
     this.add("system", message);
+  }
+
+  reset(): void {
+    this.connection = "idle";
+    this.mode = undefined;
+    this.roomId = undefined;
+    this.roomLabel = undefined;
+    this.participants.clear();
+    this.queue = [];
+    this.activePrompt = undefined;
+    this.selfId = undefined;
+    this.reasoningItems.clear();
+    this.timeline.splice(0);
   }
 
   fail(message: string): void {
@@ -173,6 +187,7 @@ export class ChatModel {
       ...(this.activePrompt ? { activePrompt: promptView(this.activePrompt) } : {}),
       timeline: this.timeline.map((item) => ({ ...item, ...(item.approval ? { approval: { ...item.approval } } : {}) })),
       canApprove: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("reviewer")),
+      canReturnToStart: this.connection === "idle" && this.timeline.length > 0,
     };
   }
 

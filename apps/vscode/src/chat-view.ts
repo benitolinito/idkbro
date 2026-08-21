@@ -5,6 +5,7 @@ import type { ApprovalDecision } from "@multicode/protocol";
 import { ChatModel, type ChatSnapshot } from "./chat-model.js";
 
 export interface ChatActions {
+  back(): void | Promise<void>;
   host(): void | Promise<void>;
   join(token?: string): void | Promise<void>;
   stop(): void | Promise<void>;
@@ -16,6 +17,7 @@ export interface ChatActions {
 
 type WebviewMessage =
   | { type: "ready" }
+  | { type: "back" }
   | { type: "host" }
   | { type: "join"; token?: string }
   | { type: "stop" }
@@ -65,6 +67,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
   private async receive(message: WebviewMessage): Promise<void> {
     switch (message.type) {
       case "ready": this.publish(); break;
+      case "back": await this.actions.back(); this.model.reset(); this.publish(); break;
       case "host": await this.actions.host(); break;
       case "join": await this.actions.join(message.token?.trim() || undefined); break;
       case "stop": await this.actions.stop(); break;
@@ -193,7 +196,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 <body>
   <div id="app">
     <header>
-      <div class="topline"><span id="dot" class="dot"></span><span class="brand">MultiCode</span><button id="copy" class="icon" title="Copy invite token">Copy invite</button><button id="stop" class="icon" title="Stop or leave room">Stop</button><button id="output" class="icon" title="Open raw output">Logs</button></div>
+      <div class="topline"><span id="dot" class="dot"></span><button id="back" class="icon" title="Return to host or join">← Back</button><span class="brand">MultiCode</span><button id="copy" class="icon" title="Copy invite token">Copy invite</button><button id="stop" class="icon" title="Stop or leave room">Stop</button><button id="output" class="icon" title="Open raw output">Logs</button></div>
       <div id="room" class="room">Not connected</div>
     </header>
     <div><div id="people"></div><div id="queue"></div></div>
@@ -207,7 +210,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const elements = Object.fromEntries(['dot','room','people','queue','conversation','prompt','send','copy','stop','output'].map(id => [id, document.getElementById(id)]));
+    const elements = Object.fromEntries(['dot','back','room','people','queue','conversation','prompt','send','copy','stop','output'].map(id => [id, document.getElementById(id)]));
     let state = { connection: 'idle', participants: [], queue: [], timeline: [] };
     let joinVisible = false;
     const expandedReasoning = new Set();
@@ -318,6 +321,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     function render() {
       elements.dot.className = 'dot ' + state.connection;
       elements.room.textContent = state.connection === 'idle' ? 'Not connected' : (state.roomLabel || (state.mode === 'host' ? 'Starting room…' : 'Joining room…'));
+      elements.back.style.display = state.canReturnToStart ? '' : 'none';
       elements.copy.style.display = state.mode === 'host' && state.connection === 'connected' ? '' : 'none';
       elements.stop.style.display = ['starting','connected','stopping','error'].includes(state.connection) ? '' : 'none';
       const enabled = state.connection === 'connected';
@@ -338,6 +342,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     });
     elements.prompt.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitPrompt(); } });
     elements.send.onclick = submitPrompt;
+    elements.back.onclick = () => { joinVisible = false; post('back'); };
     elements.copy.onclick = () => post('copyInvite');
     elements.stop.onclick = () => post('stop');
     elements.output.onclick = () => post('openOutput');

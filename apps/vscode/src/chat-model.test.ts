@@ -11,6 +11,20 @@ function welcome(): RoomServerMessage {
 }
 
 describe("ChatModel", () => {
+  it("preserves an ended transcript until Back resets the start screen", () => {
+    const model = new ChatModel();
+    model.start("host");
+    model.stopped("Room closed");
+
+    expect(model.snapshot()).toMatchObject({
+      connection: "idle",
+      canReturnToStart: true,
+      timeline: expect.arrayContaining([expect.objectContaining({ kind: "system", text: "Room closed" })]),
+    });
+    model.reset();
+    expect(model.snapshot()).toMatchObject({ connection: "idle", canReturnToStart: false, timeline: [], participants: [], queue: [] });
+  });
+
   it("represents duplicate transport connections as one participant", () => {
     const model = new ChatModel();
     model.start("host");
