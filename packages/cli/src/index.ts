@@ -26,6 +26,7 @@ import {
   type WorkspaceCheckpointChunk,
   type WorkspaceCheckpointDescriptor,
   type WorkspaceDiff,
+  type WorkspaceDiffFile,
 } from "@multicode/protocol";
 import { PostgresRelayRoomStore, RelayServer, RoomRelay } from "@multicode/relay";
 import {
@@ -51,6 +52,7 @@ import {
 import WebSocket from "ws";
 import { discoverLiveSessionForWorkspace } from "./live-session.js";
 import { renderTerminalMarkdown } from "./markdown.js";
+import { parseWorkspaceNumstat } from "./workspace-diff.js";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
@@ -237,27 +239,51 @@ function printWorkspaceDiff(diff: WorkspaceDiff): void {
   console.error(chalkStderr.cyan("────────────────────────"));
 }
 
+async function untrackedFileSummary(cwd: string, file: string): Promise<WorkspaceDiffFile> {
+  try {
+    const contents = await readFile(safeRoomFile(cwd, file).target);
+    if (contents.includes(0)) return { path: file, additions: 0, deletions: 0, binary: true };
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+    const additions = text ? text.split(/\r\n|\n|\r/).length - (/\r\n$|[\n\r]$/.test(text) ? 1 : 0) : 0;
+    return { path: file, additions, deletions: 0 };
+  } catch {
+    return { path: file, additions: 0, deletions: 0, binary: true };
+  }
+}
+
 async function readWorkspaceDiff(cwd: string, revision: string): Promise<WorkspaceDiff> {
   const maxLength = 96_000;
   let combined: string;
+  let files: WorkspaceDiffFile[] = [];
   try {
-    const [status, diff] = await Promise.all([
+    const [status, diff, numstat, untracked] = await Promise.all([
       execFileAsync("git", ["--no-optional-locks", "status", "--short"], { cwd, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 }),
       execFileAsync("git", ["--no-optional-locks", "diff", "--no-ext-diff", "--unified=3", "HEAD", "--"], {
         cwd,
         encoding: "utf8",
         maxBuffer: 10 * 1024 * 1024,
       }),
+      execFileAsync("git", ["--no-optional-locks", "diff", "--no-ext-diff", "--numstat", "-z", "HEAD", "--"], { cwd, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 }),
+      execFileAsync("git", ["--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z"], { cwd, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 }),
     ]);
     combined = [`Status:\n${status.stdout.trim() || "(clean)"}`, diff.stdout.trim()].filter(Boolean).join("\n\n");
+    files = parseWorkspaceNumstat(numstat.stdout).filter((file) => file.path.length <= 2_048).slice(0, 64);
+    const trackedPaths = new Set(files.map((file) => file.path));
+    const untrackedPaths = untracked.stdout.split("\0").filter((file) => file && file.length <= 2_048 && !trackedPaths.has(file)).slice(0, 64 - files.length);
+    files.push(...await Promise.all(untrackedPaths.map((file) => untrackedFileSummary(cwd, file))));
   } catch (error) {
     combined = `Unable to read workspace diff: ${error instanceof Error ? error.message : String(error)}`;
   }
+  const additions = files.reduce((total, file) => total + file.additions, 0);
+  const deletions = files.reduce((total, file) => total + file.deletions, 0);
   return {
     revision,
     text: combined.slice(0, maxLength),
     truncated: combined.length > maxLength,
     createdAt: new Date().toISOString(),
+    additions,
+    deletions,
+    files,
   };
 }
 

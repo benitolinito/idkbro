@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { controllerActionSchema, parseApprovalRequestId, roomClientMessageSchema, roomEventSchema } from "./index.js";
+import { controllerActionSchema, parseApprovalRequestId, roomClientMessageSchema, roomEventSchema, workspaceDiffSchema } from "./index.js";
 
 describe("room protocol", () => {
   it("accepts a valid append-only event", () => {
@@ -44,5 +44,17 @@ describe("room protocol", () => {
       model: "gpt-5.6-sol",
       effort: "high",
     })).toMatchObject({ model: "gpt-5.6-sol", effort: "high" });
+  });
+
+  it("accepts structured per-file workspace statistics", () => {
+    expect(workspaceDiffSchema.parse({
+      revision: "turn-1",
+      text: "diff --git a/a.ts b/a.ts",
+      truncated: false,
+      createdAt: new Date(0).toISOString(),
+      additions: 6,
+      deletions: 5,
+      files: [{ path: "apps/vscode/src/chat-view.ts", additions: 6, deletions: 5 }],
+    })).toMatchObject({ additions: 6, deletions: 5, files: [{ path: "apps/vscode/src/chat-view.ts" }] });
   });
 });

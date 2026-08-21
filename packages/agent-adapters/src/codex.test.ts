@@ -1,7 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { CodexAppServerAdapter, normalizeCodexMessage } from "./codex.js";
+import { CodexAppServerAdapter, codexModels, normalizeCodexMessage } from "./codex.js";
 
 describe("normalizeCodexMessage", () => {
+  it("reads the cached Codex model catalog shape used when refresh fails", () => {
+    expect(codexModels({
+      models: [{
+        slug: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        description: "Frontier model",
+        default_reasoning_level: "low",
+        supported_reasoning_levels: [{ effort: "low", description: "Fast" }, { effort: "high", description: "Deep" }],
+      }],
+    })).toEqual([{
+      id: "gpt-5.6-sol",
+      model: "gpt-5.6-sol",
+      displayName: "GPT-5.6-Sol",
+      description: "Frontier model",
+      isDefault: false,
+      defaultReasoningEffort: "low",
+      supportedReasoningEfforts: [{ reasoningEffort: "low", description: "Fast" }, { reasoningEffort: "high", description: "Deep" }],
+    }]);
+  });
+
   it("normalizes agent message deltas", () => {
     expect(
       normalizeCodexMessage({

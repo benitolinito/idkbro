@@ -1,4 +1,4 @@
-import type { AgentConfig, AgentEvent, QueuedPrompt, RoomParticipant, RoomServerMessage } from "@multicode/protocol";
+import type { AgentConfig, AgentEvent, QueuedPrompt, RoomParticipant, RoomServerMessage, WorkspaceDiff } from "@multicode/protocol";
 
 export type ConnectionState = "idle" | "starting" | "connected" | "stopping" | "error";
 export type TimelineKind = "user" | "assistant" | "reasoning" | "command" | "diff" | "system" | "error" | "approval";
@@ -10,14 +10,20 @@ export interface TimelineItem {
   text: string;
   status?: string;
   timestamp: string;
+  startedAt?: string;
   finishedAt?: string;
   turnId?: string;
   command?: string;
   durationMs?: number;
   approval?: { requestId: string | number; approvalKind: string };
+  changes?: {
+    additions: number;
+    deletions: number;
+    files: Array<{ path: string; additions: number; deletions: number; binary?: boolean }>;
+  };
 }
 
-type TimelineMetadata = Partial<Pick<TimelineItem, "finishedAt" | "turnId" | "command" | "durationMs">>;
+type TimelineMetadata = Partial<Pick<TimelineItem, "startedAt" | "finishedAt" | "turnId" | "command" | "durationMs" | "changes">>;
 
 export interface ParticipantView {
   name: string;
@@ -34,6 +40,7 @@ export interface ChatSnapshot {
   queue: Array<{ id: string; name: string; text: string }>;
   activePrompt?: { id: string; name: string; text: string };
   agentConfig?: AgentConfig;
+  activeTurnIds: string[];
   timeline: TimelineItem[];
   canApprove: boolean;
   canReturnToStart: boolean;
@@ -57,6 +64,7 @@ export class ChatModel {
   private selfId: string | undefined;
   private readonly timeline: TimelineItem[] = [];
   private readonly reasoningItems = new Map<string, { turnId: string; text: string; completed: boolean }>();
+  private readonly turnStartedAt = new Map<string, string>();
 
   start(mode: "host" | "join", roomLabel?: string): void {
     this.connection = "starting";
@@ -69,6 +77,7 @@ export class ChatModel {
     this.agentConfig = undefined;
     this.selfId = undefined;
     this.reasoningItems.clear();
+    this.turnStartedAt.clear();
     this.timeline.splice(0);
     this.add("system", mode === "host" ? "Starting a shared Codex room…" : "Joining the shared Codex room…");
   }
@@ -94,6 +103,7 @@ export class ChatModel {
     this.agentConfig = undefined;
     this.selfId = undefined;
     this.reasoningItems.clear();
+    this.turnStartedAt.clear();
     this.add("system", message);
   }
 
@@ -108,6 +118,7 @@ export class ChatModel {
     this.agentConfig = undefined;
     this.selfId = undefined;
     this.reasoningItems.clear();
+    this.turnStartedAt.clear();
     this.timeline.splice(0);
   }
 
@@ -133,6 +144,7 @@ export class ChatModel {
         this.activePrompt = message.activePrompt ?? undefined;
         this.agentConfig = message.agentConfig;
         if (message.activePrompt) this.addPrompt(message.activePrompt);
+        if (message.latestDiff) this.handleWorkspaceDiff(message.latestDiff);
         this.add("system", `Connected to room ${message.roomId}`);
         break;
       case "participant.joined":
@@ -168,7 +180,7 @@ export class ChatModel {
         this.handleAgent(message.event);
         break;
       case "workspace.diff":
-        this.upsert(`diff:${message.diff.revision}`, "diff", message.diff.text || "No tracked workspace changes.", "Workspace changes", message.diff.truncated ? "truncated" : undefined);
+        this.handleWorkspaceDiff(message.diff);
         break;
       case "workspace.checkpoint":
         this.add("system", `Workspace checkpoint ${message.checkpoint.sequence} · ${message.checkpoint.commit.slice(0, 12)}`);
@@ -201,7 +213,12 @@ export class ChatModel {
       queue: this.queue.map(promptView),
       ...(this.activePrompt ? { activePrompt: promptView(this.activePrompt) } : {}),
       ...(this.agentConfig ? { agentConfig: this.cloneAgentConfig(this.agentConfig) } : {}),
-      timeline: this.timeline.map((item) => ({ ...item, ...(item.approval ? { approval: { ...item.approval } } : {}) })),
+      activeTurnIds: [...this.turnStartedAt.keys()],
+      timeline: this.timeline.map((item) => ({
+        ...item,
+        ...(item.approval ? { approval: { ...item.approval } } : {}),
+        ...(item.changes ? { changes: { ...item.changes, files: item.changes.files.map((file) => ({ ...file })) } } : {}),
+      })),
       canApprove: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("reviewer")),
       canReturnToStart: this.connection === "idle" && this.timeline.length > 0,
     };
@@ -215,6 +232,25 @@ export class ChatModel {
         supportedReasoningEfforts: model.supportedReasoningEfforts.map((option) => ({ ...option })),
       })),
     };
+  }
+
+  private handleWorkspaceDiff(diff: WorkspaceDiff): void {
+    const files = diff.files?.map((file) => ({ ...file })) ?? [];
+    this.upsert(
+      `diff:${diff.revision}`,
+      "diff",
+      diff.text || "No tracked workspace changes.",
+      "Workspace changes",
+      diff.truncated ? "truncated" : undefined,
+      undefined,
+      files.length ? {
+        changes: {
+          additions: diff.additions ?? files.reduce((total, file) => total + file.additions, 0),
+          deletions: diff.deletions ?? files.reduce((total, file) => total + file.deletions, 0),
+          files,
+        },
+      } : undefined,
+    );
   }
 
   approvalSubmitting(requestId: string | number): void {
@@ -242,9 +278,15 @@ export class ChatModel {
       case "agent.message.completed":
         this.complete(`message:${event.itemId}`, "assistant", event.text, "Codex");
         break;
-      case "command.started":
-        this.upsert(`command:${event.itemId}`, "command", "", "Command", "running", undefined, { turnId: event.turnId, command: event.command });
+      case "command.started": {
+        const startedAt = this.turnStartedAt.get(event.turnId);
+        this.upsert(`command:${event.itemId}`, "command", "", "Command", "running", undefined, {
+          turnId: event.turnId,
+          command: event.command,
+          ...(startedAt ? { startedAt } : {}),
+        });
         break;
+      }
       case "command.output":
         this.append(`command:${event.itemId}`, "command", event.text, "Command", "running");
         break;
@@ -283,6 +325,7 @@ export class ChatModel {
           if (reasoning.turnId === event.turnId) reasoning.completed = true;
         }
         this.renderReasoning(event.turnId, new Date().toISOString());
+        this.turnStartedAt.delete(event.turnId);
         break;
       case "agent.error":
         this.add("error", event.message, "Codex");
@@ -294,6 +337,7 @@ export class ChatModel {
         this.add("error", `Codex exited${event.exitCode === null ? "" : ` with code ${event.exitCode}`}`);
         break;
       case "turn.started":
+        this.turnStartedAt.set(event.turnId, new Date().toISOString());
         break;
     }
   }
@@ -317,6 +361,7 @@ export class ChatModel {
     const items = [...this.reasoningItems.values()].filter((item) => item.turnId === turnId);
     if (!items.length) return;
     const text = items.map((item) => item.text.trim()).filter(Boolean).join("\n\n");
+    const startedAt = this.turnStartedAt.get(turnId);
     this.upsert(
       `reasoning:${turnId}`,
       "reasoning",
@@ -324,7 +369,11 @@ export class ChatModel {
       "Thinking",
       items.every((item) => item.completed) ? "completed" : "running",
       undefined,
-      { turnId, ...(finishedAt ? { finishedAt } : {}) },
+      {
+        turnId,
+        ...(startedAt ? { startedAt } : {}),
+        ...(finishedAt ? { finishedAt } : {}),
+      },
     );
   }
 

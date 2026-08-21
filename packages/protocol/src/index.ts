@@ -189,6 +189,14 @@ export const workspaceDiffSchema = z.object({
   text: z.string().max(250_000),
   truncated: z.boolean(),
   createdAt: z.string().datetime(),
+  additions: z.number().int().nonnegative().optional(),
+  deletions: z.number().int().nonnegative().optional(),
+  files: z.array(z.object({
+    path: z.string().min(1).max(2_048),
+    additions: z.number().int().nonnegative(),
+    deletions: z.number().int().nonnegative(),
+    binary: z.boolean().optional(),
+  })).max(64).optional(),
 });
 
 export const workspaceCheckpointSchema = z.object({
@@ -342,6 +350,16 @@ export interface WorkspaceDiff {
   text: string;
   truncated: boolean;
   createdAt: string;
+  additions?: number;
+  deletions?: number;
+  files?: WorkspaceDiffFile[];
+}
+
+export interface WorkspaceDiffFile {
+  path: string;
+  additions: number;
+  deletions: number;
+  binary?: boolean;
 }
 
 export interface WorkspaceCheckpoint {

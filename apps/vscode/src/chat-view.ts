@@ -14,6 +14,8 @@ export interface ChatActions {
   approve(requestId: string | number, decision: ApprovalDecision): void | Promise<void>;
   copyInvite(): void | Promise<void>;
   openOutput(): void | Promise<void>;
+  reviewChanges(): void | Promise<void>;
+  openChangedFile(file: string): void | Promise<void>;
 }
 
 type WebviewMessage =
@@ -26,6 +28,8 @@ type WebviewMessage =
   | { type: "approval"; requestId?: string | number; decision?: ApprovalDecision }
   | { type: "copyInvite" }
   | { type: "openOutput" }
+  | { type: "reviewChanges" }
+  | { type: "openChangedFile"; file?: string }
   | { type: "openLink"; href?: string };
 
 function isApprovalDecision(value: unknown): value is ApprovalDecision {
@@ -75,6 +79,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       case "stop": await this.actions.stop(); break;
       case "copyInvite": await this.actions.copyInvite(); break;
       case "openOutput": await this.actions.openOutput(); break;
+      case "reviewChanges": await this.actions.reviewChanges(); break;
+      case "openChangedFile": if (message.file?.trim()) await this.actions.openChangedFile(message.file.trim()); break;
       case "openLink": {
         const href = message.href?.trim();
         if (!href) break;
@@ -194,31 +200,59 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     details.card { border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editor-background); }
     details.card summary { padding: 7px 9px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; }
     details.card pre { margin: 0; padding: 8px 9px; border-top: 1px solid var(--vscode-panel-border); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 280px; overflow: auto; }
+    details.change-card { overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 10px; background: var(--vscode-editor-background); }
+    details.change-card > summary { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 54px; padding: 8px 9px; cursor: pointer; user-select: none; }
+    details.change-card > summary::-webkit-details-marker { display: none; }
+    .change-icon { display: grid; place-items: center; width: 25px; height: 25px; border: 1px solid var(--vscode-descriptionForeground); border-radius: 6px; color: var(--vscode-descriptionForeground); font: 700 14px/1 var(--vscode-editor-font-family); }
+    .change-overview { min-width: 0; }
+    .change-title { overflow: hidden; color: var(--vscode-foreground); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+    .change-totals { display: flex; gap: 5px; margin-top: 1px; font: 12px/1.3 var(--vscode-editor-font-family); }
+    .additions { color: var(--vscode-gitDecoration-addedResourceForeground, #3fb950); }
+    .deletions { color: var(--vscode-gitDecoration-deletedResourceForeground, #f47067); }
+    button.change-review { align-self: center; padding: 5px 9px; color: var(--vscode-foreground); background: transparent; border: 1px solid var(--vscode-panel-border); border-radius: 7px; font-size: 11px; }
+    button.change-review:hover { background: var(--vscode-toolbar-hoverBackground); }
+    .change-files { border-top: 1px solid var(--vscode-panel-border); padding: 4px 0; }
+    button.change-file { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; width: 100%; padding: 7px 10px; color: var(--vscode-descriptionForeground); background: transparent; border: 0; border-radius: 0; text-align: left; }
+    button.change-file:hover { background: var(--vscode-list-hoverBackground); }
+    .change-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .change-file-name { color: var(--vscode-foreground); }
+    .change-count { min-width: 25px; text-align: right; font: 12px/1.3 var(--vscode-editor-font-family); }
+    .change-binary { grid-column: 2 / 4; color: var(--vscode-descriptionForeground); font: 10px/1.3 var(--vscode-editor-font-family); text-transform: uppercase; }
     details.activity-card { border: 0; background: transparent; }
-    details.activity-card > summary { display: flex; align-items: center; gap: 6px; width: fit-content; max-width: 100%; padding: 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; }
+    details.activity-card > summary { display: grid; grid-template-columns: 18px minmax(0, auto) auto 10px; align-items: center; gap: 6px; width: fit-content; max-width: 100%; min-height: 28px; padding: 3px 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; border-radius: 5px; }
+    details.activity-card > summary:hover { background: var(--vscode-list-hoverBackground); }
     details.activity-card > summary::-webkit-details-marker, details.activity-step > summary::-webkit-details-marker { display: none; }
-    .activity-chevron { display: inline-block; flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; transition: transform 120ms ease; }
+    .activity-chevron { display: inline-block; grid-column: -1; flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; transition: transform 120ms ease; }
     details.activity-card[open] > summary .activity-chevron, details.activity-step[open] > summary .step-chevron { transform: rotate(90deg); }
-    .activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-weight: 600; }
-    .activity-card.running .activity-label { animation: thinkingPulse 1.4s ease-in-out infinite; }
-    .thinking-dots { display: inline-flex; gap: 2px; margin-left: -3px; }
-    .thinking-dots span { width: 2px; height: 2px; border-radius: 50%; background: var(--vscode-descriptionForeground); animation: thinkingDot 1.2s ease-in-out infinite; }
-    .thinking-dots span:nth-child(2) { animation-delay: 150ms; }
-    .thinking-dots span:nth-child(3) { animation-delay: 300ms; }
-    .activity-card:not(.running) .thinking-dots { display: none; }
-    .activity-steps { margin: 2px 0 0 9px; padding: 1px 0 1px 10px; border-left: 1px solid var(--vscode-panel-border); }
+    .activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 12px; font-weight: 600; }
+    .activity-timer { color: color-mix(in srgb, var(--vscode-descriptionForeground) 78%, transparent); font: 11px/1.3 var(--vscode-editor-font-family); white-space: nowrap; }
+    .activity-glyph { display: grid; place-items: center; width: 17px; height: 17px; color: var(--vscode-descriptionForeground); opacity: .86; }
+    .activity-glyph svg { width: 16px; height: 16px; overflow: visible; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+    .activity-card.running > summary .activity-label, .activity-step.running .step-label {
+      color: transparent;
+      background: linear-gradient(90deg, var(--vscode-descriptionForeground) 15%, var(--vscode-foreground) 42%, var(--vscode-descriptionForeground) 68%);
+      background-size: 220% 100%;
+      background-clip: text;
+      -webkit-background-clip: text;
+      animation: activeText 1.8s linear infinite;
+    }
+    .activity-card.running > summary .activity-glyph, .activity-step.running .activity-glyph { animation: activeGlyph 1.6s ease-in-out infinite; }
+    .activity-steps { margin: 1px 0 0; padding: 0; }
     details.activity-step { border: 0; background: transparent; }
-    details.activity-step > summary { display: grid; grid-template-columns: 13px minmax(0, 1fr) 10px; align-items: center; gap: 5px; min-height: 25px; padding: 2px 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; border-radius: 4px; }
+    details.activity-step.entering { animation: activityEnter 220ms cubic-bezier(.2,.8,.2,1) both; }
+    details.activity-step > summary { display: grid; grid-template-columns: 18px minmax(0, 1fr) 10px; align-items: center; gap: 6px; min-height: 28px; padding: 3px 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; border-radius: 5px; }
     details.activity-step > summary:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
-    .step-status { width: 13px; text-align: center; font-size: 11px; }
-    .activity-step.failed .step-status { color: var(--vscode-errorForeground); }
-    .step-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+    .activity-step.failed .activity-glyph, .activity-step.failed .step-label { color: var(--vscode-errorForeground); }
+    .step-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
     .step-chevron { color: var(--vscode-descriptionForeground); font-size: 9px; transition: transform 120ms ease; }
-    details.activity-step > pre.step-output { margin: 0 0 3px 18px; padding: 5px 7px; border: 0; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 220px; overflow: auto; }
-    details.activity-step > .step-markdown { margin: 1px 0 5px 18px; padding: 4px 7px; color: var(--vscode-descriptionForeground); border-left: 1px solid var(--vscode-panel-border); font-size: 11px; }
-    @keyframes thinkingPulse { 50% { opacity: .45; } }
-    @keyframes thinkingDot { 0%, 65%, 100% { opacity: .25; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-2px); } }
-    @media (prefers-reduced-motion: reduce) { .activity-card.running .activity-label, .thinking-dots span { animation: none; } }
+    details.activity-step > pre.step-output { margin: 0 0 4px 28px; padding: 5px 7px; border: 0; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 220px; overflow: auto; }
+    details.activity-step > .step-markdown { margin: 1px 0 5px 28px; padding: 4px 7px; color: var(--vscode-descriptionForeground); border-left: 1px solid var(--vscode-panel-border); font-size: 11px; }
+    @keyframes activeText { from { background-position: 100% 0; } to { background-position: -120% 0; } }
+    @keyframes activeGlyph { 0%, 100% { opacity: .46; } 50% { opacity: 1; } }
+    @keyframes activityEnter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    @media (prefers-reduced-motion: reduce) {
+      .activity-card.running > summary .activity-label, .activity-step.running .step-label, .activity-card.running > summary .activity-glyph, .activity-step.running .activity-glyph, details.activity-step.entering { animation: none; }
+    }
     .system, .error { display: flex; gap: 7px; align-items: flex-start; color: var(--vscode-descriptionForeground); font-size: 11px; padding: 3px 4px; }
     .error { color: var(--vscode-errorForeground); }
     .approval { padding: 9px; border-radius: 7px; color: var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); font-size: 11px; }
@@ -270,7 +304,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const elements = Object.fromEntries(['dot','back','room','people','queue','conversation','prompt','model','effort','send','copy','stop','output'].map(id => [id, document.getElementById(id)]));
-    let state = { connection: 'idle', participants: [], queue: [], timeline: [] };
+    let state = { connection: 'idle', participants: [], queue: [], activeTurnIds: [], timeline: [] };
     const savedComposer = vscode.getState() || {};
     let selectedModel = typeof savedComposer.model === 'string' ? savedComposer.model : '';
     let selectedEffort = typeof savedComposer.effort === 'string' ? savedComposer.effort : '';
@@ -278,7 +312,10 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     const expandedActivities = new Set();
     const collapsedActivities = new Set();
     const expandedSteps = new Set();
+    const collapsedChangeCards = new Set();
     const collapsedSteps = new Set();
+    const seenActivitySteps = new Set();
+    let liveTimerFrame;
 
     const post = (type, extra = {}) => vscode.postMessage({ type, ...extra });
     const node = (tag, className, text) => { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined) value.textContent = text; return value; };
@@ -292,9 +329,64 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const minutes = Math.floor(seconds / 60);
       return minutes + 'm ' + (seconds % 60) + 's';
     };
+    const liveElapsed = milliseconds => {
+      const tenths = Math.max(0, Math.floor((milliseconds || 0) / 100) / 10);
+      if (tenths < 60) return tenths.toFixed(1) + 's';
+      const minutes = Math.floor(tenths / 60);
+      return minutes + 'm ' + (tenths % 60).toFixed(1).padStart(4, '0') + 's';
+    };
     const shortCommand = command => {
       const compact = (command || 'command').replace(/\\s+/g, ' ').trim();
       return compact.length > 72 ? compact.slice(0, 69) + '…' : compact;
+    };
+    const commandPresentation = (command, running) => {
+      const compact = shortCommand(command);
+      const lower = compact.toLowerCase();
+      const isRead = ['cat ', 'sed ', 'head ', 'tail ', 'bat '].some(prefix => lower.startsWith(prefix) || lower.includes(' ' + prefix));
+      const pathToken = compact.split(' ').find(token => token.includes('/') && token.includes('.'));
+      const cleanPath = pathToken?.replace(/^['\"]+|['\",;:)]+$/g, '');
+      const fileName = cleanPath?.split('/').pop();
+      if (isRead && fileName) return { glyph: 'read', label: (running ? 'Reading ' : 'Read ') + fileName };
+      const rgIndex = lower.startsWith('rg ') ? 0 : lower.indexOf(' rg ');
+      if (rgIndex >= 0) {
+        const afterRg = compact.slice(rgIndex + (rgIndex === 0 ? 3 : 4));
+        const query = afterRg.split(' ').find(token => token && !token.startsWith('-'))?.replace(/^['\"]+|['\",;]+$/g, '');
+        return { glyph: 'search', label: (running ? 'Searching for ' : 'Searched for ') + (query || 'matches') };
+      }
+      return { glyph: 'terminal', label: (running ? 'Running ' : 'Ran ') + compact };
+    };
+    const activityPresentation = (item, running) => item.kind === 'reasoning'
+      ? { glyph: 'thinking', label: running ? 'Thinking' : 'Thought' }
+      : commandPresentation(item.command, running);
+    const activityGlyph = kind => {
+      const glyph = node('span', 'activity-glyph ' + kind);
+      glyph.setAttribute('aria-hidden', 'true');
+      const icons = {
+        read: '<svg viewBox="0 0 18 18"><path d="M2.5 3.2c2-.1 3.6.5 5 1.7v10c-1.4-1.2-3-1.8-5-1.7zM15.5 3.2c-2-.1-3.6.5-5 1.7v10c1.4-1.2 3-1.8 5-1.7zM9 5v10"/></svg>',
+        search: '<svg viewBox="0 0 18 18"><circle cx="7.5" cy="7.5" r="4.8"/><path d="m11 11 4 4"/></svg>',
+        terminal: '<svg viewBox="0 0 18 18"><rect x="2" y="3" width="14" height="12" rx="2"/><path d="m5 7 2 2-2 2M9.5 11h3"/></svg>',
+        thinking: '<svg viewBox="0 0 18 18"><path d="M9 2.5v2M9 13.5v2M2.5 9h2M13.5 9h2M4.4 4.4l1.4 1.4M12.2 12.2l1.4 1.4M13.6 4.4l-1.4 1.4M5.8 12.2l-1.4 1.4"/><circle cx="9" cy="9" r="2.6"/></svg>',
+      };
+      glyph.innerHTML = icons[kind] || icons.terminal;
+      return glyph;
+    };
+    const syncLiveTimers = () => {
+      if (liveTimerFrame !== undefined) cancelAnimationFrame(liveTimerFrame);
+      let lastPaint = 0;
+      const tick = frameTime => {
+        const timers = document.querySelectorAll('.activity-timer[data-started-at]');
+        if (!timers.length) { liveTimerFrame = undefined; return; }
+        if (frameTime - lastPaint >= 80) {
+          const now = Date.now();
+          for (const timer of timers) {
+            const startedAt = Number(timer.dataset.startedAt);
+            if (Number.isFinite(startedAt)) timer.textContent = '· ' + liveElapsed(now - startedAt);
+          }
+          lastPaint = frameTime;
+        }
+        liveTimerFrame = requestAnimationFrame(tick);
+      };
+      liveTimerFrame = requestAnimationFrame(tick);
     };
 
     const effortLabel = effort => ({ none: 'None', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' })[effort] || effort;
@@ -308,7 +400,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
       elements.model.replaceChildren();
       if (!models.length) {
-        const option = node('option', '', config?.model || 'Default model'); option.value = config?.model || '';
+        const fallbackModel = config?.model || selectedModel || '';
+        const option = node('option', '', fallbackModel || 'Default model'); option.value = fallbackModel;
         elements.model.append(option);
       } else {
         for (const model of models) {
@@ -334,8 +427,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       elements.effort.value = selectedEffort;
       elements.effort.title = efforts.find(option => option.reasoningEffort === selectedEffort)?.description || 'Reasoning level';
       const enabled = state.connection === 'connected';
-      elements.model.disabled = !enabled || (!models.length && !config?.model);
-      elements.effort.disabled = !enabled || !config || !efforts.length;
+      elements.model.disabled = !enabled;
+      elements.effort.disabled = !enabled || !efforts.length;
       rememberComposer();
     }
 
@@ -362,9 +455,10 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
     function renderActivity(items) {
       const runningCommand = items.find(item => item.kind === 'command' && item.status === 'running');
-      const running = Boolean(runningCommand || items.some(item => item.status === 'running'));
+      const turnRunning = items.some(item => item.turnId && state.activeTurnIds?.includes(item.turnId));
+      const running = Boolean(turnRunning || runningCommand || items.some(item => item.status === 'running'));
       const failed = items.some(isFailure);
-      const startedAt = Math.min(...items.map(item => Date.parse(item.timestamp)).filter(Number.isFinite));
+      const startedAt = Math.min(...items.map(item => Date.parse(item.startedAt || item.timestamp)).filter(Number.isFinite));
       const finishedTimes = items.map(item => Date.parse(item.finishedAt || '')).filter(Number.isFinite);
       const finishedAt = finishedTimes.length ? Math.max(...finishedTimes) : undefined;
       const duration = finishedAt === undefined || !Number.isFinite(startedAt) ? undefined : elapsed(finishedAt - startedAt);
@@ -374,14 +468,18 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
       let label = duration ? 'Worked for ' + duration : 'Worked';
       if (failed) label += ' · command failed';
-      if (runningCommand) label = 'Running ' + shortCommand(runningCommand.command);
-      else if (running) label = 'Thinking…';
+      const activeItem = [...items].reverse().find(item => item.status === 'running');
+      const presentation = activeItem ? activityPresentation(activeItem, true) : { glyph: 'thinking', label: running ? 'Working' : label };
+      if (running) label = presentation.label;
       const summary = node('summary');
       summary.setAttribute('aria-label', label + (details.open ? ', hide activity' : ', show activity'));
-      const dots = node('span', 'thinking-dots');
-      dots.setAttribute('aria-hidden', 'true');
-      dots.append(node('span'), node('span'), node('span'));
-      summary.append(node('span', 'activity-chevron', '▶'), node('span', 'activity-label', label), dots);
+      summary.append(activityGlyph(presentation.glyph), node('span', 'activity-label', label));
+      if (running && Number.isFinite(startedAt)) {
+        const timer = node('span', 'activity-timer', '· ' + liveElapsed(Date.now() - startedAt));
+        timer.dataset.startedAt = String(startedAt);
+        summary.append(timer);
+      }
+      summary.append(node('span', 'activity-chevron', '▶'));
       summary.addEventListener('click', () => {
         if (details.open) {
           expandedActivities.delete(activityId);
@@ -397,18 +495,19 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       for (const item of items) {
         const stepFailed = isFailure(item);
         const stepRunning = item.status === 'running';
-        const step = node('details', 'activity-step' + (stepFailed ? ' failed' : '') + (stepRunning ? ' running' : ''));
+        const entering = !seenActivitySteps.has(item.id);
+        const step = node('details', 'activity-step' + (stepFailed ? ' failed' : '') + (stepRunning ? ' running' : '') + (entering ? ' entering' : ''));
+        seenActivitySteps.add(item.id);
         if ((stepFailed && !collapsedSteps.has(item.id)) || expandedSteps.has(item.id)) step.setAttribute('open', '');
 
-        let stepLabel;
-        if (item.kind === 'reasoning') stepLabel = stepRunning ? 'Thinking…' : 'Thought';
-        else if (stepRunning) stepLabel = 'Running ' + shortCommand(item.command);
-        else if (stepFailed) stepLabel = 'Failed ' + shortCommand(item.command) + ' · ' + item.status;
-        else stepLabel = 'Ran ' + shortCommand(item.command) + (item.durationMs === undefined ? '' : ' in ' + elapsed(item.durationMs));
+        const stepPresentation = activityPresentation(item, stepRunning);
+        let stepLabel = stepPresentation.label;
+        if (stepFailed) stepLabel = 'Failed ' + shortCommand(item.command) + ' · ' + item.status;
+        else if (!stepRunning && item.kind === 'command' && item.durationMs !== undefined) stepLabel += ' · ' + elapsed(item.durationMs);
 
         const stepSummary = node('summary');
         stepSummary.append(
-          node('span', 'step-status', stepRunning ? '◌' : stepFailed ? '×' : '✓'),
+          activityGlyph(stepPresentation.glyph),
           node('span', 'step-label', stepLabel),
           node('span', 'step-chevron', '▶'),
         );
@@ -455,6 +554,42 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         return wrap;
       }
       if (item.kind === 'diff') {
+        if (item.changes?.files?.length) {
+          const details = node('details', 'change-card');
+          if (!collapsedChangeCards.has(item.id)) details.setAttribute('open', '');
+          const summary = node('summary');
+          const fileCount = item.changes.files.length;
+          const overview = node('div', 'change-overview');
+          overview.append(node('div', 'change-title', 'Edited ' + fileCount + ' file' + (fileCount === 1 ? '' : 's')));
+          const totals = node('div', 'change-totals');
+          totals.append(node('span', 'additions', '+' + item.changes.additions), node('span', 'deletions', '-' + item.changes.deletions));
+          overview.append(totals);
+          const review = node('button', 'change-review', 'Review');
+          review.title = 'Open Source Control';
+          review.onclick = event => { event.preventDefault(); event.stopPropagation(); post('reviewChanges'); };
+          summary.append(node('span', 'change-icon', '±'), overview, review);
+          summary.addEventListener('click', () => {
+            if (details.open) collapsedChangeCards.add(item.id);
+            else collapsedChangeCards.delete(item.id);
+          });
+          const files = node('div', 'change-files');
+          for (const file of item.changes.files) {
+            const row = node('button', 'change-file');
+            row.title = 'Review ' + file.path;
+            const separator = file.path.lastIndexOf('/');
+            const pathLabel = node('span', 'change-path');
+            if (separator >= 0) pathLabel.append(node('span', 'change-file-dir', file.path.slice(0, separator + 1)));
+            pathLabel.append(node('span', 'change-file-name', file.path.slice(separator + 1)));
+            row.append(pathLabel);
+            if (file.binary) row.append(node('span', 'change-binary', 'binary'));
+            else row.append(node('span', 'change-count additions', '+' + file.additions), node('span', 'change-count deletions', '-' + file.deletions));
+            row.onclick = event => { event.preventDefault(); event.stopPropagation(); post('openChangedFile', { file: file.path }); };
+            files.append(row);
+          }
+          details.append(summary, files);
+          wrap.append(details);
+          return wrap;
+        }
         const details = node('details', 'card');
         details.open = item.status === 'running';
         const label = (item.title || item.kind) + (item.status && item.status !== 'completed' ? ' · ' + item.status : '');
@@ -519,7 +654,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const enabled = state.connection === 'connected';
       elements.prompt.disabled = !enabled;
       elements.send.disabled = !enabled || !elements.prompt.value.trim();
-      renderModelControls(); renderPeople(); renderQueue(); renderConversation();
+      renderModelControls(); renderPeople(); renderQueue(); renderConversation(); syncLiveTimers();
     }
 
     function submitPrompt() {
@@ -527,8 +662,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       if (!text || state.connection !== 'connected') return;
       post('submit', {
         text,
-        model: state.agentConfig && selectedModel ? selectedModel : undefined,
-        effort: state.agentConfig && selectedEffort ? selectedEffort : undefined,
+        model: selectedModel || undefined,
+        effort: selectedEffort || undefined,
       }); elements.prompt.value = ''; elements.prompt.style.height = ''; elements.send.disabled = true;
     }
 

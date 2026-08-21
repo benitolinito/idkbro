@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import type {
   AgentAdapter,
@@ -67,23 +70,24 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === "number" ? value : null;
 }
 
-function codexModels(result: JsonObject): AgentModel[] {
-  if (!Array.isArray(result.data)) return [];
-  return result.data.flatMap((value) => {
+export function codexModels(result: JsonObject): AgentModel[] {
+  const values = Array.isArray(result.data) ? result.data : Array.isArray(result.models) ? result.models : [];
+  return values.flatMap((value) => {
     const model = object(value);
-    const id = string(model?.id);
-    const slug = string(model?.model);
-    const displayName = string(model?.displayName);
-    const defaultReasoningEffort = string(model?.defaultReasoningEffort);
+    const id = string(model?.id) ?? string(model?.slug);
+    const slug = string(model?.model) ?? string(model?.slug);
+    const displayName = string(model?.displayName) ?? string(model?.display_name);
+    const defaultReasoningEffort = string(model?.defaultReasoningEffort) ?? string(model?.default_reasoning_level);
     if (!id || !slug || !displayName || !defaultReasoningEffort) return [];
-    const supportedReasoningEfforts = Array.isArray(model?.supportedReasoningEfforts)
-      ? model.supportedReasoningEfforts.flatMap((option) => {
-          const item = object(option);
-          const reasoningEffort = string(item?.reasoningEffort);
-          if (!reasoningEffort) return [];
-          return [{ reasoningEffort, description: string(item?.description) ?? "" }];
-        })
-      : [];
+    const effortValues = Array.isArray(model?.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts
+      : Array.isArray(model?.supported_reasoning_levels) ? model.supported_reasoning_levels : [];
+    const supportedReasoningEfforts = effortValues.flatMap((option) => {
+      const item = object(option);
+      const reasoningEffort = string(item?.reasoningEffort) ?? string(item?.effort);
+      if (!reasoningEffort) return [];
+      return [{ reasoningEffort, description: string(item?.description) ?? "" }];
+    });
     return [{
       id,
       model: slug,
@@ -94,6 +98,16 @@ function codexModels(result: JsonObject): AgentModel[] {
       supportedReasoningEfforts,
     }];
   });
+}
+
+async function cachedCodexModels(): Promise<AgentModel[]> {
+  const codexDirectory = process.env.CODEX_HOME?.trim() || path.join(homedir(), ".codex");
+  try {
+    const cache = object(JSON.parse(await readFile(path.join(codexDirectory, "models_cache.json"), "utf8")));
+    return cache ? codexModels(cache) : [];
+  } catch {
+    return [];
+  }
 }
 
 export function normalizeCodexMessage(message: JsonRpcMessage): AgentEvent | undefined {
@@ -263,6 +277,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       // Older app-server versions do not expose the model catalog. The
       // configured model remains usable even when picker metadata is absent.
     }
+    if (!models.length) models = await cachedCodexModels();
 
     const result = await this.request("thread/start", {
       cwd: options.cwd,

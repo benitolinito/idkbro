@@ -46,6 +46,8 @@ class MultiCodeController implements vscode.Disposable {
       approve: (requestId, decision) => this.resolveApproval(requestId, decision),
       copyInvite: () => this.copyInvite(),
       openOutput: () => this.openOutput(),
+      reviewChanges: () => this.reviewChanges(),
+      openChangedFile: (file) => this.openChangedFile(file),
     });
     this.collaboration = new CollaborationBridge((message) => {
       this.chat.handle(message);
@@ -186,6 +188,29 @@ class MultiCodeController implements vscode.Disposable {
 
   openOutput(): void {
     this.output.show(true);
+  }
+
+  async reviewChanges(): Promise<void> {
+    await vscode.commands.executeCommand("git.refresh");
+    await vscode.commands.executeCommand("workbench.view.scm");
+  }
+
+  async openChangedFile(file: string): Promise<void> {
+    const root = path.resolve(this.roomWorkspace ?? this.workspaceDirectory(false));
+    const target = path.resolve(root, file);
+    const relative = path.relative(root, target);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      void vscode.window.showWarningMessage("MultiCode refused to open a change outside the room workspace.");
+      return;
+    }
+    const uri = vscode.Uri.file(target);
+    const commands = await vscode.commands.getCommands(true);
+    if (commands.includes("git.openChange")) {
+      await vscode.commands.executeCommand("git.openChange", uri);
+      return;
+    }
+    try { await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri)); }
+    catch { await this.reviewChanges(); }
   }
 
   openChat(): void {

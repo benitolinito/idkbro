@@ -73,17 +73,54 @@ describe("ChatModel", () => {
   it("streams reasoning, assistant messages, commands, and completion", () => {
     const model = new ChatModel();
     model.handle(welcome());
+    model.handle({ type: "agent.event", event: { type: "turn.started", threadId: "t", turnId: "turn" } });
     model.handle({ type: "agent.event", event: { type: "agent.reasoning.delta", threadId: "t", turnId: "turn", itemId: "r", text: "Inspecting " } });
     model.handle({ type: "agent.event", event: { type: "agent.reasoning.delta", threadId: "t", turnId: "turn", itemId: "r", text: "files" } });
     model.handle({ type: "agent.event", event: { type: "agent.message.delta", threadId: "t", turnId: "turn", itemId: "m", text: "Done" } });
     model.handle({ type: "agent.event", event: { type: "command.started", threadId: "t", turnId: "turn", itemId: "c", command: "npm test" } });
+    expect(model.snapshot().activeTurnIds).toEqual(["turn"]);
     model.handle({ type: "agent.event", event: { type: "command.exited", threadId: "t", turnId: "turn", itemId: "c", exitCode: 0, output: "24 passed" } });
     model.handle({ type: "agent.event", event: { type: "turn.completed", threadId: "t", turnId: "turn", status: "completed" } });
 
+    expect(model.snapshot().activeTurnIds).toEqual([]);
     expect(model.snapshot().timeline).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "reasoning", id: "reasoning:turn", text: "Inspecting files", status: "completed" }),
+      expect.objectContaining({ kind: "reasoning", id: "reasoning:turn", text: "Inspecting files", status: "completed", startedAt: expect.any(String) }),
       expect.objectContaining({ kind: "assistant", text: "Done" }),
-      expect.objectContaining({ kind: "command", command: "npm test", text: "24 passed", status: "completed", turnId: "turn" }),
+      expect.objectContaining({ kind: "command", command: "npm test", text: "24 passed", status: "completed", turnId: "turn", startedAt: expect.any(String) }),
+    ]));
+  });
+
+  it("exposes colored file-change statistics for the review card", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    model.handle({
+      type: "workspace.diff",
+      diff: {
+        revision: "turn",
+        text: "diff",
+        truncated: false,
+        createdAt: new Date(0).toISOString(),
+        additions: 27,
+        deletions: 6,
+        files: [
+          { path: "apps/vscode/src/chat-view.ts", additions: 6, deletions: 5 },
+          { path: "packages/agent-adapters/src/codex.test.ts", additions: 21, deletions: 1 },
+        ],
+      },
+    });
+
+    expect(model.snapshot().timeline).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "diff",
+        changes: {
+          additions: 27,
+          deletions: 6,
+          files: [
+            expect.objectContaining({ path: "apps/vscode/src/chat-view.ts", additions: 6, deletions: 5 }),
+            expect.objectContaining({ path: "packages/agent-adapters/src/codex.test.ts", additions: 21, deletions: 1 }),
+          ],
+        },
+      }),
     ]));
   });
 
