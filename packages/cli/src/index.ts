@@ -476,11 +476,11 @@ class RoomAuthority {
   }
 
   async reconcileAgentChanges(changes: WorkspaceChange[]): Promise<CollaborationEvent[]> {
-    return this.enqueueWorkspace(() => this.reconcileWorkspaceChangesLocked(changes, "agent", true));
+    return this.enqueueWorkspace(() => this.reconcileWorkspaceChangesLocked(changes, "agent"));
   }
 
   async reconcileAgentChangesLocked(changes: WorkspaceChange[]): Promise<CollaborationEvent[]> {
-    return this.reconcileWorkspaceChangesLocked(changes, "agent", true);
+    return this.reconcileWorkspaceChangesLocked(changes, "agent");
   }
 
   async reconcileExternalWorkspace(): Promise<CollaborationEvent[]> {
@@ -514,20 +514,38 @@ class RoomAuthority {
   private async reconcileWorkspaceChangesLocked(changes: WorkspaceChange[], actorId: string, materializeAfterCommit = false): Promise<CollaborationEvent[]> {
       const operations: WorkspaceTransactionOperation[] = [];
       for (const change of changes) {
+        let collaborative = change.collaborative !== false;
+        if (collaborative && change.operation !== "delete") {
+          try { await this.assertCollaborativePolicy(change.path); }
+          catch { collaborative = false; }
+        }
         if (change.operation === "rename") {
           if (!change.sourcePath) throw new Error("Agent rename is missing its source path");
+          const source = this.session.manifest.fileByPath(change.sourcePath);
+          if (!collaborative) {
+            if (source) operations.push({ type: "delete", path: change.sourcePath });
+            continue;
+          }
           const destination = safeRoomFile(this.workspacePath, change.path);
           const content = change.content ?? await this.readCollaborativeText(destination.target);
-          operations.push({ type: "rename", sourcePath: change.sourcePath, destinationPath: change.path, content });
+          if (source) operations.push({ type: "rename", sourcePath: change.sourcePath, destinationPath: change.path, content });
+          else {
+            const existing = this.session.manifest.fileByPath(change.path);
+            operations.push(existing ? { type: "replace", path: change.path, content } : { type: "create", path: change.path, content });
+          }
           continue;
         }
         if (change.operation === "delete") {
-          operations.push({ type: "delete", path: change.path });
+          if (this.session.manifest.fileByPath(change.path)) operations.push({ type: "delete", path: change.path });
+          continue;
+        }
+        const existing = this.session.manifest.fileByPath(change.path);
+        if (!collaborative) {
+          if (existing) operations.push({ type: "delete", path: change.path });
           continue;
         }
         const target = safeRoomFile(this.workspacePath, change.path);
         const content = change.content ?? await this.readCollaborativeText(target.target);
-        const existing = this.session.manifest.fileByPath(change.path);
         operations.push(existing ? { type: "replace", path: change.path, content } : { type: "create", path: change.path, content });
       }
       if (!operations.length) return [];
@@ -986,7 +1004,12 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     onPrompt: async (prompt) => {
       activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: prepared.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
       let promptText = prompt.text; try { promptText = openPrompt(localTransportKey, prompt.promptId, prompt.text); } catch { /* Host-local input is already plaintext. */ }
-      await adapter.sendPrompt({ promptId: prompt.promptId, text: promptText });
+      await adapter.sendPrompt({
+        promptId: prompt.promptId,
+        text: promptText,
+        ...(prompt.model ? { model: prompt.model } : {}),
+        ...(prompt.effort ? { effort: prompt.effort } : {}),
+      });
     },
     onCollaborationEvent: (participant, event) => authority.commit(participant.id, event),
     onApproval: async (_participant, requestId, decision) => adapter.resolveApproval(requestId, decision),
@@ -1003,9 +1026,16 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   });
   const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
   const ipc = new LocalIpcServer(ipcToken, async (payload) => {
-    const request = payload as { type?: string; text?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown };
+    const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown };
     if (request.type === "status") return { roomId: prepared.roomId, mode: "local", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null };
-    if (request.type === "prompt" && request.text) { const promptId = randomUUID(); relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, request.text), promptId); return { queued: true }; }
+    if (request.type === "prompt" && request.text) {
+      const promptId = randomUUID();
+      relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, request.text), promptId, {
+        ...(typeof request.model === "string" ? { model: request.model } : {}),
+        ...(typeof request.effort === "string" ? { effort: request.effort } : {}),
+      });
+      return { queued: true };
+    }
     if (request.type === "interrupt") { await adapter.interrupt(); return { interrupted: true }; }
     if (request.type === "approval.resolve" && request.requestId !== undefined && isApprovalDecision(request.decision)) { await adapter.resolveApproval(request.requestId, request.decision); return { resolved: true }; }
     if (request.type === "capabilities" && request.participantId && request.capabilities) { relay.setParticipantCapabilities(request.participantId, request.capabilities); return { updated: true }; }
@@ -1104,6 +1134,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
     });
+    relay.publishAgentConfig(adapter.configuration());
     console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
     previewWatcher.start();
     sharedWatcher.start();
@@ -1302,9 +1333,19 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
     const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
     ipc = new LocalIpcServer(ipcToken, async (payload) => {
-      const request = payload as { type?: string; text?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown };
+      const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown };
       if (request.type === "status") return { roomId: created.roomId, mode: "remote", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null, relayConnected: socket?.readyState === WebSocket.OPEN };
-      if (request.type === "prompt" && request.text) { const promptId = randomUUID(); sendToRelay({ type: "prompt.submit", promptId, text: sealPrompt(relayTransportKey, promptId, request.text) }); return { queued: true }; }
+      if (request.type === "prompt" && request.text) {
+        const promptId = randomUUID();
+        sendToRelay({
+          type: "prompt.submit",
+          promptId,
+          text: sealPrompt(relayTransportKey, promptId, request.text),
+          ...(request.model ? { model: request.model } : {}),
+          ...(request.effort ? { effort: request.effort } : {}),
+        });
+        return { queued: true };
+      }
       if (request.type === "interrupt") { await adapter.interrupt(); return { interrupted: true }; }
       if (request.type === "approval.resolve" && request.requestId !== undefined && isApprovalDecision(request.decision)) { await adapter.resolveApproval(request.requestId, request.decision); return { resolved: true }; }
       if (request.type === "capabilities" && request.participantId && request.capabilities) { sendToRelay({ type: "relay.participant.capabilities", participantId: request.participantId, capabilities: request.capabilities }); return { updated: true }; }
@@ -1381,6 +1422,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
     });
+    sendToRelay({ type: "relay.agent.config", config: adapter.configuration() });
     console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
     previewWatcher.start();
     sharedWatcher.start();
@@ -1426,7 +1468,12 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         processedPromptIds.add(message.prompt.promptId); if (processedPromptIds.size > 10_000) processedPromptIds.delete(processedPromptIds.keys().next().value as string);
         void (async () => {
           activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: created.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
-          await adapter.sendPrompt({ promptId: message.prompt.promptId, text: openPrompt(relayTransportKey, message.prompt.promptId, message.prompt.text) });
+          await adapter.sendPrompt({
+            promptId: message.prompt.promptId,
+            text: openPrompt(relayTransportKey, message.prompt.promptId, message.prompt.text),
+            ...(message.prompt.model ? { model: message.prompt.model } : {}),
+            ...(message.prompt.effort ? { effort: message.prompt.effort } : {}),
+          });
         })().catch((error: unknown) => {
           sendToRelay({ type: "relay.prompt.failed", promptId: message.prompt.promptId, message: error instanceof Error ? error.message : String(error) });
         });

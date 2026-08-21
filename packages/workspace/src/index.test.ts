@@ -24,6 +24,7 @@ import {
   restoreParticipantWorkspace,
   releaseDirectCheckoutLease,
   sanitizeRoomId,
+  type WorkspaceChange,
   WorkspaceProjectionTracker,
 } from "./index.js";
 
@@ -361,9 +362,8 @@ describe("v3 direct host workspace", () => {
       turn,
       withCommitLock: async (operation) => operation(),
       onCommitted: async (changes) => {
-        expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("base\n");
+        expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("agent\n");
         expect(changes).toEqual([{ operation: "update", path: "file.txt", content: "agent\n" }]);
-        await writeFile(path.join(hosted.workspacePath, "file.txt"), changes[0]?.content ?? "");
         committed = true;
       },
     });
@@ -371,6 +371,39 @@ describe("v3 direct host workspace", () => {
     expect(result.status).toBe("merged");
     expect(committed).toBe(true);
     expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("agent\n");
+    await releaseDirectCheckoutLease(hosted.lease);
+  });
+
+  it("projects oversized agent files into the direct checkout as Git-only changes", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-large-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-large-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "large.ts"), "export const initial = true;\n");
+    await execFileAsync("git", ["-C", repository, "add", "large.ts"]);
+    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
+    const hosted = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "direct-large", dataDirectory });
+    const turn = await prepareAgentTurnWorkspace({ sharedPath: hosted.workspacePath, agentPath: hosted.agentPath, roomId: hosted.roomId, sequence: 1, baseCommit: hosted.baseCommit, parentCommit: hosted.checkpointCommit });
+    const largeResult = `export const contents = ${JSON.stringify("x".repeat(97 * 1024))};\n`;
+    await writeFile(path.join(hosted.agentPath, "large.ts"), largeResult);
+    let committedChanges: WorkspaceChange[] = [];
+
+    const result = await mergeAgentWorkspace({
+      sharedPath: hosted.workspacePath,
+      agentPath: hosted.agentPath,
+      sessionDirectory: hosted.sessionDirectory,
+      roomId: hosted.roomId,
+      baseCommit: hosted.baseCommit,
+      turn,
+      withCommitLock: async (operation) => operation(),
+      onCommitted: async (changes) => { committedChanges = changes; },
+    });
+
+    expect(result.status).toBe("merged");
+    expect(committedChanges).toEqual([{ operation: "update", path: "large.ts", collaborative: false }]);
+    expect(await readFile(path.join(hosted.workspacePath, "large.ts"), "utf8")).toBe(largeResult);
+    expect((await execFileAsync("git", ["-C", hosted.workspacePath, "status", "--short"])).stdout).toContain(" M large.ts");
     await releaseDirectCheckoutLease(hosted.lease);
   });
 

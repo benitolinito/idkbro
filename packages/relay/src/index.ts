@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import {
   roomClientMessageSchema,
   checkpointChunkBytes,
+  type AgentConfig,
   type AgentEvent,
   type ApprovalDecision,
   type CollaborationEvent,
@@ -51,6 +52,7 @@ export class RoomRelay {
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
   private latestCheckpoint: WorkspaceCheckpointDescriptor | null = null;
+  private agentConfig: AgentConfig | undefined;
   private readonly host: RoomParticipant;
 
   constructor(private readonly options: RoomRelayOptions) {
@@ -90,12 +92,13 @@ export class RoomRelay {
     return { host: options.host, port: address.port };
   }
 
-  submitHostPrompt(text: string, promptId = randomUUID()): string {
+  submitHostPrompt(text: string, promptId = randomUUID(), settings: { model?: string; effort?: string } = {}): string {
     this.enqueue({
       promptId,
       participantId: this.host.id,
       participantName: this.host.name,
       text: text.trim(),
+      ...settings,
       submittedAt: new Date().toISOString(),
     });
     return promptId;
@@ -109,6 +112,11 @@ export class RoomRelay {
     } else if (event.type === "agent.exited") {
       this.activePrompt = null;
     }
+  }
+
+  publishAgentConfig(config: AgentConfig): void {
+    this.agentConfig = config;
+    this.broadcast({ type: "agent.config", config });
   }
 
   publishWorkspaceDiff(diff: WorkspaceDiff): void {
@@ -297,6 +305,8 @@ export class RoomRelay {
       participantId: state.participant.id,
       participantName: state.participant.name,
       text: parsed.data.text,
+      ...(parsed.data.model ? { model: parsed.data.model } : {}),
+      ...(parsed.data.effort ? { effort: parsed.data.effort } : {}),
       submittedAt: new Date().toISOString(),
     };
     this.enqueue(prompt);
@@ -323,6 +333,7 @@ export class RoomRelay {
       latestDiff: this.latestDiff,
       latestCheckpoint: this.latestCheckpoint,
       collabHistory: [],
+      ...(this.agentConfig ? { agentConfig: this.agentConfig } : {}),
     });
     this.broadcast({ type: "participant.joined", participant }, socket);
   }

@@ -161,11 +161,11 @@ export class CollaborationBridge implements vscode.Disposable {
   dispose(): void { this.disconnect(); this.statusChanged.dispose(); for (const decoration of this.presenceDecorations.values()) decoration.dispose(); this.presenceDecorations.clear(); this.previewOutput.dispose(); for (const disposable of this.disposables) disposable.dispose(); }
   async showPreview(): Promise<void> { await vscode.window.showTextDocument(this.previewUri, { preview: false, viewColumn: vscode.ViewColumn.Beside }); }
   async showProposal(): Promise<void> { await vscode.window.showTextDocument(this.proposalUri, { preview: false, viewColumn: vscode.ViewColumn.Beside }); }
-  sendPrompt(text: string): boolean {
+  sendPrompt(text: string, settings: { model?: string; effort?: string } = {}): boolean {
     if (!this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
     const promptId = crypto.randomUUID(); const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", this.promptKey, nonce); cipher.setAAD(Buffer.from(`prompt:${promptId}`)); const ciphertext = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
     const sealed = JSON.stringify({ version: 1, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") });
-    this.socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: sealed })); return true;
+    this.socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: sealed, ...settings })); return true;
   }
 
   resolveApproval(requestId: string | number, decision: ApprovalDecision): boolean {

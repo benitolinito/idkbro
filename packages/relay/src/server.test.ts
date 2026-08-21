@@ -71,13 +71,18 @@ describe("RelayServer", () => {
     participant.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" }));
     expect((await participant.messages.next("room.welcome")).participants.map((value) => value.name)).toEqual(["Ada", "Grace"]);
     const joined = await host.messages.next("participant.joined"); expect(joined.participant.name).toBe("Grace");
+    host.socket.send(JSON.stringify({
+      type: "relay.agent.config",
+      config: { model: "gpt-5.6-sol", effort: "medium", models: [] },
+    }));
+    expect(await participant.messages.next("agent.config")).toMatchObject({ config: { model: "gpt-5.6-sol", effort: "medium" } });
     host.socket.send(JSON.stringify({ type: "relay.participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "editor", "prompter", "reviewer"] }));
     expect(await participant.messages.next("participant.capabilities")).toMatchObject({ participantId: joined.participant.id, capabilities: expect.arrayContaining(["reviewer"]) });
 
-    participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Fix the test" }));
+    participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Fix the test", model: "gpt-5.6-terra", effort: "high" }));
     await participant.messages.next("prompt.queued");
     const prompt = await host.messages.next("prompt.started");
-    expect(prompt.prompt).toMatchObject({ participantName: "Grace", text: "Fix the test" });
+    expect(prompt.prompt).toMatchObject({ participantName: "Grace", text: "Fix the test", model: "gpt-5.6-terra", effort: "high" });
 
     host.socket.send(JSON.stringify({
       type: "relay.agent.event",

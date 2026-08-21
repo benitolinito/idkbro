@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { controllerActionSchema, parseApprovalRequestId, roomEventSchema } from "./index.js";
+import { controllerActionSchema, parseApprovalRequestId, roomClientMessageSchema, roomEventSchema } from "./index.js";
 
 describe("room protocol", () => {
   it("accepts a valid append-only event", () => {
@@ -34,5 +34,15 @@ describe("room protocol", () => {
     expect(parseApprovalRequestId("91")).toBe(91);
     expect(parseApprovalRequestId("approval-91")).toBe("approval-91");
     expect(parseApprovalRequestId("091")).toBe("091");
+  });
+
+  it("accepts model and reasoning overrides on a prompt", () => {
+    expect(roomClientMessageSchema.parse({
+      type: "prompt.submit",
+      promptId: "prompt_1",
+      text: "Refactor the parser",
+      model: "gpt-5.6-sol",
+      effort: "high",
+    })).toMatchObject({ model: "gpt-5.6-sol", effort: "high" });
   });
 });

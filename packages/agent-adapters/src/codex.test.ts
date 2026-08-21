@@ -88,4 +88,30 @@ describe("normalizeCodexMessage", () => {
       text: "Inspecting\nImplementing",
     });
   });
+
+  it("passes per-turn model and reasoning overrides to Codex", async () => {
+    const writes: string[] = [];
+    const adapter = new CodexAppServerAdapter();
+    const internals = adapter as unknown as {
+      process: { stdin: { writable: boolean; write: (value: string) => void } };
+      threadId: string;
+      handleLine: (line: string) => void;
+    };
+    internals.process = { stdin: { writable: true, write: (value) => { writes.push(value); } } };
+    internals.threadId = "thr_1";
+
+    const result = adapter.sendPrompt({
+      promptId: "prompt_1",
+      text: "Fix the test",
+      model: "gpt-5.6-terra",
+      effort: "high",
+    });
+    const request = JSON.parse(writes[0] as string);
+    expect(request).toMatchObject({
+      method: "turn/start",
+      params: { threadId: "thr_1", model: "gpt-5.6-terra", effort: "high" },
+    });
+    internals.handleLine(JSON.stringify({ id: request.id, result: { turn: { id: "turn_1" } } }));
+    await expect(result).resolves.toEqual({ turnId: "turn_1" });
+  });
 });

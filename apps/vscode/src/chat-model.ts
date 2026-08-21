@@ -1,4 +1,4 @@
-import type { AgentEvent, QueuedPrompt, RoomParticipant, RoomServerMessage } from "@multicode/protocol";
+import type { AgentConfig, AgentEvent, QueuedPrompt, RoomParticipant, RoomServerMessage } from "@multicode/protocol";
 
 export type ConnectionState = "idle" | "starting" | "connected" | "stopping" | "error";
 export type TimelineKind = "user" | "assistant" | "reasoning" | "command" | "diff" | "system" | "error" | "approval";
@@ -33,6 +33,7 @@ export interface ChatSnapshot {
   participants: ParticipantView[];
   queue: Array<{ id: string; name: string; text: string }>;
   activePrompt?: { id: string; name: string; text: string };
+  agentConfig?: AgentConfig;
   timeline: TimelineItem[];
   canApprove: boolean;
   canReturnToStart: boolean;
@@ -52,6 +53,7 @@ export class ChatModel {
   private readonly participants = new Map<string, RoomParticipant>();
   private queue: QueuedPrompt[] = [];
   private activePrompt: QueuedPrompt | undefined;
+  private agentConfig: AgentConfig | undefined;
   private selfId: string | undefined;
   private readonly timeline: TimelineItem[] = [];
   private readonly reasoningItems = new Map<string, { turnId: string; text: string; completed: boolean }>();
@@ -64,6 +66,7 @@ export class ChatModel {
     this.participants.clear();
     this.queue = [];
     this.activePrompt = undefined;
+    this.agentConfig = undefined;
     this.selfId = undefined;
     this.reasoningItems.clear();
     this.timeline.splice(0);
@@ -88,6 +91,7 @@ export class ChatModel {
     this.participants.clear();
     this.queue = [];
     this.activePrompt = undefined;
+    this.agentConfig = undefined;
     this.selfId = undefined;
     this.reasoningItems.clear();
     this.add("system", message);
@@ -101,6 +105,7 @@ export class ChatModel {
     this.participants.clear();
     this.queue = [];
     this.activePrompt = undefined;
+    this.agentConfig = undefined;
     this.selfId = undefined;
     this.reasoningItems.clear();
     this.timeline.splice(0);
@@ -126,6 +131,7 @@ export class ChatModel {
         for (const participant of message.participants) this.participants.set(participant.id, participant);
         this.queue = [...message.queue];
         this.activePrompt = message.activePrompt ?? undefined;
+        this.agentConfig = message.agentConfig;
         if (message.activePrompt) this.addPrompt(message.activePrompt);
         this.add("system", `Connected to room ${message.roomId}`);
         break;
@@ -154,6 +160,9 @@ export class ChatModel {
         this.queue = this.queue.filter((prompt) => prompt.promptId !== message.prompt.promptId);
         this.activePrompt = message.prompt;
         this.addPrompt(message.prompt);
+        break;
+      case "agent.config":
+        this.agentConfig = message.config;
         break;
       case "agent.event":
         this.handleAgent(message.event);
@@ -191,9 +200,20 @@ export class ChatModel {
       participants: [...byName.values()].sort((a, b) => Number(b.host) - Number(a.host) || a.name.localeCompare(b.name)),
       queue: this.queue.map(promptView),
       ...(this.activePrompt ? { activePrompt: promptView(this.activePrompt) } : {}),
+      ...(this.agentConfig ? { agentConfig: this.cloneAgentConfig(this.agentConfig) } : {}),
       timeline: this.timeline.map((item) => ({ ...item, ...(item.approval ? { approval: { ...item.approval } } : {}) })),
       canApprove: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("reviewer")),
       canReturnToStart: this.connection === "idle" && this.timeline.length > 0,
+    };
+  }
+
+  private cloneAgentConfig(config: AgentConfig): AgentConfig {
+    return {
+      ...config,
+      models: config.models.map((model) => ({
+        ...model,
+        supportedReasoningEfforts: model.supportedReasoningEfforts.map((option) => ({ ...option })),
+      })),
     };
   }
 

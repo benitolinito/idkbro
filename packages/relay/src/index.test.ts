@@ -75,14 +75,20 @@ describe("RoomRelay", () => {
       onCollaborationEvent: async (_participant, event) => event,
     });
     relays.push(relay);
+    relay.publishAgentConfig({
+      model: "gpt-5.6-sol",
+      effort: "medium",
+      models: [{ id: "sol", model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Balanced" }, { reasoningEffort: "high", description: "Deeper" }] }],
+    });
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
     const client = await connect(port, "secret-token", "Grace");
     sockets.push(client.socket);
+    expect(client.welcome.agentConfig).toMatchObject({ model: "gpt-5.6-sol", effort: "medium" });
 
-    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "First" }));
+    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "First", model: "gpt-5.6-sol", effort: "high" }));
     await client.messages.next("prompt.queued");
     const first = await client.messages.next("prompt.started");
-    expect(first.prompt).toMatchObject({ participantName: "Grace", text: "First" });
+    expect(first.prompt).toMatchObject({ participantName: "Grace", text: "First", model: "gpt-5.6-sol", effort: "high" });
 
     client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Second" }));
     const queued = await client.messages.next("prompt.queued");

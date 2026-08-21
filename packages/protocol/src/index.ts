@@ -80,6 +80,24 @@ export type ControllerAction = z.infer<typeof controllerActionSchema>;
 export interface AgentPrompt {
   promptId: string;
   text: string;
+  model?: string;
+  effort?: string;
+}
+
+export interface AgentModel {
+  id: string;
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  defaultReasoningEffort: string;
+  supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>;
+}
+
+export interface AgentConfig {
+  models: AgentModel[];
+  model?: string;
+  effort?: string;
 }
 
 export type ApprovalDecision = "accept" | "decline" | "cancel";
@@ -112,6 +130,7 @@ export type AgentEvent =
 export interface AgentStartOptions {
   cwd: string;
   model?: string;
+  effort?: string;
 }
 
 export interface AgentAdapter {
@@ -134,6 +153,8 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("prompt.submit"),
     promptId: z.string().min(1),
     text: z.string().trim().min(1).max(200_000),
+    model: z.string().trim().min(1).max(128).optional(),
+    effort: z.string().trim().min(1).max(32).optional(),
   }),
   z.object({
     type: z.literal("workspace.ack"),
@@ -195,6 +216,25 @@ export const workspaceCheckpointChunkSchema = z.object({
   data: z.string().min(1).max(Math.ceil(checkpointChunkBytes / 3) * 4),
 });
 
+const agentModelSchema = z.object({
+  id: z.string().min(1).max(128),
+  model: z.string().min(1).max(128),
+  displayName: z.string().min(1).max(128),
+  description: z.string().max(1_000),
+  isDefault: z.boolean(),
+  defaultReasoningEffort: z.string().min(1).max(32),
+  supportedReasoningEfforts: z.array(z.object({
+    reasoningEffort: z.string().min(1).max(32),
+    description: z.string().max(500),
+  })).max(16),
+});
+
+const agentConfigSchema = z.object({
+  models: z.array(agentModelSchema).max(100),
+  model: z.string().min(1).max(128).optional(),
+  effort: z.string().min(1).max(32).optional(),
+});
+
 export const relayHostMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("relay.room.create"),
@@ -209,6 +249,12 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("prompt.submit"),
     promptId: z.string().min(1),
     text: z.string().trim().min(1).max(200_000),
+    model: z.string().trim().min(1).max(128).optional(),
+    effort: z.string().trim().min(1).max(32).optional(),
+  }),
+  z.object({
+    type: z.literal("relay.agent.config"),
+    config: agentConfigSchema,
   }),
   z.object({
     type: z.literal("relay.agent.event"),
@@ -286,6 +332,8 @@ export interface QueuedPrompt {
   participantId: string;
   participantName: string;
   text: string;
+  model?: string;
+  effort?: string;
   submittedAt: string;
 }
 
@@ -328,7 +376,8 @@ export type RelayHostMessage =
       name: string;
     }
   | { type: "relay.room.resume"; roomId: string; resumeToken: string }
-  | { type: "prompt.submit"; promptId: string; text: string }
+  | { type: "prompt.submit"; promptId: string; text: string; model?: string; effort?: string }
+  | { type: "relay.agent.config"; config: AgentConfig }
   | { type: "relay.agent.event"; event: AgentEvent }
   | { type: "relay.agent.encrypted"; eventType: string; status?: string; payload: string }
   | { type: "relay.workspace.diff"; diff: WorkspaceDiff }
@@ -368,12 +417,14 @@ export type RoomServerMessage =
       latestDiff: WorkspaceDiff | null;
       latestCheckpoint: WorkspaceCheckpointDescriptor | WorkspaceCheckpoint | null;
       collabHistory: CollaborationEvent[];
+      agentConfig?: AgentConfig;
     }
   | { type: "participant.joined"; participant: RoomParticipant }
   | { type: "participant.left"; participantId: string; name: string }
   | { type: "participant.capabilities"; participantId: string; capabilities: Capability[] }
   | { type: "prompt.queued"; prompt: QueuedPrompt; position: number }
   | { type: "prompt.started"; prompt: QueuedPrompt }
+  | { type: "agent.config"; config: AgentConfig }
   | { type: "agent.event"; event: AgentEvent }
   | { type: "agent.encrypted"; eventType: string; status?: string; payload: string }
   | { type: "workspace.diff"; diff: WorkspaceDiff }

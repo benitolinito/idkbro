@@ -3,6 +3,8 @@ import { createInterface } from "node:readline";
 import type {
   AgentAdapter,
   AgentEvent,
+  AgentConfig,
+  AgentModel,
   AgentPrompt,
   AgentStartOptions,
   ApprovalDecision,
@@ -63,6 +65,35 @@ function string(value: unknown): string | undefined {
 
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" ? value : null;
+}
+
+function codexModels(result: JsonObject): AgentModel[] {
+  if (!Array.isArray(result.data)) return [];
+  return result.data.flatMap((value) => {
+    const model = object(value);
+    const id = string(model?.id);
+    const slug = string(model?.model);
+    const displayName = string(model?.displayName);
+    const defaultReasoningEffort = string(model?.defaultReasoningEffort);
+    if (!id || !slug || !displayName || !defaultReasoningEffort) return [];
+    const supportedReasoningEfforts = Array.isArray(model?.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts.flatMap((option) => {
+          const item = object(option);
+          const reasoningEffort = string(item?.reasoningEffort);
+          if (!reasoningEffort) return [];
+          return [{ reasoningEffort, description: string(item?.description) ?? "" }];
+        })
+      : [];
+    return [{
+      id,
+      model: slug,
+      displayName,
+      description: string(model?.description) ?? "",
+      isDefault: model?.isDefault === true,
+      defaultReasoningEffort,
+      supportedReasoningEfforts,
+    }];
+  });
 }
 
 export function normalizeCodexMessage(message: JsonRpcMessage): AgentEvent | undefined {
@@ -193,6 +224,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private nextRequestId = 1;
   private threadId: string | undefined;
   private activeTurnId: string | undefined;
+  private config: AgentConfig = { models: [] };
 
   constructor(private readonly executable = "codex") {}
 
@@ -224,17 +256,44 @@ export class CodexAppServerAdapter implements AgentAdapter {
     });
     this.notify("initialized", {});
 
+    let models: AgentModel[] = [];
+    try {
+      models = codexModels(await this.request("model/list", {}));
+    } catch {
+      // Older app-server versions do not expose the model catalog. The
+      // configured model remains usable even when picker metadata is absent.
+    }
+
     const result = await this.request("thread/start", {
       cwd: options.cwd,
       ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
     });
     const thread = object(result.thread);
     const threadId = string(thread?.id);
     if (!threadId) throw new Error("Codex thread/start returned no thread ID");
 
     this.threadId = threadId;
+    const selectedModel = options.model ?? string(thread?.model) ?? models.find((model) => model.isDefault)?.model;
+    const selectedDefinition = models.find((model) => model.model === selectedModel);
+    const selectedEffort = options.effort ?? string(thread?.reasoningEffort) ?? selectedDefinition?.defaultReasoningEffort;
+    this.config = {
+      models,
+      ...(selectedModel ? { model: selectedModel } : {}),
+      ...(selectedEffort ? { effort: selectedEffort } : {}),
+    };
     this.eventQueue.push({ type: "agent.started", threadId });
     return { threadId };
+  }
+
+  configuration(): AgentConfig {
+    return {
+      ...this.config,
+      models: this.config.models.map((model) => ({
+        ...model,
+        supportedReasoningEfforts: model.supportedReasoningEfforts.map((option) => ({ ...option })),
+      })),
+    };
   }
 
   async sendPrompt(prompt: AgentPrompt): Promise<{ turnId: string }> {
@@ -246,6 +305,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       clientUserMessageId: prompt.promptId,
       input: [{ type: "text", text: prompt.text }],
       summary: "auto",
+      ...(prompt.model ? { model: prompt.model } : {}),
+      ...(prompt.effort ? { effort: prompt.effort } : {}),
     });
     const turn = object(result.turn);
     const turnId = string(turn?.id);

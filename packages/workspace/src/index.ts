@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import type { WorkspaceCheckpoint } from "@multicode/protocol";
 
 const execFileAsync = promisify(execFile);
+const maxCollaborativeTextBytes = 96 * 1024;
 
 export interface RepositoryInfo {
   root: string;
@@ -873,7 +874,14 @@ export async function cleanupParticipantWorkspace(options: {
 }
 
 export interface AgentTurnSnapshot { commit: string; sequence: number }
-export interface WorkspaceChange { operation: "create" | "update" | "delete" | "rename"; path: string; sourcePath?: string; content?: string }
+export interface WorkspaceChange {
+  operation: "create" | "update" | "delete" | "rename";
+  path: string;
+  sourcePath?: string;
+  content?: string;
+  /** False when Git should project the change but live Yjs collaboration cannot safely carry it. */
+  collaborative?: boolean;
+}
 export interface PendingWorkspaceProposal { version: 1; sequence: number; roomId: string; baseCommit: string; agentCommit: string; humanCommit: string; patchPath: string; createdAt: string; status: "pending" }
 
 async function captureSnapshotCommit(options: { cwd: string; roomId: string; sequence: number; baseCommit: string; parentCommit: string }): Promise<string> {
@@ -926,16 +934,16 @@ async function gitRaw(cwd: string, args: string[]): Promise<string> {
   return (await execFileAsync("git", args, { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 })).stdout;
 }
 
-async function readTreeText(cwd: string, treeId: string, filePath: string): Promise<string> {
+async function readTreeCollaborativeText(cwd: string, treeId: string, filePath: string): Promise<{ content: string } | { collaborative: false }> {
   const contents = await new Promise<Buffer>((resolve, reject) => {
     execFile("git", ["show", `${treeId}:${filePath}`], { cwd, encoding: "buffer", maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) { reject(new Error(Buffer.from(stderr).toString("utf8") || error.message)); return; }
       resolve(Buffer.from(stdout));
     });
   });
-  if (contents.byteLength > 96 * 1024) throw new Error(`Agent result for ${filePath} exceeds the collaborative text limit`);
-  try { return new TextDecoder("utf-8", { fatal: true }).decode(contents); }
-  catch { throw new Error(`Agent result for ${filePath} is not collaborative UTF-8 text`); }
+  if (contents.byteLength > maxCollaborativeTextBytes) return { collaborative: false };
+  try { return { content: new TextDecoder("utf-8", { fatal: true }).decode(contents) }; }
+  catch { return { collaborative: false }; }
 }
 
 export async function mergeAgentWorkspace(options: {
@@ -946,7 +954,7 @@ export async function mergeAgentWorkspace(options: {
   baseCommit: string;
   turn: AgentTurnSnapshot;
   withCommitLock: <T>(operation: () => Promise<T>) => Promise<T>;
-  /** Journal and materialize the merged changes while the workspace lock is held. */
+  /** Journal the merged changes while the workspace lock is held. The Git patch is already visible in the shared checkout. */
   onCommitted?: (changes: WorkspaceChange[]) => Promise<void>;
 }): Promise<{ status: "unchanged" | "merged" | "conflicted"; proposalPath?: string; changes?: WorkspaceChange[] }> {
   await verifyOwnedHostWorktrees(options.sharedPath, options.agentPath, options.roomId);
@@ -973,19 +981,27 @@ export async function mergeAgentWorkspace(options: {
       const status = fields[index++] as string;
       if (status.startsWith("R")) {
         const sourcePath = fields[index++] as string; const destinationPath = fields[index++] as string;
-        changes.push({ operation: "rename", sourcePath, path: destinationPath, content: await readTreeText(options.sharedPath, mergedTree, destinationPath) });
+        const text = await readTreeCollaborativeText(options.sharedPath, mergedTree, destinationPath);
+        changes.push({ operation: "rename", sourcePath, path: destinationPath, ...text });
       }
       else {
         const filePath = fields[index++] as string; const operation = status === "A" ? "create" : status === "D" ? "delete" : "update";
-        changes.push({ operation, path: filePath, ...(operation !== "delete" ? { content: await readTreeText(options.sharedPath, mergedTree, filePath) } : {}) });
+        if (operation === "delete") changes.push({ operation, path: filePath });
+        else changes.push({ operation, path: filePath, ...await readTreeCollaborativeText(options.sharedPath, mergedTree, filePath) });
       }
     }
     const applied = await options.withCommitLock(async () => {
       const verification = await captureSnapshotCommit({ cwd: options.sharedPath, roomId: `${options.roomId}-merge-verify`, sequence: options.turn.sequence + attempt, baseCommit: options.baseCommit, parentCommit: humanCommit });
       if (await tree(options.sharedPath, verification) !== await tree(options.sharedPath, humanCommit)) return false;
       await applyPatch(options.sharedPath, patchText, true);
-      if (options.onCommitted) await options.onCommitted(changes);
-      else await applyPatch(options.sharedPath, patchText, false);
+      await applyPatch(options.sharedPath, patchText, false);
+      try {
+        if (options.onCommitted) await options.onCommitted(changes);
+      } catch (error) {
+        try { await applyPatch(options.sharedPath, patchText, false, true); }
+        catch (rollbackError) { throw new AggregateError([error, rollbackError], "Workspace commit failed and its Git projection could not be rolled back"); }
+        throw error;
+      }
       return true;
     });
     if (applied) return { status: "merged", changes };

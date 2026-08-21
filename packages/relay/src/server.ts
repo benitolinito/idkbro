@@ -6,6 +6,7 @@ import {
   relayHostMessageSchema,
   roomClientMessageSchema,
   checkpointChunkBytes,
+  type AgentConfig,
   type AgentEvent,
   type QueuedPrompt,
   type RelayHostMessage,
@@ -94,6 +95,7 @@ class CentralRoom {
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
   private latestCheckpoint: WorkspaceCheckpointDescriptor | null = null;
+  private agentConfig: AgentConfig | undefined;
   private readonly checkpointTransfers = new Map<string, {
     descriptor: WorkspaceCheckpointDescriptor;
     targetParticipantId?: string;
@@ -138,7 +140,7 @@ class CentralRoom {
     if (this.closed) { reject(socket, "Room is closed", 4004); return; }
     if (this.hostSocket.readyState === WebSocket.OPEN) this.hostSocket.close(4000, "Host connection replaced");
     this.hostSocket = socket; this.attachHost(socket);
-    send(socket, { type: "room.welcome", roomId: this.roomId, selfId: this.host.id, participants: [this.host, ...this.participants.values()], activePrompt: this.activePrompt, queue: [...this.queue], latestDiff: this.latestDiff, latestCheckpoint: this.latestCheckpoint, collabHistory: [...this.collabHistory] });
+    send(socket, { type: "room.welcome", roomId: this.roomId, selfId: this.host.id, participants: [this.host, ...this.participants.values()], activePrompt: this.activePrompt, queue: [...this.queue], latestDiff: this.latestDiff, latestCheckpoint: this.latestCheckpoint, collabHistory: [...this.collabHistory], ...(this.agentConfig ? { agentConfig: this.agentConfig } : {}) });
   }
 
   private attachHost(socket: WebSocket): void {
@@ -216,6 +218,7 @@ class CentralRoom {
       latestDiff: this.latestDiff,
       latestCheckpoint: this.latestCheckpoint,
       collabHistory: [...this.collabHistory],
+      ...(this.agentConfig ? { agentConfig: this.agentConfig } : {}),
     });
     this.broadcast({ type: "participant.joined", participant }, socket);
 
@@ -293,6 +296,8 @@ class CentralRoom {
       participantId: participant.id,
       participantName: participant.name,
       text: participantMessage.text,
+      ...(participantMessage.model ? { model: participantMessage.model } : {}),
+      ...(participantMessage.effort ? { effort: participantMessage.effort } : {}),
       submittedAt: new Date().toISOString(),
     });
   }
@@ -318,8 +323,14 @@ class CentralRoom {
           participantId: this.host.id,
           participantName: this.host.name,
           text: message.text,
+          ...(message.model ? { model: message.model } : {}),
+          ...(message.effort ? { effort: message.effort } : {}),
           submittedAt: new Date().toISOString(),
         });
+        break;
+      case "relay.agent.config":
+        this.agentConfig = message.config;
+        this.broadcast({ type: "agent.config", config: message.config }, this.hostSocket);
         break;
       case "relay.agent.event":
         if (!agentEventTypes.has(message.event.type)) {

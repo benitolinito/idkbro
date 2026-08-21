@@ -42,12 +42,17 @@ class MultiCodeController implements vscode.Disposable {
       host: () => this.host(),
       join: (token) => this.join(token),
       stop: () => this.stop(),
-      submit: (text) => this.submitPrompt(text),
+      submit: (text, settings) => this.submitPrompt(text, settings),
       approve: (requestId, decision) => this.resolveApproval(requestId, decision),
       copyInvite: () => this.copyInvite(),
       openOutput: () => this.openOutput(),
     });
-    this.collaboration = new CollaborationBridge((message) => this.chat.handle(message));
+    this.collaboration = new CollaborationBridge((message) => {
+      this.chat.handle(message);
+      if (message.type === "agent.event" && message.event.type === "turn.completed") {
+        void vscode.commands.executeCommand("git.refresh");
+      }
+    });
     this.status.name = "MultiCode";
     this.status.command = "multicode.host";
     this.setIdle();
@@ -153,10 +158,10 @@ class MultiCodeController implements vscode.Disposable {
     if (prompt?.trim()) await this.submitPrompt(prompt);
   }
 
-  async submitPrompt(text: string): Promise<void> {
+  async submitPrompt(text: string, settings: { model?: string; effort?: string } = {}): Promise<void> {
     const prompt = text.trim();
     if (!prompt) return;
-    if (this.roomWorkspaceReady && this.collaboration.sendPrompt(prompt)) return;
+    if (this.roomWorkspaceReady && this.collaboration.sendPrompt(prompt, settings)) return;
     if (!this.process?.stdin.writable) {
       void vscode.window.showWarningMessage("MultiCode is reconnecting; the prompt was not sent.");
       return;

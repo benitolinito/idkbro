@@ -10,7 +10,7 @@ export interface ChatActions {
   host(): void | Promise<void>;
   join(token?: string): void | Promise<void>;
   stop(): void | Promise<void>;
-  submit(text: string): void | Promise<void>;
+  submit(text: string, settings: { model?: string; effort?: string }): void | Promise<void>;
   approve(requestId: string | number, decision: ApprovalDecision): void | Promise<void>;
   copyInvite(): void | Promise<void>;
   openOutput(): void | Promise<void>;
@@ -22,7 +22,7 @@ type WebviewMessage =
   | { type: "host" }
   | { type: "join"; token?: string }
   | { type: "stop" }
-  | { type: "submit"; text?: string }
+  | { type: "submit"; text?: string; model?: string; effort?: string }
   | { type: "approval"; requestId?: string | number; decision?: ApprovalDecision }
   | { type: "copyInvite" }
   | { type: "openOutput" }
@@ -95,7 +95,10 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       }
       case "submit": {
         const text = message.text?.trim();
-        if (text) await this.actions.submit(text);
+        if (text) await this.actions.submit(text, {
+          ...(message.model?.trim() ? { model: message.model.trim() } : {}),
+          ...(message.effort?.trim() ? { effort: message.effort.trim() } : {}),
+        });
         break;
       }
     }
@@ -135,7 +138,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     :root { color-scheme: light dark; }
     * { box-sizing: border-box; }
     body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); font: 13px/1.45 var(--vscode-font-family); overflow: hidden; }
-    button, textarea, input { font: inherit; }
+    button, textarea, input, select { font: inherit; }
     button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 5px; padding: 7px 11px; cursor: pointer; }
     button:hover { background: var(--vscode-button-hoverBackground); }
     button.secondary { color: var(--vscode-foreground); background: var(--vscode-button-secondaryBackground); }
@@ -234,7 +237,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     textarea { display: block; width: 100%; min-height: 48px; max-height: 150px; resize: none; border: 0; padding: 1px; }
     textarea:focus, input:focus { border-color: var(--vscode-focusBorder); }
     .composerbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
-    .hint { color: var(--vscode-descriptionForeground); font-size: 10px; }
+    .pickers { display: flex; align-items: center; min-width: 0; gap: 2px; }
+    .picker { min-width: 0; max-width: 150px; color: var(--vscode-descriptionForeground); background: transparent; border: 0; border-radius: 5px; padding: 3px 20px 3px 5px; outline: none; cursor: pointer; font-size: 11px; text-overflow: ellipsis; }
+    .picker:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+    .picker:focus { color: var(--vscode-foreground); outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+    .picker:disabled { opacity: .5; cursor: default; }
+    #effort { max-width: 105px; }
     .send { min-width: 34px; border-radius: 7px; font-weight: 700; }
   </style>
 </head>
@@ -249,14 +257,23 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     <footer>
       <div class="composer">
         <textarea id="prompt" placeholder="Ask Codex or describe a change…" aria-label="Prompt"></textarea>
-        <div class="composerbar"><span class="hint">Enter to send · Shift+Enter for a new line</span><button id="send" class="send" title="Send prompt">↑</button></div>
+        <div class="composerbar">
+          <div class="pickers">
+            <select id="model" class="picker" aria-label="Model" title="Model"></select>
+            <select id="effort" class="picker" aria-label="Reasoning level" title="Reasoning level"></select>
+          </div>
+          <button id="send" class="send" title="Send prompt (Enter)">↑</button>
+        </div>
       </div>
     </footer>
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const elements = Object.fromEntries(['dot','back','room','people','queue','conversation','prompt','send','copy','stop','output'].map(id => [id, document.getElementById(id)]));
+    const elements = Object.fromEntries(['dot','back','room','people','queue','conversation','prompt','model','effort','send','copy','stop','output'].map(id => [id, document.getElementById(id)]));
     let state = { connection: 'idle', participants: [], queue: [], timeline: [] };
+    const savedComposer = vscode.getState() || {};
+    let selectedModel = typeof savedComposer.model === 'string' ? savedComposer.model : '';
+    let selectedEffort = typeof savedComposer.effort === 'string' ? savedComposer.effort : '';
     let joinVisible = false;
     const expandedActivities = new Set();
     const collapsedActivities = new Set();
@@ -279,6 +296,48 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const compact = (command || 'command').replace(/\\s+/g, ' ').trim();
       return compact.length > 72 ? compact.slice(0, 69) + '…' : compact;
     };
+
+    const effortLabel = effort => ({ none: 'None', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' })[effort] || effort;
+    const rememberComposer = () => vscode.setState({ model: selectedModel, effort: selectedEffort });
+
+    function renderModelControls() {
+      const config = state.agentConfig;
+      const models = Array.isArray(config?.models) ? config.models : [];
+      if (!selectedModel) selectedModel = config?.model || models.find(model => model.isDefault)?.model || models[0]?.model || '';
+      if (models.length && !models.some(model => model.model === selectedModel)) selectedModel = config?.model || models.find(model => model.isDefault)?.model || models[0]?.model || '';
+
+      elements.model.replaceChildren();
+      if (!models.length) {
+        const option = node('option', '', config?.model || 'Default model'); option.value = config?.model || '';
+        elements.model.append(option);
+      } else {
+        for (const model of models) {
+          const option = node('option', '', model.displayName); option.value = model.model; option.title = model.description || model.displayName;
+          elements.model.append(option);
+        }
+      }
+      elements.model.value = selectedModel;
+      elements.model.title = models.find(model => model.model === selectedModel)?.description || 'Model';
+
+      const selected = models.find(model => model.model === selectedModel);
+      const efforts = selected?.supportedReasoningEfforts?.length
+        ? selected.supportedReasoningEfforts
+        : ['low', 'medium', 'high', 'xhigh'].map(reasoningEffort => ({ reasoningEffort, description: '' }));
+      if (!selectedEffort || !efforts.some(option => option.reasoningEffort === selectedEffort)) {
+        selectedEffort = (selectedModel === config?.model ? config?.effort : undefined) || selected?.defaultReasoningEffort || efforts[0]?.reasoningEffort || '';
+      }
+      elements.effort.replaceChildren();
+      for (const effort of efforts) {
+        const option = node('option', '', effortLabel(effort.reasoningEffort)); option.value = effort.reasoningEffort; option.title = effort.description || effortLabel(effort.reasoningEffort);
+        elements.effort.append(option);
+      }
+      elements.effort.value = selectedEffort;
+      elements.effort.title = efforts.find(option => option.reasoningEffort === selectedEffort)?.description || 'Reasoning level';
+      const enabled = state.connection === 'connected';
+      elements.model.disabled = !enabled || (!models.length && !config?.model);
+      elements.effort.disabled = !enabled || !config || !efforts.length;
+      rememberComposer();
+    }
 
     function renderPeople() {
       elements.people.replaceChildren();
@@ -460,13 +519,17 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const enabled = state.connection === 'connected';
       elements.prompt.disabled = !enabled;
       elements.send.disabled = !enabled || !elements.prompt.value.trim();
-      renderPeople(); renderQueue(); renderConversation();
+      renderModelControls(); renderPeople(); renderQueue(); renderConversation();
     }
 
     function submitPrompt() {
       const text = elements.prompt.value.trim();
       if (!text || state.connection !== 'connected') return;
-      post('submit', { text }); elements.prompt.value = ''; elements.prompt.style.height = ''; elements.send.disabled = true;
+      post('submit', {
+        text,
+        model: state.agentConfig && selectedModel ? selectedModel : undefined,
+        effort: state.agentConfig && selectedEffort ? selectedEffort : undefined,
+      }); elements.prompt.value = ''; elements.prompt.style.height = ''; elements.send.disabled = true;
     }
 
     elements.prompt.addEventListener('input', () => {
@@ -474,6 +537,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       elements.send.disabled = state.connection !== 'connected' || !elements.prompt.value.trim();
     });
     elements.prompt.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitPrompt(); } });
+    elements.model.addEventListener('change', () => { selectedModel = elements.model.value; selectedEffort = ''; renderModelControls(); });
+    elements.effort.addEventListener('change', () => { selectedEffort = elements.effort.value; rememberComposer(); });
     elements.send.onclick = submitPrompt;
     elements.back.onclick = () => { joinVisible = false; post('back'); };
     elements.copy.onclick = () => post('copyInvite');

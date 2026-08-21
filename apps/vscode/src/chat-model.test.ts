@@ -51,6 +51,25 @@ describe("ChatModel", () => {
     expect(state.timeline.filter((item) => item.kind === "user")).toHaveLength(1);
   });
 
+  it("exposes the Codex model catalog and current reasoning level", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    model.handle({
+      type: "agent.config",
+      config: {
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        models: [{ id: "sol", model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Balanced" }]}],
+      },
+    });
+
+    expect(model.snapshot().agentConfig).toMatchObject({
+      model: "gpt-5.6-sol",
+      effort: "medium",
+      models: [expect.objectContaining({ displayName: "GPT-5.6 Sol" })],
+    });
+  });
+
   it("streams reasoning, assistant messages, commands, and completion", () => {
     const model = new ChatModel();
     model.handle(welcome());
