@@ -39,7 +39,7 @@ build and install it from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.4.1.vsix
+code --install-extension apps/vscode/multicode-vscode-0.4.2.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
@@ -182,7 +182,7 @@ curl https://multicode.luisagd.com/health
 Expected response:
 
 ```json
-{"ok":true,"rooms":0,"uptimeSeconds":12}
+{ "ok": true, "rooms": 0, "uptimeSeconds": 12 }
 ```
 
 ### Relay operations
@@ -275,15 +275,15 @@ The workflow runs all checks and publishes the packaged VSIX when that version
 does not already exist on the repository's Releases page. Further commits at
 the same version only produce temporary Actions artifacts.
 
-| Package | Responsibility |
-| --- | --- |
-| `@multicode/cli` | Host daemon/controller and authenticated thin-client commands |
-| `@multicode/protocol` | Shared schemas and event types |
-| `@multicode/session-core` | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC |
-| `@multicode/workspace` | Safe worktrees, bootstrap checkpoints, B/A/H merges, proposals, and transactional application |
-| `@multicode/agent-adapters` | Codex app-server integration |
-| `@multicode/relay` | Embedded and standalone WebSocket relays |
-| `multicode-vscode` | VS Code commands, session output, and status-bar controls |
+| Package                     | Responsibility                                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------------------------- |
+| `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                     |
+| `@multicode/protocol`       | Shared schemas and event types                                                                    |
+| `@multicode/session-core`   | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC |
+| `@multicode/workspace`      | Safe worktrees, bootstrap checkpoints, B/A/H merges, proposals, and transactional application     |
+| `@multicode/agent-adapters` | Codex app-server integration                                                                      |
+| `@multicode/relay`          | Embedded and standalone WebSocket relays                                                          |
+| `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                         |
 
 ## Current limitations
 
