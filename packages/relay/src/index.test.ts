@@ -115,6 +115,39 @@ describe("RoomRelay", () => {
     expect(lateClient.welcome.participants.map((participant) => participant.name)).toEqual(["Ada", "Grace", "Linus"]);
   });
 
+  it("lets a prompt owner edit, steer, and remove queued prompts", async () => {
+    const steered: string[] = [];
+    const relay = new RoomRelay({
+      roomId: "room-queue",
+      token: "secret-token",
+      hostName: "Ada",
+      onPrompt: async () => undefined,
+      onSteer: async (queuedPrompt) => { steered.push(queuedPrompt.text); },
+      onCollaborationEvent: async (_participant, event) => event,
+    });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const client = await connect(port, "secret-token", "Grace");
+    sockets.push(client.socket);
+
+    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "active", text: "First" }));
+    await client.messages.next("prompt.queued");
+    await client.messages.next("prompt.started");
+    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "queued", text: "Original" }));
+    await client.messages.next("prompt.queued");
+
+    client.socket.send(JSON.stringify({ type: "prompt.update", promptId: "queued", text: "Steer with this" }));
+    expect((await client.messages.next("prompt.updated")).prompt.text).toBe("Steer with this");
+    client.socket.send(JSON.stringify({ type: "prompt.steer", promptId: "queued" }));
+    expect((await client.messages.next("prompt.steered")).prompt.promptId).toBe("queued");
+    expect(steered).toEqual(["Steer with this"]);
+
+    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "remove-me", text: "Remove me" }));
+    await client.messages.next("prompt.queued");
+    client.socket.send(JSON.stringify({ type: "prompt.remove", promptId: "remove-me" }));
+    expect((await client.messages.next("prompt.removed")).promptId).toBe("remove-me");
+  });
+
   it("rejects an invalid invite token", async () => {
     const relay = new RoomRelay({
       roomId: "room-1",

@@ -84,6 +84,20 @@ describe("RelayServer", () => {
     const prompt = await host.messages.next("prompt.started");
     expect(prompt.prompt).toMatchObject({ participantName: "Grace", text: "Fix the test", model: "gpt-5.6-terra", effort: "high" });
 
+    participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "queued-steer", text: "Original follow-up" }));
+    await participant.messages.next("prompt.queued");
+    participant.socket.send(JSON.stringify({ type: "prompt.update", promptId: "queued-steer", text: "Use the focused fix" }));
+    expect((await participant.messages.next("prompt.updated")).prompt.text).toBe("Use the focused fix");
+    participant.socket.send(JSON.stringify({ type: "prompt.steer", promptId: "queued-steer" }));
+    expect((await host.messages.next("prompt.steer")).prompt.text).toBe("Use the focused fix");
+    host.socket.send(JSON.stringify({ type: "relay.prompt.steered", promptId: "queued-steer" }));
+    expect((await participant.messages.next("prompt.steered")).prompt.promptId).toBe("queued-steer");
+
+    participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "queued-remove", text: "Remove this" }));
+    await participant.messages.next("prompt.queued");
+    participant.socket.send(JSON.stringify({ type: "prompt.remove", promptId: "queued-remove" }));
+    expect((await participant.messages.next("prompt.removed")).promptId).toBe("queued-remove");
+
     host.socket.send(JSON.stringify({
       type: "relay.agent.event",
       event: { type: "agent.message.delta", threadId: "t1", turnId: "u1", itemId: "i1", text: "Working" },

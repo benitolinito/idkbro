@@ -205,6 +205,17 @@ function printRoomMessage(message: RoomServerMessage, includeAgent = true): void
     case "prompt.started":
       console.error(`\n${err.info("▶", `${err.label(message.prompt.participantName)}: ${message.prompt.text}`)}`);
       break;
+    case "prompt.updated":
+      console.error(`\n${err.info("✎", `${err.label(message.prompt.participantName)} updated a queued prompt: ${message.prompt.text}`)}`);
+      break;
+    case "prompt.removed":
+      console.error(`\n${err.muted(`− Queued prompt ${message.promptId} removed`)}`);
+      break;
+    case "prompt.steered":
+      console.error(`\n${err.info("↪", `${err.label(message.prompt.participantName)} steered: ${message.prompt.text}`)}`);
+      break;
+    case "prompt.steer":
+      break;
     case "agent.event":
       if (includeAgent) printAgentEvent(message.event);
       break;
@@ -224,7 +235,7 @@ function printRoomMessage(message: RoomServerMessage, includeAgent = true): void
 }
 
 function decryptPromptMessage(message: RoomServerMessage, key: Buffer): RoomServerMessage {
-  if (message.type === "prompt.queued" || message.type === "prompt.started") return { ...message, prompt: { ...message.prompt, text: openPrompt(key, message.prompt.promptId, message.prompt.text) } };
+  if (message.type === "prompt.queued" || message.type === "prompt.started" || message.type === "prompt.updated" || message.type === "prompt.steered" || message.type === "prompt.steer") return { ...message, prompt: { ...message.prompt, text: openPrompt(key, message.prompt.promptId, message.prompt.text) } };
   if (message.type !== "room.welcome") return message;
   return {
     ...message,
@@ -1037,6 +1048,10 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
         ...(prompt.effort ? { effort: prompt.effort } : {}),
       });
     },
+    onSteer: async (prompt) => {
+      let promptText = prompt.text; try { promptText = openPrompt(localTransportKey, prompt.promptId, prompt.text); } catch { /* Host-local input is already plaintext. */ }
+      await adapter.steer({ promptId: prompt.promptId, text: promptText });
+    },
     onCollaborationEvent: (participant, event) => authority.commit(participant.id, event),
     onApproval: async (_participant, requestId, decision) => adapter.resolveApproval(requestId, decision),
     onCheckpointRequest: (participantId, sequence) => {
@@ -1489,6 +1504,19 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         return;
       }
       if (message.type === "approval.submitted") { void adapter.resolveApproval(message.requestId, message.decision).catch((error: unknown) => console.error(err.error(`Approval failed: ${error instanceof Error ? error.message : String(error)}`))); return; }
+      if (message.type === "prompt.steer") {
+        void adapter.steer({
+          promptId: message.prompt.promptId,
+          text: openPrompt(relayTransportKey, message.prompt.promptId, message.prompt.text),
+        }).then(() => {
+          sendToRelay({ type: "relay.prompt.steered", promptId: message.prompt.promptId });
+        }).catch((error: unknown) => {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          sendToRelay({ type: "relay.prompt.steer.failed", promptId: message.prompt.promptId, message: errorMessage });
+          console.error(err.error(`Could not steer the active turn: ${errorMessage}`));
+        });
+        return;
+      }
       if (message.type === "prompt.started") {
         if (processedPromptIds.has(message.prompt.promptId)) { sendToRelay({ type: "relay.prompt.failed", promptId: message.prompt.promptId, message: "Duplicate prompt replay rejected" }); return; }
         processedPromptIds.add(message.prompt.promptId); if (processedPromptIds.size > 10_000) processedPromptIds.delete(processedPromptIds.keys().next().value as string);

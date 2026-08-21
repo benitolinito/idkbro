@@ -92,6 +92,7 @@ function reject(socket: WebSocket, message: string, code = 4003): void {
 class CentralRoom {
   private readonly participants = new Map<WebSocket, RoomParticipant>();
   private readonly queue: QueuedPrompt[] = [];
+  private readonly steeringPromptIds = new Set<string>();
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
   private latestCheckpoint: WorkspaceCheckpointDescriptor | null = null;
@@ -286,6 +287,34 @@ class CentralRoom {
       if (!participant.capabilities.includes("reviewer")) { send(socket, { type: "room.error", message: "Participant does not have reviewer capability" }); return; }
       send(this.hostSocket, { type: "approval.submitted", participantId: participant.id, requestId: participantMessage.requestId, decision: participantMessage.decision }); return;
     }
+    if (participantMessage.type === "prompt.update" || participantMessage.type === "prompt.remove" || participantMessage.type === "prompt.steer") {
+      if (!this.allowRate(socket, "queue", 60, 60_000)) { send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }
+      const index = this.queue.findIndex((prompt) => prompt.promptId === participantMessage.promptId);
+      const queued = this.queue[index];
+      if (!queued) { send(socket, { type: "room.error", message: "Queued prompt was not found" }); return; }
+      if (queued.participantId !== participant.id) { send(socket, { type: "room.error", message: "Only the prompt owner can change it" }); return; }
+      if (this.steeringPromptIds.has(queued.promptId)) { send(socket, { type: "room.error", message: "That prompt is already steering the active turn" }); return; }
+      if (participantMessage.type === "prompt.update") {
+        const updated: QueuedPrompt = {
+          ...queued,
+          text: participantMessage.text,
+          ...(participantMessage.model ? { model: participantMessage.model } : {}),
+          ...(participantMessage.effort ? { effort: participantMessage.effort } : {}),
+        };
+        this.queue[index] = updated;
+        this.broadcast({ type: "prompt.updated", prompt: updated });
+        return;
+      }
+      if (participantMessage.type === "prompt.remove") {
+        this.queue.splice(index, 1);
+        this.broadcast({ type: "prompt.removed", promptId: queued.promptId });
+        return;
+      }
+      if (!this.activePrompt) { send(socket, { type: "room.error", message: "There is no active turn to steer" }); return; }
+      this.steeringPromptIds.add(queued.promptId);
+      send(this.hostSocket, { type: "prompt.steer", prompt: queued });
+      return;
+    }
     if (!this.allowRate(socket, "prompt", 20, 60_000)) { send(socket, { type: "room.error", message: "Prompt rate limit exceeded" }); return; }
     if (!participant.capabilities.includes("prompter")) {
       send(socket, { type: "room.error", message: "Participant does not have prompter capability" });
@@ -374,6 +403,21 @@ class CentralRoom {
         if (this.activePrompt?.promptId !== message.promptId) return;
         this.broadcast({ type: "room.error", message: `Prompt failed on host: ${message.message}` });
         this.activePrompt = null;
+        this.dispatchNext();
+        break;
+      case "relay.prompt.steered": {
+        if (!this.steeringPromptIds.delete(message.promptId)) return;
+        const index = this.queue.findIndex((prompt) => prompt.promptId === message.promptId);
+        const prompt = this.queue[index];
+        if (!prompt) return;
+        this.queue.splice(index, 1);
+        this.broadcast({ type: "prompt.steered", prompt });
+        this.dispatchNext();
+        break;
+      }
+      case "relay.prompt.steer.failed":
+        if (!this.steeringPromptIds.delete(message.promptId)) return;
+        this.broadcast({ type: "room.error", message: `Could not steer the active turn: ${message.message}` });
         this.dispatchNext();
         break;
       case "relay.participant.capabilities": {
@@ -517,6 +561,7 @@ class CentralRoom {
 
   private dispatchNext(): void {
     if (this.closed || this.activePrompt || this.queue.length === 0) return;
+    if (this.steeringPromptIds.has(this.queue[0]?.promptId ?? "")) return;
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;

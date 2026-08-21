@@ -27,6 +27,7 @@ export interface RoomRelayOptions {
   token: string;
   hostName: string;
   onPrompt: (prompt: QueuedPrompt) => Promise<void>;
+  onSteer?: (prompt: QueuedPrompt) => Promise<void>;
   onCollaborationEvent: (participant: RoomParticipant, event: CollaborationEvent) => Promise<CollaborationEvent>;
   onApproval?: (participant: RoomParticipant, requestId: string | number, decision: ApprovalDecision) => Promise<void>;
   onCheckpointRequest?: (participantId: string, sequence: number) => Promise<void> | void;
@@ -49,6 +50,7 @@ export class RoomRelay {
   private server: WebSocketServer | undefined;
   private readonly connections = new Map<WebSocket, ConnectionState>();
   private readonly queue: QueuedPrompt[] = [];
+  private readonly steeringPromptIds = new Set<string>();
   private activePrompt: QueuedPrompt | null = null;
   private latestDiff: WorkspaceDiff | null = null;
   private latestCheckpoint: WorkspaceCheckpointDescriptor | null = null;
@@ -294,6 +296,47 @@ export class RoomRelay {
       void this.options.onApproval?.(state.participant, parsed.data.requestId, parsed.data.decision).catch((error: unknown) => this.send(socket, { type: "room.error", message: error instanceof Error ? error.message : String(error) })); return;
     }
 
+    if (parsed.data.type === "prompt.update" || parsed.data.type === "prompt.remove" || parsed.data.type === "prompt.steer") {
+      const queueAction = parsed.data;
+      if (!this.allowRate(state, "queue", 60, 60_000)) { this.send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }
+      const index = this.queue.findIndex((prompt) => prompt.promptId === queueAction.promptId);
+      const queued = this.queue[index];
+      if (!queued) { this.send(socket, { type: "room.error", message: "Queued prompt was not found" }); return; }
+      if (queued.participantId !== state.participant.id) { this.send(socket, { type: "room.error", message: "Only the prompt owner can change it" }); return; }
+      if (this.steeringPromptIds.has(queued.promptId)) { this.send(socket, { type: "room.error", message: "That prompt is already steering the active turn" }); return; }
+      if (queueAction.type === "prompt.update") {
+        const updated: QueuedPrompt = {
+          ...queued,
+          text: queueAction.text,
+          ...(queueAction.model ? { model: queueAction.model } : {}),
+          ...(queueAction.effort ? { effort: queueAction.effort } : {}),
+        };
+        this.queue[index] = updated;
+        this.broadcast({ type: "prompt.updated", prompt: updated });
+        return;
+      }
+      if (queueAction.type === "prompt.remove") {
+        this.queue.splice(index, 1);
+        this.broadcast({ type: "prompt.removed", promptId: queued.promptId });
+        return;
+      }
+      if (!this.activePrompt) { this.send(socket, { type: "room.error", message: "There is no active turn to steer" }); return; }
+      if (!this.options.onSteer) { this.send(socket, { type: "room.error", message: "This room does not support steering" }); return; }
+      this.steeringPromptIds.add(queued.promptId);
+      void this.options.onSteer(queued).then(() => {
+        this.steeringPromptIds.delete(queued.promptId);
+        const currentIndex = this.queue.findIndex((prompt) => prompt.promptId === queued.promptId);
+        if (currentIndex >= 0) this.queue.splice(currentIndex, 1);
+        this.broadcast({ type: "prompt.steered", prompt: queued });
+        this.dispatchNext();
+      }).catch((error: unknown) => {
+        this.steeringPromptIds.delete(queued.promptId);
+        this.send(socket, { type: "room.error", message: `Could not steer: ${error instanceof Error ? error.message : String(error)}` });
+        this.dispatchNext();
+      });
+      return;
+    }
+
     if (!this.allowRate(state, "prompt", 20, 60_000)) { this.send(socket, { type: "room.error", message: "Prompt rate limit exceeded" }); return; }
     if (!state.participant.capabilities.includes("prompter")) {
       this.send(socket, { type: "room.error", message: "Participant does not have prompter capability" });
@@ -388,6 +431,7 @@ export class RoomRelay {
 
   private dispatchNext(): void {
     if (this.activePrompt || this.queue.length === 0) return;
+    if (this.steeringPromptIds.has(this.queue[0]?.promptId ?? "")) return;
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;

@@ -12,6 +12,9 @@ export interface ChatActions {
   join(token?: string): void | Promise<void>;
   stop(): void | Promise<void>;
   submit(text: string, settings: { model?: string; effort?: string }): void | Promise<void>;
+  updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string }): void | Promise<void>;
+  removeQueuedPrompt(promptId: string): void | Promise<void>;
+  steerQueuedPrompt(promptId: string): void | Promise<void>;
   approve(requestId: string | number, decision: ApprovalDecision): void | Promise<void>;
   copyInvite(): void | Promise<void>;
   openOutput(): void | Promise<void>;
@@ -26,6 +29,9 @@ type WebviewMessage =
   | { type: "join"; token?: string }
   | { type: "stop" }
   | { type: "submit"; text?: string; model?: string; effort?: string }
+  | { type: "queueUpdate"; promptId?: string; text?: string; model?: string; effort?: string }
+  | { type: "queueRemove"; promptId?: string }
+  | { type: "queueSteer"; promptId?: string }
   | { type: "approval"; requestId?: string | number; decision?: ApprovalDecision }
   | { type: "copyInvite" }
   | { type: "openOutput" }
@@ -108,6 +114,21 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         });
         break;
       }
+      case "queueUpdate": {
+        const promptId = message.promptId?.trim();
+        const text = message.text?.trim();
+        if (promptId && text) await this.actions.updateQueuedPrompt(promptId, text, {
+          ...(message.model?.trim() ? { model: message.model.trim() } : {}),
+          ...(message.effort?.trim() ? { effort: message.effort.trim() } : {}),
+        });
+        break;
+      }
+      case "queueRemove":
+        if (message.promptId?.trim()) await this.actions.removeQueuedPrompt(message.promptId.trim());
+        break;
+      case "queueSteer":
+        if (message.promptId?.trim()) await this.actions.steerQueuedPrompt(message.promptId.trim());
+        break;
     }
   }
 
@@ -180,11 +201,15 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .join-form.visible { display: flex; }
     .join-form input { min-width: 0; flex: 1; }
     .item { margin: 0 0 12px; }
+    .item.user, .item.assistant { position: relative; margin-bottom: 28px; }
     .meta { display: flex; align-items: center; gap: 6px; color: var(--vscode-descriptionForeground); font-size: 11px; margin: 0 3px 4px; }
     .meta strong { color: var(--vscode-foreground); }
     .bubble { border: 1px solid var(--vscode-panel-border); border-radius: 9px; padding: 9px 10px; overflow-wrap: anywhere; }
     .user .bubble { background: color-mix(in srgb, var(--vscode-button-background) 18%, transparent); border-color: color-mix(in srgb, var(--vscode-button-background) 45%, var(--vscode-panel-border)); }
     .assistant .bubble { background: var(--vscode-editor-background); }
+    .message-time { position: absolute; top: calc(100% + 4px); left: 3px; height: 18px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 18px; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 100ms ease; }
+    .user .message-time { right: 3px; left: auto; text-align: right; }
+    .item.user:hover .message-time, .item.assistant:hover .message-time, .item.user:focus-within .message-time, .item.assistant:focus-within .message-time { opacity: 1; visibility: visible; }
     .markdown { white-space: normal; overflow-wrap: anywhere; }
     .markdown > :first-child { margin-top: 0; }
     .markdown > :last-child { margin-bottom: 0; }
@@ -226,13 +251,16 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     button.change-review { align-self: center; padding: 5px 9px; color: var(--vscode-foreground); background: transparent; border: 1px solid var(--vscode-panel-border); border-radius: 7px; font-size: 11px; }
     button.change-review:hover { background: var(--vscode-toolbar-hoverBackground); }
     .change-files { border-top: 1px solid var(--vscode-panel-border); padding: 4px 0; }
+    .change-file-entry + .change-file-entry { border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 55%, transparent); }
     button.change-file { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; width: 100%; padding: 7px 10px; color: var(--vscode-descriptionForeground); background: transparent; border: 0; border-radius: 0; text-align: left; }
     button.change-file:hover { background: var(--vscode-list-hoverBackground); }
+    button.change-file[aria-expanded="true"] { background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground)); }
     .change-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .change-file-name { color: var(--vscode-foreground); }
     .change-count { min-width: 25px; text-align: right; font: 12px/1.3 var(--vscode-editor-font-family); }
     .change-binary { grid-column: 2 / 4; color: var(--vscode-descriptionForeground); font: 10px/1.3 var(--vscode-editor-font-family); text-transform: uppercase; }
     .diff-preview { max-height: 390px; overflow: auto; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-textCodeBlock-background); }
+    .change-file-preview .diff-file-heading { display: none; }
     .diff-file-preview + .diff-file-preview { border-top: 1px solid var(--vscode-panel-border); }
     .diff-file-heading { position: sticky; top: 0; z-index: 1; padding: 6px 9px; overflow: hidden; color: var(--vscode-descriptionForeground); background: var(--vscode-editor-background); font: 10px/1.4 var(--vscode-editor-font-family); text-overflow: ellipsis; white-space: nowrap; }
     .diff-lines { min-width: max-content; width: 100%; padding: 3px 0; }
@@ -274,8 +302,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .activity-step.failed .activity-glyph, .activity-step.failed .step-label { color: var(--vscode-errorForeground); }
     .step-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
     .step-chevron { color: var(--vscode-descriptionForeground); font-size: 9px; transition: transform 120ms ease; }
-    details.activity-step > pre.step-output { margin: 0 0 4px 28px; padding: 5px 7px; border: 0; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 220px; overflow: auto; }
-    details.activity-step > .step-markdown { margin: 1px 0 5px 28px; padding: 4px 7px; color: var(--vscode-descriptionForeground); border-left: 1px solid var(--vscode-panel-border); font-size: 11px; }
+    details.activity-step > pre.step-output { width: 100%; margin: 0 0 4px; padding: 7px 9px; border: 0; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 5px; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 220px; overflow: auto; }
+    details.activity-step > .step-markdown { width: 100%; margin: 1px 0 5px; padding: 6px 9px; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-left: 2px solid var(--vscode-panel-border); border-radius: 0 5px 5px 0; font-size: 11px; }
     @keyframes activeText { from { background-position: 100% 0; } to { background-position: -120% 0; } }
     @keyframes activeGlyph { 0%, 100% { opacity: .46; } 50% { opacity: 1; } }
     @keyframes activityEnter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
@@ -305,9 +333,25 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .approval-actions button.approval-deny:hover { background: var(--vscode-toolbar-hoverBackground); }
     .approval-actions button.approval-allow { font-weight: 600; }
     .approval-waiting { padding: 0 13px 12px; color: var(--vscode-descriptionForeground); font-size: 11px; }
-    #queue { display: none; margin: 8px 10px 0; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px 9px; color: var(--vscode-descriptionForeground); font-size: 11px; }
+    #queue { display: none; margin: 8px 10px 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
     #queue.visible { display: block; }
-    #queue strong { color: var(--vscode-foreground); }
+    .queue-head { display: flex; align-items: center; gap: 6px; padding: 0 4px 6px; }
+    .queue-head strong { color: var(--vscode-foreground); font-weight: 600; }
+    .queue-list { display: grid; gap: 6px; }
+    .queue-card { min-width: 0; overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 9px; background: color-mix(in srgb, var(--vscode-sideBar-background) 82%, var(--vscode-editor-background)); }
+    .queue-row { display: flex; min-width: 0; align-items: center; gap: 8px; padding: 8px 9px; }
+    .queue-index { flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; }
+    .queue-copy { min-width: 0; flex: 1; }
+    .queue-text { overflow: hidden; color: var(--vscode-foreground); font-size: 12px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+    .queue-meta { margin-top: 2px; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .queue-actions { display: flex; flex: none; align-items: center; gap: 2px; }
+    button.queue-action { padding: 4px 6px; color: var(--vscode-descriptionForeground); background: transparent; font-size: 11px; }
+    button.queue-action:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+    button.queue-steer { color: var(--vscode-foreground); font-weight: 600; }
+    .queue-editor { display: grid; gap: 7px; padding: 8px 9px 9px; border-top: 1px solid var(--vscode-panel-border); }
+    .queue-editor textarea { min-height: 58px; padding: 7px 8px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); resize: vertical; }
+    .queue-editor-actions { display: flex; justify-content: flex-end; gap: 5px; }
+    .queue-editor-actions button { padding: 4px 8px; font-size: 11px; }
     footer { padding: 8px 10px 10px; background: var(--vscode-sideBar-background); border-top: 1px solid var(--vscode-panel-border); }
     .composer { position: relative; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 9px; background: var(--vscode-input-background); padding: 8px 8px 7px; }
     .composer:focus-within { border-color: var(--vscode-focusBorder); }
@@ -353,36 +397,53 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     let selectedModel = typeof savedComposer.model === 'string' ? savedComposer.model : '';
     let selectedEffort = typeof savedComposer.effort === 'string' ? savedComposer.effort : '';
     let joinVisible = false;
+    let editingQueuePromptId = '';
+    let queuedPromptDraft = '';
     const expandedActivities = new Set();
     const collapsedActivities = new Set();
     const expandedSteps = new Set();
     const collapsedChangeCards = new Set();
+    const expandedDiffFiles = new Set();
     const collapsedSteps = new Set();
     const seenActivitySteps = new Set();
-    let liveTimerFrame;
+    let liveTimerTimeout;
     let conversationRenderVersion = 0;
 
     const post = (type, extra = {}) => vscode.postMessage({ type, ...extra });
     const node = (tag, className, text) => { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined) value.textContent = text; return value; };
     const markdownNode = (className, html) => { const value = node('div', className); value.innerHTML = html || ''; return value; };
+    const toggleDetailsInPlace = (event, details, summary) => {
+      event.preventDefault();
+      const anchorTop = summary.getBoundingClientRect().top;
+      details.open = !details.open;
+      summary.focus({ preventScroll: true });
+      const restoreAnchor = () => {
+        const shift = summary.getBoundingClientRect().top - anchorTop;
+        if (Math.abs(shift) > 0.5) elements.conversation.scrollTop += shift;
+      };
+      restoreAnchor();
+      requestAnimationFrame(restoreAnchor);
+    };
     const initials = name => name.split(/\\s+/).filter(Boolean).slice(0, 2).map(part => part[0]?.toUpperCase()).join('') || '?';
     const isActivity = item => item.kind === 'reasoning' || item.kind === 'command';
     const isFailure = item => item.kind === 'command' && item.status?.startsWith('exit');
     const elapsed = milliseconds => {
-      const seconds = Math.max(0, Math.round((milliseconds || 0) / 1000));
+      const seconds = Math.max(0, Math.floor((milliseconds || 0) / 1000));
       if (seconds < 60) return seconds + 's';
       const minutes = Math.floor(seconds / 60);
       return minutes + 'm ' + (seconds % 60) + 's';
     };
-    const liveElapsed = milliseconds => {
-      const tenths = Math.max(0, Math.floor((milliseconds || 0) / 100) / 10);
-      if (tenths < 60) return tenths.toFixed(1) + 's';
-      const minutes = Math.floor(tenths / 60);
-      return minutes + 'm ' + (tenths % 60).toFixed(1).padStart(4, '0') + 's';
-    };
     const shortCommand = command => {
       const compact = (command || 'command').replace(/\\s+/g, ' ').trim();
       return compact.length > 72 ? compact.slice(0, 69) + '…' : compact;
+    };
+    const messageTime = timestamp => {
+      const date = new Date(timestamp);
+      if (!Number.isFinite(date.getTime())) return { short: '', full: '' };
+      return {
+        short: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date),
+        full: new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'long' }).format(date),
+      };
     };
     const commandPresentation = (command, running) => {
       const compact = shortCommand(command);
@@ -416,22 +477,22 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       return glyph;
     };
     const syncLiveTimers = () => {
-      if (liveTimerFrame !== undefined) cancelAnimationFrame(liveTimerFrame);
-      let lastPaint = 0;
-      const tick = frameTime => {
+      if (liveTimerTimeout !== undefined) clearTimeout(liveTimerTimeout);
+      const tick = () => {
         const timers = document.querySelectorAll('.activity-timer[data-started-at]');
-        if (!timers.length) { liveTimerFrame = undefined; return; }
-        if (frameTime - lastPaint >= 80) {
-          const now = Date.now();
-          for (const timer of timers) {
-            const startedAt = Number(timer.dataset.startedAt);
-            if (Number.isFinite(startedAt)) timer.textContent = '· ' + liveElapsed(now - startedAt);
-          }
-          lastPaint = frameTime;
+        if (!timers.length) { liveTimerTimeout = undefined; return; }
+        const now = Date.now();
+        let nextTick = 1000;
+        for (const timer of timers) {
+          const startedAt = Number(timer.dataset.startedAt);
+          if (!Number.isFinite(startedAt)) continue;
+          const runningFor = Math.max(0, now - startedAt);
+          timer.textContent = 'for ' + elapsed(runningFor);
+          nextTick = Math.min(nextTick, 1000 - (runningFor % 1000));
         }
-        liveTimerFrame = requestAnimationFrame(tick);
+        liveTimerTimeout = setTimeout(tick, Math.max(50, nextTick));
       };
-      liveTimerFrame = requestAnimationFrame(tick);
+      tick();
     };
 
     const effortLabel = effort => ({ none: 'None', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' })[effort] || effort;
@@ -494,8 +555,65 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const count = state.queue.length;
       elements.queue.className = count ? 'visible' : '';
       elements.queue.replaceChildren();
-      if (!count) return;
-      elements.queue.append(node('strong', '', count + ' queued'), document.createTextNode(' · ' + state.queue.map(item => item.name).join(', ')));
+      if (!count) { editingQueuePromptId = ''; queuedPromptDraft = ''; return; }
+      if (editingQueuePromptId && !state.queue.some(item => item.id === editingQueuePromptId)) { editingQueuePromptId = ''; queuedPromptDraft = ''; }
+
+      const head = node('div', 'queue-head');
+      head.append(node('strong', '', count + (count === 1 ? ' prompt queued' : ' prompts queued')), node('span', '', 'Runs in order'));
+      const list = node('div', 'queue-list');
+      state.queue.forEach((item, index) => {
+        const card = node('div', 'queue-card');
+        const row = node('div', 'queue-row');
+        row.append(node('span', 'queue-index', String(index + 1)));
+        const copy = node('div', 'queue-copy');
+        copy.append(node('div', 'queue-text', item.text));
+        const settings = [item.name, item.model, item.effort ? effortLabel(item.effort) : ''].filter(Boolean).join(' · ');
+        copy.append(node('div', 'queue-meta', settings));
+        row.append(copy);
+
+        if (item.owned) {
+          const actions = node('div', 'queue-actions');
+          const steer = node('button', 'queue-action queue-steer', '↪ Steer');
+          steer.title = state.activeTurnIds?.length ? 'Send this prompt into the active turn' : 'Steer is available while Codex is working';
+          steer.disabled = !state.activeTurnIds?.length;
+          steer.addEventListener('click', () => post('queueSteer', { promptId: item.id }));
+          const edit = node('button', 'queue-action', 'Edit');
+          edit.title = 'Edit queued prompt';
+          edit.addEventListener('click', () => { editingQueuePromptId = item.id; queuedPromptDraft = item.text; renderQueue(); });
+          const remove = node('button', 'queue-action', '×');
+          remove.title = 'Remove queued prompt';
+          remove.setAttribute('aria-label', 'Remove queued prompt');
+          remove.addEventListener('click', () => post('queueRemove', { promptId: item.id }));
+          actions.append(steer, edit, remove);
+          row.append(actions);
+        }
+        card.append(row);
+
+        if (item.owned && editingQueuePromptId === item.id) {
+          const editor = node('div', 'queue-editor');
+          const textarea = node('textarea');
+          textarea.value = queuedPromptDraft;
+          textarea.setAttribute('aria-label', 'Edit queued prompt');
+          textarea.addEventListener('input', () => { queuedPromptDraft = textarea.value; save.disabled = !queuedPromptDraft.trim(); });
+          const editorActions = node('div', 'queue-editor-actions');
+          const cancel = node('button', 'secondary', 'Cancel');
+          cancel.addEventListener('click', () => { editingQueuePromptId = ''; queuedPromptDraft = ''; renderQueue(); });
+          const save = node('button', '', 'Save');
+          save.disabled = !queuedPromptDraft.trim();
+          save.addEventListener('click', () => {
+            const text = queuedPromptDraft.trim();
+            if (!text) return;
+            post('queueUpdate', { promptId: item.id, text, model: item.model, effort: item.effort });
+            editingQueuePromptId = ''; queuedPromptDraft = ''; renderQueue();
+          });
+          editorActions.append(cancel, save);
+          editor.append(textarea, editorActions);
+          card.append(editor);
+          requestAnimationFrame(() => textarea.focus({ preventScroll: true }));
+        }
+        list.append(card);
+      });
+      elements.queue.append(head, list);
     }
 
     function renderActivity(items) {
@@ -512,17 +630,15 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       details.dataset.activityId = activityId;
       if ((running && !collapsedActivities.has(activityId)) || (!running && expandedActivities.has(activityId))) details.setAttribute('open', '');
 
-      let label = duration ? 'Worked for ' + duration : 'Worked';
+      let label = running ? 'Working' : (duration ? 'Worked for ' + duration : 'Worked');
       if (failed) label += ' · command failed';
-      const activeItem = [...items].reverse().find(item => item.status === 'running');
-      const presentation = activeItem ? activityPresentation(activeItem, true) : { glyph: 'thinking', label: running ? 'Working' : label };
-      if (running) label = presentation.label;
       const summary = node('summary');
       summary.setAttribute('aria-label', label + (details.open ? ', hide activity' : ', show activity'));
-      summary.append(activityGlyph(presentation.glyph), node('span', 'activity-label', label));
+      summary.append(activityGlyph('thinking'), node('span', 'activity-label', label));
       if (running && Number.isFinite(startedAt)) {
-        const timer = node('span', 'activity-timer', '· ' + liveElapsed(Date.now() - startedAt));
+        const timer = node('span', 'activity-timer', 'for ' + elapsed(Date.now() - startedAt));
         timer.dataset.startedAt = String(startedAt);
+        timer.setAttribute('aria-hidden', 'true');
         summary.append(timer);
       }
       summary.append(node('span', 'activity-chevron', '▶'));
@@ -535,7 +651,11 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
           collapsedActivities.add(activityId);
         }
       };
-      summary.addEventListener('click', () => rememberActivityOpen(!details.open));
+      summary.addEventListener('click', event => {
+        const opening = !details.open;
+        toggleDetailsInPlace(event, details, summary);
+        rememberActivityOpen(opening);
+      });
       details.addEventListener('toggle', () => {
         rememberActivityOpen(details.open);
         summary.setAttribute('aria-label', label + (details.open ? ', hide activity' : ', show activity'));
@@ -570,7 +690,11 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
             collapsedSteps.add(item.id);
           }
         };
-        stepSummary.addEventListener('click', () => rememberStepOpen(!step.open));
+        stepSummary.addEventListener('click', event => {
+          const opening = !step.open;
+          toggleDetailsInPlace(event, step, stepSummary);
+          rememberStepOpen(opening);
+        });
         step.addEventListener('toggle', () => rememberStepOpen(step.open));
         const body = item.text || (item.kind === 'command' ? (stepRunning ? 'Waiting for output…' : 'Command completed without output.') : 'No reasoning summary.');
         step.append(stepSummary, item.kind === 'reasoning'
@@ -631,7 +755,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         const meta = node('div', 'meta');
         meta.append(node('strong', '', item.title || (item.kind === 'assistant' ? 'Codex' : 'You')));
         if (item.status && item.status !== 'completed') meta.append(node('span', '', item.status));
-        wrap.append(meta, markdownNode('bubble markdown', item.markdownHtml));
+        const formattedTime = messageTime(item.timestamp);
+        const time = node('time', 'message-time', formattedTime.short);
+        time.dateTime = item.timestamp;
+        time.title = formattedTime.full;
+        time.setAttribute('aria-label', formattedTime.full ? 'Sent ' + formattedTime.full : 'Message time unavailable');
+        wrap.append(meta, markdownNode('bubble markdown', item.markdownHtml), time);
         return wrap;
       }
       if (item.kind === 'diff') {
@@ -649,18 +778,25 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
           review.title = 'Open Source Control';
           review.onclick = event => { event.preventDefault(); event.stopPropagation(); post('reviewChanges'); };
           summary.append(node('span', 'change-icon', '±'), overview, review);
-          summary.addEventListener('click', () => {
-            if (details.open) collapsedChangeCards.add(item.id);
-            else collapsedChangeCards.delete(item.id);
+          summary.addEventListener('click', event => {
+            const opening = !details.open;
+            toggleDetailsInPlace(event, details, summary);
+            if (opening) collapsedChangeCards.delete(item.id);
+            else collapsedChangeCards.add(item.id);
           });
           details.addEventListener('toggle', () => {
             if (details.open) collapsedChangeCards.delete(item.id);
             else collapsedChangeCards.add(item.id);
           });
           const files = node('div', 'change-files');
+          const diffTemplate = node('div');
+          diffTemplate.innerHTML = item.diffHtml || '';
+          const diffSections = new Map([...diffTemplate.querySelectorAll('.diff-file-preview')].map(section => [section.querySelector('.diff-file-heading')?.textContent || '', section]));
           for (const file of item.changes.files) {
+            const entry = node('div', 'change-file-entry');
             const row = node('button', 'change-file');
-            row.title = 'Review ' + file.path;
+            const diffSection = diffSections.get(file.path);
+            row.title = diffSection ? 'Show diff for ' + file.path : 'Open ' + file.path;
             const separator = file.path.lastIndexOf('/');
             const pathLabel = node('span', 'change-path');
             if (separator >= 0) pathLabel.append(node('span', 'change-file-dir', file.path.slice(0, separator + 1)));
@@ -668,18 +804,43 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
             row.append(pathLabel);
             if (file.binary) row.append(node('span', 'change-binary', 'binary'));
             else row.append(node('span', 'change-count additions', '+' + file.additions), node('span', 'change-count deletions', '-' + file.deletions));
-            row.onclick = event => { event.preventDefault(); event.stopPropagation(); post('openChangedFile', { file: file.path }); };
-            files.append(row);
+            if (diffSection) {
+              const previewKey = item.id + ':' + file.path;
+              const preview = node('div', 'diff-preview change-file-preview');
+              preview.append(diffSection.cloneNode(true));
+              const setPreviewOpen = open => {
+                preview.hidden = !open;
+                row.setAttribute('aria-expanded', String(open));
+                if (open) expandedDiffFiles.add(previewKey); else expandedDiffFiles.delete(previewKey);
+              };
+              setPreviewOpen(expandedDiffFiles.has(previewKey));
+              row.onclick = event => {
+                event.preventDefault(); event.stopPropagation();
+                const anchorTop = row.getBoundingClientRect().top;
+                setPreviewOpen(preview.hidden);
+                row.focus({ preventScroll: true });
+                const restoreAnchor = () => { elements.conversation.scrollTop += row.getBoundingClientRect().top - anchorTop; };
+                restoreAnchor(); requestAnimationFrame(restoreAnchor);
+              };
+              entry.append(row, preview);
+            } else {
+              row.onclick = event => { event.preventDefault(); event.stopPropagation(); post('openChangedFile', { file: file.path }); };
+              entry.append(row);
+            }
+            files.append(entry);
           }
+          const truncatedNotice = diffTemplate.querySelector('.diff-preview-truncated');
+          if (truncatedNotice) files.append(truncatedNotice.cloneNode(true));
           details.append(summary, files);
-          if (item.diffHtml) details.append(markdownNode('diff-preview', item.diffHtml));
           wrap.append(details);
           return wrap;
         }
         const details = node('details', 'card');
         details.open = item.status === 'running';
         const label = (item.title || item.kind) + (item.status && item.status !== 'completed' ? ' · ' + item.status : '');
-        details.append(node('summary', '', label), node('pre', '', item.text));
+        const summary = node('summary', '', label);
+        summary.addEventListener('click', event => toggleDetailsInPlace(event, details, summary));
+        details.append(summary, node('pre', '', item.text));
         wrap.append(details);
         return wrap;
       }

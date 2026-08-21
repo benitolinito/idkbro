@@ -29,7 +29,7 @@ export interface TimelineItem {
   };
 }
 
-type TimelineMetadata = Partial<Pick<TimelineItem, "startedAt" | "finishedAt" | "turnId" | "command" | "durationMs" | "changes">>;
+type TimelineMetadata = Partial<Pick<TimelineItem, "timestamp" | "startedAt" | "finishedAt" | "turnId" | "command" | "durationMs" | "changes">>;
 
 export interface ParticipantView {
   name: string;
@@ -43,7 +43,7 @@ export interface ChatSnapshot {
   roomId?: string;
   roomLabel?: string;
   participants: ParticipantView[];
-  queue: Array<{ id: string; name: string; text: string }>;
+  queue: Array<{ id: string; name: string; text: string; owned: boolean; model?: string; effort?: string }>;
   activePrompt?: { id: string; name: string; text: string };
   agentConfig?: AgentConfig;
   activeTurnIds: string[];
@@ -54,8 +54,15 @@ export interface ChatSnapshot {
 
 const maxTimelineItems = 300;
 
-function promptView(prompt: QueuedPrompt) {
-  return { id: prompt.promptId, name: prompt.participantName, text: prompt.text };
+function promptView(prompt: QueuedPrompt, selfId?: string) {
+  return {
+    id: prompt.promptId,
+    name: prompt.participantName,
+    text: prompt.text,
+    owned: Boolean(selfId && prompt.participantId === selfId),
+    ...(prompt.model ? { model: prompt.model } : {}),
+    ...(prompt.effort ? { effort: prompt.effort } : {}),
+  };
 }
 
 export class ChatModel {
@@ -174,6 +181,20 @@ export class ChatModel {
       case "prompt.queued":
         if (!this.queue.some((prompt) => prompt.promptId === message.prompt.promptId)) this.queue.push(message.prompt);
         break;
+      case "prompt.updated": {
+        const index = this.queue.findIndex((prompt) => prompt.promptId === message.prompt.promptId);
+        if (index >= 0) this.queue[index] = message.prompt;
+        break;
+      }
+      case "prompt.removed":
+        this.queue = this.queue.filter((prompt) => prompt.promptId !== message.promptId);
+        break;
+      case "prompt.steered":
+        this.queue = this.queue.filter((prompt) => prompt.promptId !== message.prompt.promptId);
+        this.addPrompt(message.prompt);
+        break;
+      case "prompt.steer":
+        break;
       case "prompt.started":
         this.queue = this.queue.filter((prompt) => prompt.promptId !== message.prompt.promptId);
         this.activePrompt = message.prompt;
@@ -216,8 +237,8 @@ export class ChatModel {
       ...(this.roomId ? { roomId: this.roomId } : {}),
       ...(this.roomLabel ? { roomLabel: this.roomLabel } : {}),
       participants: [...byName.values()].sort((a, b) => Number(b.host) - Number(a.host) || a.name.localeCompare(b.name)),
-      queue: this.queue.map(promptView),
-      ...(this.activePrompt ? { activePrompt: promptView(this.activePrompt) } : {}),
+      queue: this.queue.map((prompt) => promptView(prompt, this.selfId)),
+      ...(this.activePrompt ? { activePrompt: promptView(this.activePrompt, this.selfId) } : {}),
       ...(this.agentConfig ? { agentConfig: this.cloneAgentConfig(this.agentConfig) } : {}),
       activeTurnIds: [...this.turnStartedAt.keys()],
       timeline: this.timeline.map((item) => ({
@@ -354,7 +375,7 @@ export class ChatModel {
 
   private addPrompt(prompt: QueuedPrompt): void {
     const id = `prompt:${prompt.promptId}`;
-    if (!this.find(id)) this.upsert(id, "user", prompt.text, prompt.participantName);
+    if (!this.find(id)) this.upsert(id, "user", prompt.text, prompt.participantName, undefined, undefined, { timestamp: prompt.submittedAt });
   }
 
   private updateReasoning(turnId: string, itemId: string, text: string, completed: boolean): void {
@@ -436,7 +457,7 @@ export class ChatModel {
       if (metadata) Object.assign(current, metadata);
       return;
     }
-    this.timeline.push({ id, kind, text, ...(title ? { title } : {}), ...(status ? { status } : {}), ...(approval ? { approval: { ...approval } } : {}), ...metadata, timestamp: new Date().toISOString() });
+    this.timeline.push({ id, kind, text, ...(title ? { title } : {}), ...(status ? { status } : {}), ...(approval ? { approval: { ...approval } } : {}), timestamp: metadata?.timestamp ?? new Date().toISOString(), ...metadata });
     if (this.timeline.length > maxTimelineItems) this.timeline.splice(0, this.timeline.length - maxTimelineItems);
   }
 }

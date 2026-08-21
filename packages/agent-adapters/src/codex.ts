@@ -330,6 +330,19 @@ export class CodexAppServerAdapter implements AgentAdapter {
     return { turnId };
   }
 
+  async steer(prompt: AgentPrompt): Promise<{ turnId: string }> {
+    if (!this.threadId || !this.activeTurnId) throw new Error("There is no active Codex turn to steer");
+    const expectedTurnId = this.activeTurnId;
+    const result = await this.request("turn/steer", {
+      threadId: this.threadId,
+      expectedTurnId,
+      input: [{ type: "text", text: prompt.text }],
+    });
+    const turnId = string(result.turnId);
+    if (!turnId) throw new Error("Codex turn/steer returned no turn ID");
+    return { turnId };
+  }
+
   async interrupt(): Promise<void> {
     if (!this.threadId || !this.activeTurnId) return;
     await this.request("turn/interrupt", {

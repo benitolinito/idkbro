@@ -163,9 +163,31 @@ export class CollaborationBridge implements vscode.Disposable {
   async showProposal(): Promise<void> { await vscode.window.showTextDocument(this.proposalUri, { preview: false, viewColumn: vscode.ViewColumn.Beside }); }
   sendPrompt(text: string, settings: { model?: string; effort?: string } = {}): boolean {
     if (!this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
-    const promptId = crypto.randomUUID(); const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", this.promptKey, nonce); cipher.setAAD(Buffer.from(`prompt:${promptId}`)); const ciphertext = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
-    const sealed = JSON.stringify({ version: 1, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") });
-    this.socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: sealed, ...settings })); return true;
+    const promptId = crypto.randomUUID();
+    this.socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: this.sealPrompt(promptId, text), ...settings })); return true;
+  }
+
+  updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string } = {}): boolean {
+    if (!this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ type: "prompt.update", promptId, text: this.sealPrompt(promptId, text), ...settings }));
+    return true;
+  }
+
+  removeQueuedPrompt(promptId: string): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ type: "prompt.remove", promptId }));
+    return true;
+  }
+
+  steerQueuedPrompt(promptId: string): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ type: "prompt.steer", promptId }));
+    return true;
+  }
+
+  private sealPrompt(promptId: string, text: string): string {
+    const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", this.promptKey as Buffer, nonce); cipher.setAAD(Buffer.from(`prompt:${promptId}`)); const ciphertext = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+    return JSON.stringify({ version: 1, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") });
   }
 
   resolveApproval(requestId: string | number, decision: ApprovalDecision): boolean {
@@ -248,7 +270,7 @@ export class CollaborationBridge implements vscode.Disposable {
     }
     if (!this.promptKey) { this.onRoomMessage(message); return; }
     try {
-      if (message.type === "prompt.queued" || message.type === "prompt.started") {
+      if (message.type === "prompt.queued" || message.type === "prompt.started" || message.type === "prompt.updated" || message.type === "prompt.steered" || message.type === "prompt.steer") {
         this.onRoomMessage({ ...message, prompt: this.openPrompt(message.prompt) });
         return;
       }

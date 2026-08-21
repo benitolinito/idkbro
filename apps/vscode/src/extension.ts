@@ -43,6 +43,9 @@ class MultiCodeController implements vscode.Disposable {
       join: (token) => this.join(token),
       stop: () => this.stop(),
       submit: (text, settings) => this.submitPrompt(text, settings),
+      updateQueuedPrompt: (promptId, text, settings) => this.updateQueuedPrompt(promptId, text, settings),
+      removeQueuedPrompt: (promptId) => this.removeQueuedPrompt(promptId),
+      steerQueuedPrompt: (promptId) => this.steerQueuedPrompt(promptId),
       approve: (requestId, decision) => this.resolveApproval(requestId, decision),
       copyInvite: () => this.copyInvite(),
       openOutput: () => this.openOutput(),
@@ -169,6 +172,21 @@ class MultiCodeController implements vscode.Disposable {
       return;
     }
     this.process.stdin.write(`${prompt}\n`);
+  }
+
+  updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string } = {}): void {
+    if (text.trim() && this.collaboration.updateQueuedPrompt(promptId, text.trim(), settings)) return;
+    void vscode.window.showWarningMessage("MultiCode is reconnecting; the queued prompt was not updated.");
+  }
+
+  removeQueuedPrompt(promptId: string): void {
+    if (this.collaboration.removeQueuedPrompt(promptId)) return;
+    void vscode.window.showWarningMessage("MultiCode is reconnecting; the queued prompt was not removed.");
+  }
+
+  steerQueuedPrompt(promptId: string): void {
+    if (this.collaboration.steerQueuedPrompt(promptId)) return;
+    void vscode.window.showWarningMessage("MultiCode is reconnecting; the steer was not sent.");
   }
 
   async resolveApproval(requestId: string | number, decision: ApprovalDecision): Promise<void> {

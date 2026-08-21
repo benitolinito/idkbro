@@ -41,14 +41,34 @@ describe("ChatModel", () => {
     const model = new ChatModel();
     model.handle(welcome());
     model.handle({ type: "prompt.queued", prompt, position: 1 });
-    expect(model.snapshot().queue).toEqual([{ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop" }]);
+    expect(model.snapshot().queue).toEqual([{ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop", owned: false }]);
 
     model.handle({ type: "prompt.started", prompt });
     model.handle({ type: "prompt.started", prompt });
     const state = model.snapshot();
     expect(state.queue).toEqual([]);
-    expect(state.activePrompt).toEqual({ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop" });
-    expect(state.timeline.filter((item) => item.kind === "user")).toHaveLength(1);
+    expect(state.activePrompt).toEqual({ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop", owned: false });
+    expect(state.timeline.filter((item) => item.kind === "user")).toEqual([
+      expect.objectContaining({ timestamp: prompt.submittedAt }),
+    ]);
+  });
+
+  it("updates, removes, and steers owned queued prompts", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    const ownedPrompt: QueuedPrompt = { ...prompt, promptId: "prompt-owned", participantId: "editor", model: "gpt-5.6-sol", effort: "high" };
+    model.handle({ type: "prompt.queued", prompt: ownedPrompt, position: 1 });
+    model.handle({ type: "prompt.updated", prompt: { ...ownedPrompt, text: "Use the smaller change" } });
+
+    expect(model.snapshot().queue).toEqual([expect.objectContaining({ id: "prompt-owned", text: "Use the smaller change", owned: true, model: "gpt-5.6-sol", effort: "high" })]);
+
+    model.handle({ type: "prompt.steered", prompt: { ...ownedPrompt, text: "Use the smaller change" } });
+    expect(model.snapshot().queue).toEqual([]);
+    expect(model.snapshot().timeline).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "user", text: "Use the smaller change" })]));
+
+    model.handle({ type: "prompt.queued", prompt: ownedPrompt, position: 1 });
+    model.handle({ type: "prompt.removed", promptId: ownedPrompt.promptId });
+    expect(model.snapshot().queue).toEqual([]);
   });
 
   it("exposes the Codex model catalog and current reasoning level", () => {

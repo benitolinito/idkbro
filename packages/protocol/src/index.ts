@@ -136,6 +136,7 @@ export interface AgentStartOptions {
 export interface AgentAdapter {
   start(options: AgentStartOptions): Promise<{ threadId: string }>;
   sendPrompt(prompt: AgentPrompt): Promise<{ turnId: string }>;
+  steer(prompt: AgentPrompt): Promise<{ turnId: string }>;
   interrupt(): Promise<void>;
   resolveApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
   events(): AsyncIterable<AgentEvent>;
@@ -156,6 +157,15 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     model: z.string().trim().min(1).max(128).optional(),
     effort: z.string().trim().min(1).max(32).optional(),
   }),
+  z.object({
+    type: z.literal("prompt.update"),
+    promptId: z.string().min(1),
+    text: z.string().trim().min(1).max(200_000),
+    model: z.string().trim().min(1).max(128).optional(),
+    effort: z.string().trim().min(1).max(32).optional(),
+  }),
+  z.object({ type: z.literal("prompt.remove"), promptId: z.string().min(1) }),
+  z.object({ type: z.literal("prompt.steer"), promptId: z.string().min(1) }),
   z.object({
     type: z.literal("workspace.ack"),
     sequence: z.number().int().positive(),
@@ -302,6 +312,12 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
     promptId: z.string().min(1),
     message: z.string().min(1).max(1_000),
   }),
+  z.object({ type: z.literal("relay.prompt.steered"), promptId: z.string().min(1) }),
+  z.object({
+    type: z.literal("relay.prompt.steer.failed"),
+    promptId: z.string().min(1),
+    message: z.string().min(1).max(1_000),
+  }),
   z.object({
     type: z.literal("relay.participant.capabilities"),
     participantId: z.string().min(1).max(128),
@@ -404,6 +420,8 @@ export type RelayHostMessage =
   | { type: "relay.workspace.checkpoint.chunk"; chunk: WorkspaceCheckpointChunk; targetParticipantId?: string }
   | { type: "relay.workspace.checkpoint.complete"; sequence: number; targetParticipantId?: string }
   | { type: "relay.prompt.failed"; promptId: string; message: string }
+  | { type: "relay.prompt.steered"; promptId: string }
+  | { type: "relay.prompt.steer.failed"; promptId: string; message: string }
   | { type: "relay.participant.capabilities"; participantId: string; capabilities: Capability[] }
   | { type: "relay.collab.event"; event: CollaborationEvent };
 
@@ -441,6 +459,10 @@ export type RoomServerMessage =
   | { type: "participant.left"; participantId: string; name: string }
   | { type: "participant.capabilities"; participantId: string; capabilities: Capability[] }
   | { type: "prompt.queued"; prompt: QueuedPrompt; position: number }
+  | { type: "prompt.updated"; prompt: QueuedPrompt }
+  | { type: "prompt.removed"; promptId: string }
+  | { type: "prompt.steered"; prompt: QueuedPrompt }
+  | { type: "prompt.steer"; prompt: QueuedPrompt }
   | { type: "prompt.started"; prompt: QueuedPrompt }
   | { type: "agent.config"; config: AgentConfig }
   | { type: "agent.event"; event: AgentEvent }

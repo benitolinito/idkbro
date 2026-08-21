@@ -46,6 +46,12 @@ describe("room protocol", () => {
     })).toMatchObject({ model: "gpt-5.6-sol", effort: "high" });
   });
 
+  it("accepts queued prompt edit, remove, and steer actions", () => {
+    expect(roomClientMessageSchema.parse({ type: "prompt.update", promptId: "prompt_1", text: "Use a narrower fix" })).toMatchObject({ type: "prompt.update" });
+    expect(roomClientMessageSchema.parse({ type: "prompt.remove", promptId: "prompt_1" })).toEqual({ type: "prompt.remove", promptId: "prompt_1" });
+    expect(roomClientMessageSchema.parse({ type: "prompt.steer", promptId: "prompt_1" })).toEqual({ type: "prompt.steer", promptId: "prompt_1" });
+  });
+
   it("accepts structured per-file workspace statistics", () => {
     expect(workspaceDiffSchema.parse({
       revision: "turn-1",

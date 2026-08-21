@@ -134,4 +134,31 @@ describe("normalizeCodexMessage", () => {
     internals.handleLine(JSON.stringify({ id: request.id, result: { turn: { id: "turn_1" } } }));
     await expect(result).resolves.toEqual({ turnId: "turn_1" });
   });
+
+  it("steers the active turn without starting a new turn", async () => {
+    const writes: string[] = [];
+    const adapter = new CodexAppServerAdapter();
+    const internals = adapter as unknown as {
+      process: { stdin: { writable: boolean; write: (value: string) => void } };
+      threadId: string;
+      activeTurnId: string;
+      handleLine: (line: string) => void;
+    };
+    internals.process = { stdin: { writable: true, write: (value) => { writes.push(value); } } };
+    internals.threadId = "thr_1";
+    internals.activeTurnId = "turn_1";
+
+    const result = adapter.steer({ promptId: "prompt_2", text: "Focus on the failing test" });
+    const request = JSON.parse(writes[0] as string);
+    expect(request).toMatchObject({
+      method: "turn/steer",
+      params: {
+        threadId: "thr_1",
+        expectedTurnId: "turn_1",
+        input: [{ type: "text", text: "Focus on the failing test" }],
+      },
+    });
+    internals.handleLine(JSON.stringify({ id: request.id, result: { turnId: "turn_1" } }));
+    await expect(result).resolves.toEqual({ turnId: "turn_1" });
+  });
 });
