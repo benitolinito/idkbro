@@ -19,4 +19,10 @@ describe("public join command", () => {
     expect(stdout).toContain("--bootstrap-only");
     expect(stdout).toContain("--viewer");
   });
+
+  it("exposes host approval resolution for the VS Code extension", async () => {
+    const { stdout } = await execFileAsync(process.execPath, [cli, "approve", "--help"]);
+    expect(stdout).toContain("<request-id>");
+    expect(stdout).toContain("<decision>");
+  });
 });

@@ -8,6 +8,7 @@ import { CollaborationBridge } from "./collaboration.js";
 import { resolveHostingDirectory } from "./host-workspace.js";
 import { roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 import { workspaceHandoffId, workspaceHandoffSecretKey, type WorkspaceHandoff } from "./workspace-handoff.js";
+import type { ApprovalDecision } from "@multicode/protocol";
 
 type SessionMode = "host" | "join";
 
@@ -39,6 +40,7 @@ class MultiCodeController implements vscode.Disposable {
       join: (token) => this.join(token),
       stop: () => this.stop(),
       submit: (text) => this.submitPrompt(text),
+      approve: (requestId, decision) => this.resolveApproval(requestId, decision),
       copyInvite: () => this.copyInvite(),
       openOutput: () => this.openOutput(),
     });
@@ -88,7 +90,7 @@ class MultiCodeController implements vscode.Disposable {
     this.status.tooltip = "Click to send a prompt";
     this.status.command = "multicode.sendPrompt";
     void vscode.commands.executeCommand("setContext", "multicode.connected", true);
-    this.collaboration.connect(handoff.relay, token, handoff.name, handoff.role);
+    this.collaboration.connect(handoff.relay, token, handoff.name, handoff.role, handoff.mode === "host" ? "daemon" : "extension");
     this.openChat();
   }
 
@@ -153,6 +155,15 @@ class MultiCodeController implements vscode.Disposable {
       return;
     }
     this.process.stdin.write(`${prompt}\n`);
+  }
+
+  async resolveApproval(requestId: string | number, decision: ApprovalDecision): Promise<void> {
+    if (this.mode === "host" && this.roomWorkspace) {
+      await this.runCliCommand(["approve", String(requestId), decision], this.roomWorkspace);
+      return;
+    }
+    if (this.collaboration.resolveApproval(requestId, decision)) return;
+    throw new Error("MultiCode is reconnecting; the approval was not sent");
   }
 
   async copyInvite(): Promise<void> {
@@ -305,7 +316,7 @@ class MultiCodeController implements vscode.Disposable {
     if (!this.roomWorkspaceReady || !this.pendingCollaboration) return;
     const pending = this.pendingCollaboration;
     this.pendingCollaboration = undefined;
-    this.collaboration.connect(pending.relay, pending.token, pending.name, pending.role);
+    this.collaboration.connect(pending.relay, pending.token, pending.name, pending.role, this.mode === "host" ? "daemon" : "extension");
     void this.openRoomWorkspace(pending);
   }
 
@@ -363,6 +374,18 @@ class MultiCodeController implements vscode.Disposable {
     const developmentCli = path.resolve(this.context.extensionPath, "../../packages/cli/dist/index.js");
     if (existsSync(developmentCli)) return { executable: "node", prefixArgs: [developmentCli] };
     return { executable: configured, prefixArgs: [] };
+  }
+
+  private runCliCommand(args: string[], cwd: string): Promise<void> {
+    const command = this.cliCommand();
+    return new Promise((resolve, reject) => {
+      const child = spawn(command.executable, [...command.prefixArgs, ...args], { cwd, env: this.sessionEnvironment() });
+      let stdout = ""; let stderr = "";
+      child.stdout.on("data", (data: Buffer) => { const text = data.toString(); stdout += text; this.output.append(text); });
+      child.stderr.on("data", (data: Buffer) => { const text = data.toString(); stderr += text; this.output.append(text); });
+      child.once("error", reject);
+      child.once("close", (code) => code === 0 ? resolve() : reject(new Error((stderr || stdout || `MultiCode exited with code ${code ?? "unknown"}`).trim())));
+    });
   }
 
   private sessionEnvironment(): NodeJS.ProcessEnv {

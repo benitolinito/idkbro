@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeCodexMessage } from "./codex.js";
+import { CodexAppServerAdapter, normalizeCodexMessage } from "./codex.js";
 
 describe("normalizeCodexMessage", () => {
   it("normalizes agent message deltas", () => {
@@ -30,6 +30,29 @@ describe("normalizeCodexMessage", () => {
       approvalKind: "item/commandExecution/requestApproval",
       details: { threadId: "thr_1", command: "npm test" },
     });
+  });
+
+  it("responds to a pending approval once and publishes its resolution", async () => {
+    const writes: string[] = [];
+    const adapter = new CodexAppServerAdapter();
+    const internals = adapter as unknown as {
+      process: { stdin: { writable: boolean; write: (value: string) => void } };
+      handleLine: (line: string) => void;
+    };
+    internals.process = { stdin: { writable: true, write: (value) => { writes.push(value); } } };
+    internals.handleLine(JSON.stringify({
+      id: 91,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thr_1", command: "npm test" },
+    }));
+
+    const events = adapter.events()[Symbol.asyncIterator]();
+    await expect(events.next()).resolves.toMatchObject({ value: { type: "approval.requested", requestId: 91 } });
+    await adapter.resolveApproval(91, "accept");
+
+    expect(JSON.parse(writes[0] as string)).toEqual({ id: 91, result: { decision: "accept" } });
+    await expect(events.next()).resolves.toEqual({ value: { type: "approval.resolved", requestId: 91, decision: "accept" }, done: false });
+    await expect(adapter.resolveApproval(91, "decline")).rejects.toThrow("no longer pending");
   });
 
   it("normalizes streamed Codex reasoning summaries", () => {

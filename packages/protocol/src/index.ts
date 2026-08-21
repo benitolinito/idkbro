@@ -84,6 +84,15 @@ export interface AgentPrompt {
 
 export type ApprovalDecision = "accept" | "decline" | "cancel";
 
+/** Preserve JSON-RPC numeric IDs when an approval ID crosses a CLI boundary. */
+export function parseApprovalRequestId(value: string): string | number {
+  if (/^(0|[1-9]\d*)$/.test(value)) {
+    const numeric = Number(value);
+    if (Number.isSafeInteger(numeric)) return numeric;
+  }
+  return value;
+}
+
 export type AgentEvent =
   | { type: "agent.started"; threadId: string }
   | { type: "turn.started"; threadId: string; turnId: string }
@@ -96,6 +105,7 @@ export type AgentEvent =
   | { type: "command.output"; threadId: string; turnId: string; itemId: string; text: string }
   | { type: "command.exited"; threadId: string; turnId: string; itemId: string; exitCode: number | null; output?: string }
   | { type: "approval.requested"; requestId: string | number; approvalKind: string; details: Record<string, unknown> }
+  | { type: "approval.resolved"; requestId: string | number; decision: ApprovalDecision }
   | { type: "agent.error"; message: string }
   | { type: "agent.exited"; exitCode: number | null; signal: string | null };
 

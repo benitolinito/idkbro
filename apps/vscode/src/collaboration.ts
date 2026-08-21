@@ -6,7 +6,8 @@ import * as vscode from "vscode";
 import WebSocket from "ws";
 import * as Y from "yjs";
 import { isSensitiveWorkspacePath } from "@multicode/protocol";
-import type { AgentEvent, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
+import type { AgentEvent, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
+import { SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
 
 interface EncryptedUpdate { file: string; nonce: string; tag: string; ciphertext: string; }
 const maxCollaborativeTextBytes = 96 * 1024;
@@ -47,6 +48,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private inviteToken = "";
   private displayName = "";
   private requestedRole: "viewer" | "editor" = "editor";
+  private workspaceDiskOwner: WorkspaceDiskOwner = "extension";
   private canEdit = true;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private applyingRemoteManifest = 0;
@@ -59,6 +61,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly recentStructuralPaths = new Map<string, number>();
   private readonly ignoredPaths = new Map<string, boolean>();
   private workspaceRootUri: vscode.Uri | undefined;
+  private readonly receiveQueue = new SerialTaskQueue();
 
   constructor(private readonly onRoomMessage?: (message: RoomServerMessage) => void) {
     const diskWatcher = vscode.workspace.createFileSystemWatcher("**/*");
@@ -84,12 +87,13 @@ export class CollaborationBridge implements vscode.Disposable {
     ];
   }
 
-  connect(relayUrl: string, inviteToken: string, name: string, requestedRole: "viewer" | "editor" = "editor"): void {
+  connect(relayUrl: string, inviteToken: string, name: string, requestedRole: "viewer" | "editor" = "editor", workspaceDiskOwner: WorkspaceDiskOwner = "extension"): void {
     if (
       this.relayUrl === relayUrl
       && this.inviteToken === inviteToken
       && this.displayName === name
       && this.requestedRole === requestedRole
+      && this.workspaceDiskOwner === workspaceDiskOwner
       && (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING)
     ) return;
 
@@ -99,7 +103,7 @@ export class CollaborationBridge implements vscode.Disposable {
     });
     this.disconnect();
     for (const [file, contents] of localBuffers) this.pendingLocalText.set(file, contents);
-    this.relayUrl = relayUrl; this.inviteToken = inviteToken; this.displayName = name; this.requestedRole = requestedRole; this.canEdit = requestedRole === "editor";
+    this.relayUrl = relayUrl; this.inviteToken = inviteToken; this.displayName = name; this.requestedRole = requestedRole; this.workspaceDiskOwner = workspaceDiskOwner; this.canEdit = requestedRole === "editor";
     this.latestPreviewRevision = 0; this.latestPreviewTurn = ""; this.welcomed = false;
     this.statusChanged.fire("connecting");
     const [code, secret] = inviteToken.split(".", 2);
@@ -110,13 +114,22 @@ export class CollaborationBridge implements vscode.Disposable {
     const socket = new WebSocket(base);
     this.socket = socket;
     socket.on("open", () => { this.statusChanged.fire("connected"); socket.send(JSON.stringify({ type: "room.join", token: code, name, requestedRole })); });
-    socket.on("message", (data) => void this.receive(data.toString()));
+    socket.on("message", (data) => {
+      const raw = data.toString();
+      void this.receiveQueue.enqueue(async () => {
+        if (this.socket !== socket) return;
+        await this.receive(raw);
+      }).catch((error: unknown) => {
+        console.error(`MultiCode could not apply a collaboration event: ${error instanceof Error ? error.message : String(error)}`);
+        if (this.socket === socket) this.resynchronizeOpenDocuments();
+      });
+    });
     socket.on("close", () => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       if (this.inviteToken) {
         this.statusChanged.fire("reconnecting");
-        this.reconnectTimer = setTimeout(() => this.connect(this.relayUrl, this.inviteToken, this.displayName, this.requestedRole), 5_000);
+        this.reconnectTimer = setTimeout(() => this.connect(this.relayUrl, this.inviteToken, this.displayName, this.requestedRole, this.workspaceDiskOwner), 5_000);
       }
     });
   }
@@ -148,6 +161,12 @@ export class CollaborationBridge implements vscode.Disposable {
     const promptId = crypto.randomUUID(); const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", this.promptKey, nonce); cipher.setAAD(Buffer.from(`prompt:${promptId}`)); const ciphertext = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
     const sealed = JSON.stringify({ version: 1, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") });
     this.socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: sealed })); return true;
+  }
+
+  resolveApproval(requestId: string | number, decision: ApprovalDecision): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ type: "approval.resolve", requestId, decision }));
+    return true;
   }
 
   private file(document: vscode.TextDocument): string | undefined {
@@ -341,13 +360,22 @@ export class CollaborationBridge implements vscode.Disposable {
     const root = this.workspaceRoot(); if (!root) return;
     const uri = vscode.Uri.joinPath(root, ...file.split("/"));
     const open = await vscode.workspace.openTextDocument(uri);
-    if (open.getText() === contents) { if (open.isDirty) await open.save(); return; }
+    const saveProjection = shouldSaveRenderedDocument(this.workspaceDiskOwner);
+    if (open.getText() === contents) {
+      if (saveProjection && open.isDirty && !await open.save()) throw new Error(`Could not save collaborative update to ${file}`);
+      return;
+    }
     this.suppressed.add(file);
     try {
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, new vscode.Range(open.positionAt(0), open.positionAt(open.getText().length)), contents);
       if (!await vscode.workspace.applyEdit(edit)) throw new Error(`Could not apply collaborative update to ${file}`);
-      await open.save();
+      // The host daemon has already projected committed Yjs state into its room
+      // worktree. Saving that same buffer here creates a competing-writer race
+      // and VS Code reports that the on-disk file is newer. Participant
+      // worktrees have no daemon projector, so their extension remains the
+      // single writer and persists the rendered buffer.
+      if (saveProjection && !await open.save()) throw new Error(`Could not save collaborative update to ${file}`);
     }
     finally { this.suppressed.delete(file); }
   }

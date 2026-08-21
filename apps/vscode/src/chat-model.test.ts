@@ -54,4 +54,32 @@ describe("ChatModel", () => {
       expect.objectContaining({ kind: "system", text: "Turn completed · completed" }),
     ]));
   });
+
+  it("exposes pending approvals to the host and records their resolution", () => {
+    const model = new ChatModel();
+    model.start("host");
+    model.handle(welcome());
+    model.handle({ type: "agent.event", event: { type: "approval.requested", requestId: 91, approvalKind: "item/commandExecution/requestApproval", details: { command: "npm test", cwd: "/repo" } } });
+
+    expect(model.snapshot()).toMatchObject({
+      canApprove: true,
+      timeline: expect.arrayContaining([
+        expect.objectContaining({ kind: "approval", status: "pending", text: "Command: npm test\nWorking directory: /repo", approval: expect.objectContaining({ requestId: 91 }) }),
+      ]),
+    });
+
+    model.approvalSubmitting(91);
+    expect(model.snapshot().timeline.find((item) => item.id === "approval:91")?.status).toBe("resolving");
+    model.handle({ type: "agent.event", event: { type: "approval.resolved", requestId: 91, decision: "accept" } });
+    expect(model.snapshot().timeline.find((item) => item.id === "approval:91")?.status).toBe("approved");
+  });
+
+  it("only exposes participant approval controls after reviewer capability is granted", () => {
+    const model = new ChatModel();
+    model.start("join");
+    model.handle(welcome());
+    expect(model.snapshot().canApprove).toBe(false);
+    model.handle({ type: "participant.capabilities", participantId: "editor", capabilities: ["viewer", "editor", "prompter", "reviewer"] });
+    expect(model.snapshot().canApprove).toBe(true);
+  });
 });

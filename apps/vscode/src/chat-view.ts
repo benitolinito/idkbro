@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import type { RoomServerMessage } from "@multicode/protocol";
+import type { ApprovalDecision } from "@multicode/protocol";
 import { ChatModel, type ChatSnapshot } from "./chat-model.js";
 
 export interface ChatActions {
@@ -8,6 +9,7 @@ export interface ChatActions {
   join(token?: string): void | Promise<void>;
   stop(): void | Promise<void>;
   submit(text: string): void | Promise<void>;
+  approve(requestId: string | number, decision: ApprovalDecision): void | Promise<void>;
   copyInvite(): void | Promise<void>;
   openOutput(): void | Promise<void>;
 }
@@ -18,8 +20,13 @@ type WebviewMessage =
   | { type: "join"; token?: string }
   | { type: "stop" }
   | { type: "submit"; text?: string }
+  | { type: "approval"; requestId?: string | number; decision?: ApprovalDecision }
   | { type: "copyInvite" }
   | { type: "openOutput" };
+
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return value === "accept" || value === "decline" || value === "cancel";
+}
 
 export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Disposable {
   static readonly viewType = "multicode.chatView";
@@ -63,6 +70,13 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       case "stop": await this.actions.stop(); break;
       case "copyInvite": await this.actions.copyInvite(); break;
       case "openOutput": await this.actions.openOutput(); break;
+      case "approval": {
+        if ((typeof message.requestId !== "string" && typeof message.requestId !== "number") || !isApprovalDecision(message.decision)) break;
+        this.model.approvalSubmitting(message.requestId); this.publish();
+        try { await this.actions.approve(message.requestId, message.decision); }
+        catch (error) { this.model.approvalFailed(message.requestId, error instanceof Error ? error.message : String(error)); this.publish(); }
+        break;
+      }
       case "submit": {
         const text = message.text?.trim();
         if (text) await this.actions.submit(text);
@@ -139,9 +153,14 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     details.card summary { padding: 7px 9px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; }
     details.card pre { margin: 0; padding: 8px 9px; border-top: 1px solid var(--vscode-panel-border); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 280px; overflow: auto; }
     .reasoning details { opacity: .86; }
-    .system, .error, .approval { display: flex; gap: 7px; align-items: flex-start; color: var(--vscode-descriptionForeground); font-size: 11px; padding: 3px 4px; }
+    .system, .error { display: flex; gap: 7px; align-items: flex-start; color: var(--vscode-descriptionForeground); font-size: 11px; padding: 3px 4px; }
     .error { color: var(--vscode-errorForeground); }
-    .approval { padding: 8px; border-radius: 7px; color: var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); }
+    .approval { padding: 9px; border-radius: 7px; color: var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); font-size: 11px; }
+    .approval-head { display: flex; align-items: center; gap: 6px; font-weight: 700; }
+    .approval-status { margin-left: auto; color: var(--vscode-descriptionForeground); font-weight: 400; }
+    .approval-body { margin-top: 6px; color: var(--vscode-foreground); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .approval-actions { display: flex; gap: 6px; margin-top: 9px; }
+    .approval-actions button { padding: 5px 9px; }
     #queue { display: none; margin: 8px 10px 0; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px 9px; color: var(--vscode-descriptionForeground); font-size: 11px; }
     #queue.visible { display: block; }
     #queue strong { color: var(--vscode-foreground); }
@@ -204,6 +223,20 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
     function renderItem(item) {
       const wrap = node('article', 'item ' + item.kind);
+      if (item.kind === 'approval') {
+        const head = node('div', 'approval-head');
+        head.append(node('span', '', '!'), node('span', '', item.title || 'Approval required'));
+        if (item.status) head.append(node('span', 'approval-status', item.status));
+        wrap.append(head, node('div', 'approval-body', item.text));
+        if (item.approval && state.canApprove && item.status === 'pending') {
+          const actions = node('div', 'approval-actions');
+          const allow = node('button', '', 'Allow'); allow.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'accept' });
+          const decline = node('button', 'secondary', 'Decline'); decline.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'decline' });
+          const cancel = node('button', 'secondary', 'Cancel turn'); cancel.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'cancel' });
+          actions.append(allow, decline, cancel); wrap.append(actions);
+        }
+        return wrap;
+      }
       if (item.kind === 'user' || item.kind === 'assistant') {
         const meta = node('div', 'meta');
         meta.append(node('strong', '', item.title || (item.kind === 'assistant' ? 'Codex' : 'You')));

@@ -10,6 +10,7 @@ export interface TimelineItem {
   text: string;
   status?: string;
   timestamp: string;
+  approval?: { requestId: string | number; approvalKind: string };
 }
 
 export interface ParticipantView {
@@ -27,6 +28,7 @@ export interface ChatSnapshot {
   queue: Array<{ id: string; name: string; text: string }>;
   activePrompt?: { id: string; name: string; text: string };
   timeline: TimelineItem[];
+  canApprove: boolean;
 }
 
 const maxTimelineItems = 300;
@@ -43,6 +45,7 @@ export class ChatModel {
   private readonly participants = new Map<string, RoomParticipant>();
   private queue: QueuedPrompt[] = [];
   private activePrompt: QueuedPrompt | undefined;
+  private selfId: string | undefined;
   private readonly timeline: TimelineItem[] = [];
 
   start(mode: "host" | "join", roomLabel?: string): void {
@@ -53,6 +56,7 @@ export class ChatModel {
     this.participants.clear();
     this.queue = [];
     this.activePrompt = undefined;
+    this.selfId = undefined;
     this.timeline.splice(0);
     this.add("system", mode === "host" ? "Starting a shared Codex room…" : "Joining the shared Codex room…");
   }
@@ -75,6 +79,7 @@ export class ChatModel {
     this.participants.clear();
     this.queue = [];
     this.activePrompt = undefined;
+    this.selfId = undefined;
     this.add("system", message);
   }
 
@@ -92,6 +97,7 @@ export class ChatModel {
       case "room.welcome":
         this.connection = "connected";
         this.roomId = message.roomId;
+        this.selfId = message.selfId;
         this.roomLabel ??= message.roomId;
         this.participants.clear();
         for (const participant of message.participants) this.participants.set(participant.id, participant);
@@ -108,6 +114,11 @@ export class ChatModel {
         this.participants.delete(message.participantId);
         this.add("system", `${message.name} left`);
         break;
+      case "participant.capabilities": {
+        const participant = this.participants.get(message.participantId);
+        if (participant) this.participants.set(message.participantId, { ...participant, capabilities: [...message.capabilities] });
+        break;
+      }
       case "participant.synced": {
         const participant = this.participants.get(message.participantId);
         if (participant) this.participants.set(message.participantId, { ...participant, synced: true });
@@ -157,8 +168,20 @@ export class ChatModel {
       participants: [...byName.values()].sort((a, b) => Number(b.host) - Number(a.host) || a.name.localeCompare(b.name)),
       queue: this.queue.map(promptView),
       ...(this.activePrompt ? { activePrompt: promptView(this.activePrompt) } : {}),
-      timeline: this.timeline.map((item) => ({ ...item })),
+      timeline: this.timeline.map((item) => ({ ...item, ...(item.approval ? { approval: { ...item.approval } } : {}) })),
+      canApprove: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("reviewer")),
     };
+  }
+
+  approvalSubmitting(requestId: string | number): void {
+    const item = this.find(`approval:${requestId}`);
+    if (item) item.status = "resolving";
+  }
+
+  approvalFailed(requestId: string | number, message: string): void {
+    const item = this.find(`approval:${requestId}`);
+    if (item) item.status = "pending";
+    this.add("error", `Approval ${requestId} was not sent: ${message}`, "Approval");
   }
 
   private handleAgent(event: AgentEvent): void {
@@ -185,8 +208,14 @@ export class ChatModel {
         this.upsert(`command:${event.itemId}`, "command", event.output ?? this.find(`command:${event.itemId}`)?.text ?? "", "Command", event.exitCode === 0 ? "completed" : `exit ${event.exitCode ?? "unknown"}`);
         break;
       case "approval.requested":
-        this.upsert(`approval:${event.requestId}`, "approval", "Interactive approval is not available yet. Approve or decline from the host when support is added.", "Approval required", "pending");
+        this.upsert(`approval:${event.requestId}`, "approval", this.approvalText(event), "Approval required", "pending", { requestId: event.requestId, approvalKind: event.approvalKind });
         break;
+      case "approval.resolved": {
+        const current = this.find(`approval:${event.requestId}`);
+        const status = event.decision === "accept" ? "approved" : event.decision === "decline" ? "declined" : "cancelled";
+        this.upsert(`approval:${event.requestId}`, "approval", current?.text ?? `Request ${event.requestId}`, "Approval", status, current?.approval);
+        break;
+      }
       case "turn.completed":
         this.activePrompt = undefined;
         this.add("system", `Turn completed${event.status ? ` · ${event.status}` : ""}`);
@@ -228,15 +257,24 @@ export class ChatModel {
     return this.timeline.find((item) => item.id === id);
   }
 
-  private upsert(id: string, kind: TimelineKind, text: string, title?: string, status?: string): void {
+  private approvalText(event: Extract<AgentEvent, { type: "approval.requested" }>): string {
+    const command = typeof event.details.command === "string" ? event.details.command : undefined;
+    const cwd = typeof event.details.cwd === "string" ? event.details.cwd : undefined;
+    const reason = typeof event.details.reason === "string" ? event.details.reason : undefined;
+    return [command ? `Command: ${command}` : undefined, cwd ? `Working directory: ${cwd}` : undefined, reason, !command && !cwd && !reason ? event.approvalKind : undefined].filter(Boolean).join("\n");
+  }
+
+  private upsert(id: string, kind: TimelineKind, text: string, title?: string, status?: string, approval?: TimelineItem["approval"]): void {
     const current = this.find(id);
     if (current) {
       current.text = text;
+      if (title) current.title = title;
       if (status) current.status = status;
       else delete current.status;
+      if (approval) current.approval = { ...approval };
       return;
     }
-    this.timeline.push({ id, kind, text, ...(title ? { title } : {}), ...(status ? { status } : {}), timestamp: new Date().toISOString() });
+    this.timeline.push({ id, kind, text, ...(title ? { title } : {}), ...(status ? { status } : {}), ...(approval ? { approval: { ...approval } } : {}), timestamp: new Date().toISOString() });
     if (this.timeline.length > maxTimelineItems) this.timeline.splice(0, this.timeline.length - maxTimelineItems);
   }
 }

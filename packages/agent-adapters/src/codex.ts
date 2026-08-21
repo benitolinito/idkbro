@@ -189,6 +189,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private process: ChildProcessWithoutNullStreams | undefined;
   private readonly eventQueue = new AsyncEventQueue<AgentEvent>();
   private readonly pending = new Map<string | number, PendingRequest>();
+  private readonly pendingApprovals = new Set<string | number>();
   private nextRequestId = 1;
   private threadId: string | undefined;
   private activeTurnId: string | undefined;
@@ -263,7 +264,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   async resolveApproval(requestId: string | number, decision: ApprovalDecision): Promise<void> {
+    if (!this.pendingApprovals.has(requestId)) throw new Error(`Approval request ${requestId} is no longer pending`);
     this.write({ id: requestId, result: { decision } });
+    this.pendingApprovals.delete(requestId);
+    this.eventQueue.push({ type: "approval.resolved", requestId, decision });
   }
 
   events(): AsyncIterable<AgentEvent> {
@@ -314,11 +318,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
     if (message.method === "turn/completed") this.activeTurnId = undefined;
     const event = normalizeCodexMessage(message);
-    if (event) this.eventQueue.push(event);
+    if (event) {
+      if (event.type === "approval.requested") this.pendingApprovals.add(event.requestId);
+      this.eventQueue.push(event);
+    }
   }
 
   private fail(error: Error): void {
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
+    this.pendingApprovals.clear();
   }
 }

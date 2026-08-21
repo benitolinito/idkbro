@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { controllerActionSchema, roomEventSchema } from "./index.js";
+import { controllerActionSchema, parseApprovalRequestId, roomEventSchema } from "./index.js";
 
 describe("room protocol", () => {
   it("accepts a valid append-only event", () => {
@@ -29,5 +29,10 @@ describe("room protocol", () => {
 
     expect(result.success).toBe(false);
   });
-});
 
+  it("preserves numeric approval request IDs across CLI input", () => {
+    expect(parseApprovalRequestId("91")).toBe(91);
+    expect(parseApprovalRequestId("approval-91")).toBe("approval-91");
+    expect(parseApprovalRequestId("091")).toBe("091");
+  });
+});
