@@ -10,8 +10,14 @@ export interface TimelineItem {
   text: string;
   status?: string;
   timestamp: string;
+  finishedAt?: string;
+  turnId?: string;
+  command?: string;
+  durationMs?: number;
   approval?: { requestId: string | number; approvalKind: string };
 }
+
+type TimelineMetadata = Partial<Pick<TimelineItem, "finishedAt" | "turnId" | "command" | "durationMs">>;
 
 export interface ParticipantView {
   name: string;
@@ -217,13 +223,30 @@ export class ChatModel {
         this.complete(`message:${event.itemId}`, "assistant", event.text, "Codex");
         break;
       case "command.started":
-        this.upsert(`command:${event.itemId}`, "command", event.command, "Command", "running");
+        this.upsert(`command:${event.itemId}`, "command", "", "Command", "running", undefined, { turnId: event.turnId, command: event.command });
         break;
       case "command.output":
         this.append(`command:${event.itemId}`, "command", event.text, "Command", "running");
         break;
       case "command.exited":
-        this.upsert(`command:${event.itemId}`, "command", event.output ?? this.find(`command:${event.itemId}`)?.text ?? "", "Command", event.exitCode === 0 ? "completed" : `exit ${event.exitCode ?? "unknown"}`);
+        {
+          const current = this.find(`command:${event.itemId}`);
+          const finishedAt = new Date().toISOString();
+          this.upsert(
+            `command:${event.itemId}`,
+            "command",
+            event.output ?? current?.text ?? "",
+            "Command",
+            event.exitCode === 0 ? "completed" : `exit ${event.exitCode ?? "unknown"}`,
+            undefined,
+            {
+              turnId: event.turnId,
+              ...(current?.command ? { command: current.command } : {}),
+              finishedAt,
+              ...(current ? { durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(current.timestamp)) } : {}),
+            },
+          );
+        }
         break;
       case "approval.requested":
         this.upsert(`approval:${event.requestId}`, "approval", this.approvalText(event), "Approval required", "pending", { requestId: event.requestId, approvalKind: event.approvalKind });
@@ -239,8 +262,7 @@ export class ChatModel {
         for (const reasoning of this.reasoningItems.values()) {
           if (reasoning.turnId === event.turnId) reasoning.completed = true;
         }
-        this.renderReasoning(event.turnId);
-        this.add("system", `Turn completed${event.status ? ` · ${event.status}` : ""}`);
+        this.renderReasoning(event.turnId, new Date().toISOString());
         break;
       case "agent.error":
         this.add("error", event.message, "Codex");
@@ -271,11 +293,19 @@ export class ChatModel {
     this.renderReasoning(turnId);
   }
 
-  private renderReasoning(turnId: string): void {
+  private renderReasoning(turnId: string, finishedAt?: string): void {
     const items = [...this.reasoningItems.values()].filter((item) => item.turnId === turnId);
     if (!items.length) return;
     const text = items.map((item) => item.text.trim()).filter(Boolean).join("\n\n");
-    this.upsert(`reasoning:${turnId}`, "reasoning", text, "Thinking", items.every((item) => item.completed) ? "completed" : "running");
+    this.upsert(
+      `reasoning:${turnId}`,
+      "reasoning",
+      text,
+      "Thinking",
+      items.every((item) => item.completed) ? "completed" : "running",
+      undefined,
+      { turnId, ...(finishedAt ? { finishedAt } : {}) },
+    );
   }
 
   private add(kind: TimelineKind, text: string, title?: string): void {
@@ -303,7 +333,7 @@ export class ChatModel {
     return [command ? `Command: ${command}` : undefined, cwd ? `Working directory: ${cwd}` : undefined, reason, !command && !cwd && !reason ? event.approvalKind : undefined].filter(Boolean).join("\n");
   }
 
-  private upsert(id: string, kind: TimelineKind, text: string, title?: string, status?: string, approval?: TimelineItem["approval"]): void {
+  private upsert(id: string, kind: TimelineKind, text: string, title?: string, status?: string, approval?: TimelineItem["approval"], metadata?: TimelineMetadata): void {
     const current = this.find(id);
     if (current) {
       current.text = text;
@@ -311,9 +341,10 @@ export class ChatModel {
       if (status) current.status = status;
       else delete current.status;
       if (approval) current.approval = { ...approval };
+      if (metadata) Object.assign(current, metadata);
       return;
     }
-    this.timeline.push({ id, kind, text, ...(title ? { title } : {}), ...(status ? { status } : {}), ...(approval ? { approval: { ...approval } } : {}), timestamp: new Date().toISOString() });
+    this.timeline.push({ id, kind, text, ...(title ? { title } : {}), ...(status ? { status } : {}), ...(approval ? { approval: { ...approval } } : {}), ...metadata, timestamp: new Date().toISOString() });
     if (this.timeline.length > maxTimelineItems) this.timeline.splice(0, this.timeline.length - maxTimelineItems);
   }
 }

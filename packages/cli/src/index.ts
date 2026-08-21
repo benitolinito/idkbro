@@ -50,6 +50,7 @@ import {
 } from "@multicode/workspace";
 import WebSocket from "ws";
 import { discoverLiveSessionForWorkspace } from "./live-session.js";
+import { renderTerminalMarkdown } from "./markdown.js";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
@@ -78,6 +79,15 @@ const err = {
 };
 
 const streamingReasoningItems = new Set<string>();
+const streamingAssistantItems = new Map<string, { turnId: string; text: string }>();
+
+function finishAssistantMessage(itemId: string, completedText?: string): void {
+  const buffered = streamingAssistantItems.get(itemId);
+  streamingAssistantItems.delete(itemId);
+  if (!buffered) process.stdout.write(`\n${chalk.green("●")} ${chalk.bold("Codex")}\n`);
+  const rendered = renderTerminalMarkdown(completedText || buffered?.text || "");
+  if (rendered) process.stdout.write(`${rendered}\n`);
+}
 
 function isApprovalDecision(value: unknown): value is ApprovalDecision {
   return value === "accept" || value === "decline" || value === "cancel";
@@ -137,7 +147,17 @@ function printAgentEvent(event: AgentEvent): void {
         process.stdout.write(`\n${chalk.cyan("◆")} ${chalk.bold("Thinking")}\n${chalk.dim(event.text)}\n`);
       }
       break;
-    case "agent.message.delta":
+    case "agent.message.delta": {
+      if (!streamingAssistantItems.has(event.itemId)) {
+        process.stdout.write(`\n${chalk.green("●")} ${chalk.bold("Codex")}\n`);
+      }
+      const current = streamingAssistantItems.get(event.itemId);
+      streamingAssistantItems.set(event.itemId, { turnId: event.turnId, text: `${current?.text ?? ""}${event.text}` });
+      break;
+    }
+    case "agent.message.completed":
+      finishAssistantMessage(event.itemId, event.text);
+      break;
     case "command.output":
       process.stdout.write(event.text);
       break;
@@ -152,6 +172,9 @@ function printAgentEvent(event: AgentEvent): void {
       console.error(`\n${err.error(`${err.label("Codex")} ${event.message}`)}`);
       break;
     case "turn.completed":
+      for (const [itemId, item] of streamingAssistantItems) {
+        if (item.turnId === event.turnId) finishAssistantMessage(itemId);
+      }
       console.error(`\n${err.success(`${err.label("Turn completed")}${event.status ? err.muted(` (${event.status})`) : ""}`)}`);
       break;
     default:

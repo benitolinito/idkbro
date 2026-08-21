@@ -64,8 +64,7 @@ describe("ChatModel", () => {
     expect(model.snapshot().timeline).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "reasoning", id: "reasoning:turn", text: "Inspecting files", status: "completed" }),
       expect.objectContaining({ kind: "assistant", text: "Done" }),
-      expect.objectContaining({ kind: "command", text: "24 passed", status: "completed" }),
-      expect.objectContaining({ kind: "system", text: "Turn completed · completed" }),
+      expect.objectContaining({ kind: "command", command: "npm test", text: "24 passed", status: "completed", turnId: "turn" }),
     ]));
   });
 

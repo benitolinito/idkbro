@@ -25,6 +25,7 @@
   "dependencies": {
     "@multicode/protocol": "0.0.0",
     "@multicode/workspace": "0.0.0",
+    "markdown-it": "^14.3.0",
     "ws": "^8.18.0",
     "yjs": "^13.6.27"
   },
@@ -156,6 +157,7 @@
     "clean": "tsc -b --clean"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
     "@types/vscode": "^1.96.0",
     "@vscode/vsce": "^3.6.2",
     "esbuild": "^0.25.0"
