@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -173,6 +173,27 @@ describe("v2 host room worktrees", () => {
     const repositoryRoot = await realpath(repository);
     expect(await inspectManagedRoomWorktree(room.sharedPath)).toMatchObject({ role: "shared", roomId: "room", repositoryRoot });
     expect(await inspectManagedRoomWorktree(room.agentPath)).toMatchObject({ role: "agent", roomId: "room", repositoryRoot });
+  });
+
+  it("retries prompt preparation while the agent index has a transient lock", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-agent-lock-repo-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-agent-lock-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "file.txt"), "base\n");
+    await execFileAsync("git", ["-C", repository, "add", "."]); await execFileAsync("git", ["-C", repository, "commit", "-qm", "base"]);
+    const room = await createRoomWorktrees({ cwd: repository, roomId: "agent-lock-room", dataDirectory });
+    const agentGitDirectory = (await execFileAsync("git", ["-C", room.agentPath, "rev-parse", "--git-dir"])).stdout.trim();
+    const indexLock = path.resolve(room.agentPath, agentGitDirectory, "index.lock");
+    await writeFile(indexLock, "transient lock");
+    const release = setTimeout(() => { void rm(indexLock, { force: true }); }, 100);
+    try {
+      await expect(prepareAgentTurnWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, roomId: room.roomId, sequence: 1, baseCommit: room.baseCommit, parentCommit: room.checkpointCommit })).resolves.toMatchObject({ sequence: 1 });
+    } finally {
+      clearTimeout(release);
+      await rm(indexLock, { force: true });
+    }
   });
 
   it("merges independent human and agent edits including agent-created files", async () => {

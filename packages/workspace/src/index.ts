@@ -53,12 +53,25 @@ export interface ParticipantWorkspaceState {
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  return stdout.trim();
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const { stdout } = await execFileAsync("git", args, {
+        cwd,
+        encoding: "utf8",
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      return stdout.trim();
+    } catch (error) {
+      if (attempt >= 7 || !isGitLockContention(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25 * (2 ** attempt), 1_000)));
+    }
+  }
+}
+
+function isGitLockContention(error: unknown): boolean {
+  const value = error as { message?: unknown; stderr?: unknown };
+  const detail = [value?.message, value?.stderr].filter((part): part is string => typeof part === "string").join("\n");
+  return /Unable to create [^\r\n]*\.lock[^\r\n]*File exists|Another git process seems to be running/i.test(detail);
 }
 
 async function gitWithEnv(cwd: string, args: string[], environment: NodeJS.ProcessEnv): Promise<string> {

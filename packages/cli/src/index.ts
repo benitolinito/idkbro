@@ -205,8 +205,8 @@ async function readWorkspaceDiff(cwd: string, revision: string): Promise<Workspa
   let combined: string;
   try {
     const [status, diff] = await Promise.all([
-      execFileAsync("git", ["status", "--short"], { cwd, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 }),
-      execFileAsync("git", ["diff", "--no-ext-diff", "--unified=3", "HEAD", "--"], {
+      execFileAsync("git", ["--no-optional-locks", "status", "--short"], { cwd, encoding: "utf8", maxBuffer: 2 * 1024 * 1024 }),
+      execFileAsync("git", ["--no-optional-locks", "diff", "--no-ext-diff", "--unified=3", "HEAD", "--"], {
         cwd,
         encoding: "utf8",
         maxBuffer: 10 * 1024 * 1024,
