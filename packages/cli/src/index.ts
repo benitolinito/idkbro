@@ -1697,6 +1697,8 @@ program
   .argument("<full-token>", "complete room token printed by the host")
   .option("--name <name>", "participant display name", defaultName)
   .option("--relay <url>", "override the central relay URL")
+  .option("--viewer", "join without edit or prompt permissions")
+  .option("--bootstrap-only", "prepare the room workspace and let another client own the live connection")
   .action(joinRoom);
 
 program
