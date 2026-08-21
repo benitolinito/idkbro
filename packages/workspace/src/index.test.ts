@@ -10,13 +10,17 @@ import {
   createTaskWorktree,
   createRoomWorktrees,
   createWorkspaceCheckpoint,
+  inspectDirectCheckout,
   inspectManagedRoomWorktree,
   inspectRepository,
   mergeAgentWorkspace,
   prepareParticipantWorkspace,
   prepareAgentTurnWorkspace,
+  prepareDirectHostedWorkspace,
   restoreParticipantWorkspace,
+  releaseDirectCheckoutLease,
   sanitizeRoomId,
+  WorkspaceProjectionTracker,
 } from "./index.js";
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +32,32 @@ describe("sanitizeRoomId", () => {
 
   it("rejects an empty result", () => {
     expect(() => sanitizeRoomId("///")).toThrow(/letter or number/);
+  });
+});
+
+describe("workspace projection tracking", () => {
+  it("recognizes repeated watcher echoes without importing them as edits", () => {
+    const projections = new WorkspaceProjectionTracker();
+    const readme = "# MultiCode\n\nOne shared document.\n";
+    projections.record("README.md", readme, { fileId: "readme", documentEpoch: 1, authoritySequence: 42 });
+
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      expect(projections.matches("README.md", readme, { fileId: "readme", documentEpoch: 1 })).toBe(true);
+    }
+    expect(projections.matches("README.md", readme, { fileId: "other", documentEpoch: 1 })).toBe(false);
+    expect(projections.matches("README.md", readme, { fileId: "readme", documentEpoch: 2 })).toBe(false);
+    expect(projections.matches("README.md", `${readme}\nExternal edit.\n`, { fileId: "readme", documentEpoch: 1 })).toBe(false);
+  });
+
+  it("moves and retires projection identity with manifest operations", () => {
+    const projections = new WorkspaceProjectionTracker();
+    projections.record("src/old.ts", "export const value = 1;\n", { fileId: "value", documentEpoch: 3, authoritySequence: 7 });
+    projections.move("src/old.ts", "src/new.ts");
+
+    expect(projections.get("src/old.ts")).toBeUndefined();
+    expect(projections.get("src/new.ts")).toMatchObject({ fileId: "value", documentEpoch: 3, authoritySequence: 7 });
+    projections.forget("src/new.ts");
+    expect(projections.get("src/new.ts")).toBeUndefined();
   });
 });
 
@@ -238,7 +268,114 @@ describe("v2 host room worktrees", () => {
     await writeFile(path.join(repository, "file.txt"), "base\n"); await execFileAsync("git", ["-C", repository, "add", "."]); await execFileAsync("git", ["-C", repository, "commit", "-qm", "base"]);
     const room = await createRoomWorktrees({ cwd: repository, roomId: "rollback-room", dataDirectory }); const turn = await prepareAgentTurnWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, roomId: room.roomId, sequence: 1, baseCommit: room.baseCommit, parentCommit: room.checkpointCommit });
     await writeFile(path.join(room.agentPath, "file.txt"), "agent\n");
-    await expect(mergeAgentWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, sessionDirectory: room.sessionDirectory, roomId: room.roomId, baseCommit: room.baseCommit, turn, withCommitLock: async (operation) => operation(), onApplied: async () => { throw new Error("journal failed"); } })).rejects.toThrow(/journal failed/);
+    await expect(mergeAgentWorkspace({ sharedPath: room.sharedPath, agentPath: room.agentPath, sessionDirectory: room.sessionDirectory, roomId: room.roomId, baseCommit: room.baseCommit, turn, withCommitLock: async (operation) => operation(), onCommitted: async () => { throw new Error("journal failed"); } })).rejects.toThrow(/journal failed/);
     expect(await readFile(path.join(room.sharedPath, "file.txt"), "utf8")).toBe("base\n");
+  });
+});
+
+describe("v3 direct host workspace", () => {
+  it("uses the original clean checkout and creates only an agent worktree", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-host-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "README.md"), "# Direct room\n");
+    await execFileAsync("git", ["-C", repository, "add", "README.md"]);
+    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
+
+    const hosted = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "direct-room", dataDirectory });
+    const root = await realpath(repository);
+    expect(hosted.workspacePath).toBe(root);
+    expect(hosted.agentPath).not.toBe(root);
+    expect(path.basename(hosted.agentPath)).toBe("agent");
+    expect(await readFile(path.join(hosted.workspacePath, "README.md"), "utf8")).toBe("# Direct room\n");
+    expect(await readFile(path.join(hosted.agentPath, "README.md"), "utf8")).toBe("# Direct room\n");
+    await expect(readFile(path.join(hosted.sessionDirectory, "shared", "README.md"), "utf8")).rejects.toThrow();
+    expect(await inspectManagedRoomWorktree(hosted.workspacePath)).toBeNull();
+    expect(await inspectManagedRoomWorktree(hosted.agentPath)).toMatchObject({ role: "agent", roomId: "direct-room", repositoryRoot: root });
+    await expect(prepareAgentTurnWorkspace({
+      sharedPath: hosted.workspacePath,
+      agentPath: hosted.agentPath,
+      roomId: hosted.roomId,
+      sequence: 1,
+      baseCommit: hosted.baseCommit,
+      parentCommit: hosted.checkpointCommit,
+    })).resolves.toMatchObject({ sequence: 1 });
+
+    const lease = JSON.parse(await readFile(hosted.lease.path, "utf8")) as Record<string, unknown>;
+    expect(lease).toMatchObject({ version: 3, roomId: "direct-room", repositoryRoot: root, baseCommit: hosted.baseCommit, initialTree: hosted.initialTree });
+    await releaseDirectCheckoutLease(hosted.lease);
+    await expect(readFile(hosted.lease.path, "utf8")).rejects.toThrow();
+  });
+
+  it("rejects dirty or mismatched checkouts before creating direct-room state", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-dirty-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-dirty-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "file.txt"), "base\n");
+    await execFileAsync("git", ["-C", repository, "add", "file.txt"]);
+    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
+    const clean = await inspectDirectCheckout({ cwd: repository });
+    await writeFile(path.join(repository, "file.txt"), "dirty\n");
+
+    await expect(inspectDirectCheckout({ cwd: repository })).rejects.toThrow(/Commit or stash/);
+    await expect(prepareDirectHostedWorkspace({ cwd: repository, roomId: "dirty-room", dataDirectory })).rejects.toThrow(/Commit or stash/);
+    await expect(readFile(path.join(dataDirectory, "dirty-room", ".multicode-session.json"), "utf8")).rejects.toThrow();
+    await execFileAsync("git", ["-C", repository, "restore", "file.txt"]);
+    await expect(inspectDirectCheckout({ cwd: repository, expectedBaseCommit: "0".repeat(clean.head.length) })).rejects.toThrow(/does not match room base/);
+  });
+
+  it("hands an agent merge to the authority before changing the direct checkout", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-merge-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-merge-data-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(repository, "file.txt"), "base\n");
+    await execFileAsync("git", ["-C", repository, "add", "file.txt"]);
+    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
+    const hosted = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "direct-merge", dataDirectory });
+    const turn = await prepareAgentTurnWorkspace({ sharedPath: hosted.workspacePath, agentPath: hosted.agentPath, roomId: hosted.roomId, sequence: 1, baseCommit: hosted.baseCommit, parentCommit: hosted.checkpointCommit });
+    await writeFile(path.join(hosted.agentPath, "file.txt"), "agent\n");
+    let committed = false;
+
+    const result = await mergeAgentWorkspace({
+      sharedPath: hosted.workspacePath,
+      agentPath: hosted.agentPath,
+      sessionDirectory: hosted.sessionDirectory,
+      roomId: hosted.roomId,
+      baseCommit: hosted.baseCommit,
+      turn,
+      withCommitLock: async (operation) => operation(),
+      onCommitted: async (changes) => {
+        expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("base\n");
+        expect(changes).toEqual([{ operation: "update", path: "file.txt", content: "agent\n" }]);
+        await writeFile(path.join(hosted.workspacePath, "file.txt"), changes[0]?.content ?? "");
+        committed = true;
+      },
+    });
+
+    expect(result.status).toBe("merged");
+    expect(committed).toBe(true);
+    expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("agent\n");
+    await releaseDirectCheckoutLease(hosted.lease);
+  });
+
+  it("allows only one direct room to lease a checkout", async () => {
+    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-lease-"));
+    const firstData = await mkdtemp(path.join(tmpdir(), "multicode-direct-first-"));
+    const secondData = await mkdtemp(path.join(tmpdir(), "multicode-direct-second-"));
+    await execFileAsync("git", ["init", "-q", repository]);
+    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
+    await execFileAsync("git", ["-C", repository, "commit", "--allow-empty", "-qm", "initial"]);
+    const first = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "first", dataDirectory: firstData });
+
+    await expect(prepareDirectHostedWorkspace({ cwd: repository, roomId: "second", dataDirectory: secondData })).rejects.toThrow(/already leased by room first/);
+    await expect(readFile(path.join(secondData, "second", ".multicode-session.json"), "utf8")).rejects.toThrow();
+    await releaseDirectCheckoutLease(first.lease);
   });
 });

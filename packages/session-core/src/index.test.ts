@@ -87,6 +87,29 @@ describe("host session durability", () => {
     expect(sessionText(session, "file")).toBe("");
   });
 
+  it("keeps document text stable when the same Yjs update is replayed repeatedly", async () => {
+    let sequence = 0;
+    const journal: DurableJournal = {
+      append: async (envelope, payload) => {
+        sequence += 1;
+        return { roomId: envelope.roomId, sequence, envelope: { ...envelope, sequence }, payload, createdAt: new Date().toISOString() };
+      },
+      replay: async () => [],
+    };
+    const session = new HostSession("room", "epoch", roomSecret(), journal);
+    const source = new Y.Doc();
+    const expected = "# MultiCode\n\nA shared README must not multiply.\n";
+    source.getText("content").insert(0, expected);
+    const update = Y.encodeStateAsUpdate(source);
+
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      await session.applyDocumentUpdate("ada", "README.md", update);
+    }
+
+    expect(sequence).toBe(1_000);
+    expect(sessionText(session, "README.md")).toBe(expected);
+  });
+
   it("rejects malformed Yjs updates before writing the journal", async () => {
     const appended: unknown[] = []; const journal: DurableJournal = { append: async (...args) => { appended.push(args); throw new Error("must not append"); }, replay: async () => [] };
     const session = new HostSession("room", "epoch", roomSecret(), journal);

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { access, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -32,6 +32,29 @@ export interface RoomWorktrees {
   sessionDirectory: string;
 }
 
+export interface DirectCheckoutLease {
+  version: 3;
+  roomId: string;
+  repositoryRoot: string;
+  sessionDirectory: string;
+  baseCommit: string;
+  initialTree: string;
+  nonce: string;
+  createdAt: string;
+  path: string;
+}
+
+export interface DirectHostedWorkspace {
+  roomId: string;
+  workspacePath: string;
+  agentPath: string;
+  baseCommit: string;
+  initialTree: string;
+  checkpointCommit: string;
+  sessionDirectory: string;
+  lease: DirectCheckoutLease;
+}
+
 export interface ManagedRoomWorktree {
   role: "shared" | "agent";
   roomId: string;
@@ -50,6 +73,61 @@ export interface ParticipantWorkspaceState {
   roomId: string;
   markerPath: string;
   creationNonce: string;
+}
+
+export interface WorkspaceProjectionIdentity {
+  fileId?: string;
+  documentEpoch?: number;
+  authoritySequence?: number;
+}
+
+export interface WorkspaceProjectionRecord extends WorkspaceProjectionIdentity {
+  path: string;
+  contentHash: string;
+}
+
+/**
+ * Records the exact content most recently accepted or materialized by the room
+ * authority. Filesystem watchers use this ledger to distinguish their own
+ * projection writes from genuinely external edits.
+ */
+export class WorkspaceProjectionTracker {
+  private readonly records = new Map<string, WorkspaceProjectionRecord>();
+
+  record(filePath: string, contents: string, identity: WorkspaceProjectionIdentity = {}): WorkspaceProjectionRecord {
+    const record: WorkspaceProjectionRecord = {
+      path: filePath,
+      contentHash: projectionContentHash(contents),
+      ...identity,
+    };
+    this.records.set(filePath, record);
+    return { ...record };
+  }
+
+  matches(filePath: string, contents: string, identity: Pick<WorkspaceProjectionIdentity, "fileId" | "documentEpoch"> = {}): boolean {
+    const record = this.records.get(filePath);
+    if (!record || record.contentHash !== projectionContentHash(contents)) return false;
+    if (identity.fileId !== undefined && record.fileId !== identity.fileId) return false;
+    if (identity.documentEpoch !== undefined && record.documentEpoch !== identity.documentEpoch) return false;
+    return true;
+  }
+
+  move(sourcePath: string, destinationPath: string): void {
+    const record = this.records.get(sourcePath);
+    this.records.delete(sourcePath);
+    if (record) this.records.set(destinationPath, { ...record, path: destinationPath });
+  }
+
+  forget(filePath: string): void { this.records.delete(filePath); }
+  clear(): void { this.records.clear(); }
+  get(filePath: string): WorkspaceProjectionRecord | undefined {
+    const record = this.records.get(filePath);
+    return record ? { ...record } : undefined;
+  }
+}
+
+export function projectionContentHash(contents: string): string {
+  return createHash("sha256").update(contents).digest("hex");
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -141,15 +219,151 @@ export async function inspectManagedRoomWorktree(cwd: string): Promise<ManagedRo
   }
   if (!marker || typeof marker !== "object") return null;
   const value = marker as Record<string, unknown>;
-  if (value.version !== 2 || typeof value.roomId !== "string" || typeof value.repositoryRoot !== "string") return null;
+  if (![2, 3].includes(value.version as number) || typeof value.roomId !== "string" || typeof value.repositoryRoot !== "string") return null;
   const current = path.resolve(repository.root);
-  const role = typeof value.sharedPath === "string" && path.resolve(value.sharedPath) === current
+  const role = value.version === 2 && typeof value.sharedPath === "string" && path.resolve(value.sharedPath) === current
     ? "shared"
     : typeof value.agentPath === "string" && path.resolve(value.agentPath) === current
       ? "agent"
       : null;
   if (!role) return null;
   return { role, roomId: value.roomId, repositoryRoot: value.repositoryRoot, sessionDirectory };
+}
+
+export async function inspectDirectCheckout(options: { cwd: string; expectedBaseCommit?: string }): Promise<RepositoryInfo & { initialTree: string }> {
+  const repository = await inspectRepository(options.cwd);
+  if (repository.operationInProgress) throw new Error("Finish the current merge, rebase, cherry-pick, or revert before starting a direct room");
+  if (repository.dirty) throw new Error("Commit or stash all tracked and untracked changes before starting a direct room");
+  if (options.expectedBaseCommit && repository.head !== options.expectedBaseCommit) {
+    throw new Error(`Checkout HEAD ${repository.head.slice(0, 12)} does not match room base ${options.expectedBaseCommit.slice(0, 12)}`);
+  }
+  return { ...repository, root: await realpath(repository.root), initialTree: await git(repository.root, ["rev-parse", `${repository.head}^{tree}`]) };
+}
+
+/**
+ * Prepares the v3 host layout: the original checkout is the room projection and
+ * the only additional Git worktree is the agent sandbox. This is intentionally
+ * separate from createRoomWorktrees until the direct-checkout migration flips.
+ */
+export async function prepareDirectHostedWorkspace(options: {
+  cwd: string;
+  roomId: string;
+  dataDirectory?: string;
+}): Promise<DirectHostedWorkspace> {
+  const repository = await inspectDirectCheckout({ cwd: options.cwd });
+  const roomId = sanitizeRoomId(options.roomId);
+  const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
+  const sessionDirectory = path.join(dataDirectory, roomId);
+  const agentPath = path.join(sessionDirectory, "agent");
+  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+  try {
+    await mkdir(sessionDirectory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Session directory already exists for ${roomId}`);
+    throw error;
+  }
+
+  let lease: DirectCheckoutLease | undefined;
+  try {
+    lease = await acquireDirectCheckoutLease({
+      repository,
+      roomId,
+      sessionDirectory,
+    });
+    // Close the preflight-to-lease race before creating any checkpoint from the
+    // checkout. Cooperative room writers now see the lease and must stand down.
+    await inspectDirectCheckout({ cwd: repository.root, expectedBaseCommit: repository.head });
+    const checkpoint = await createWorkspaceCheckpoint({ cwd: repository.root, roomId, sequence: 1, baseCommit: repository.head, force: true });
+    if (!checkpoint) throw new Error("Unable to create initial direct-room checkpoint");
+    await git(repository.root, ["worktree", "add", "--detach", agentPath, checkpoint.commit]);
+    const canonicalAgentPath = await realpath(agentPath);
+    await writeFile(path.join(sessionDirectory, ".multicode-session.json"), JSON.stringify({
+      version: 3,
+      roomId,
+      repositoryRoot: repository.root,
+      workspacePath: repository.root,
+      agentPath: canonicalAgentPath,
+      baseCommit: repository.head,
+      initialTree: repository.initialTree,
+      checkpointCommit: checkpoint.commit,
+      leasePath: lease.path,
+      creationNonce: lease.nonce,
+    }, null, 2), { mode: 0o600 });
+    return {
+      roomId,
+      workspacePath: repository.root,
+      agentPath: canonicalAgentPath,
+      baseCommit: repository.head,
+      initialTree: repository.initialTree,
+      checkpointCommit: checkpoint.commit,
+      sessionDirectory,
+      lease,
+    };
+  } catch (error) {
+    await git(repository.root, ["worktree", "remove", "--force", agentPath]).catch(() => undefined);
+    if (lease) await releaseDirectCheckoutLease(lease).catch(() => undefined);
+    await rm(sessionDirectory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export async function releaseDirectCheckoutLease(lease: DirectCheckoutLease): Promise<void> {
+  let persisted: Record<string, unknown>;
+  try {
+    persisted = JSON.parse(await readFile(lease.path, "utf8")) as Record<string, unknown>;
+  } catch {
+    throw new Error("Direct-room checkout lease is missing or invalid");
+  }
+  if (
+    persisted.version !== 3
+    || persisted.roomId !== lease.roomId
+    || persisted.repositoryRoot !== lease.repositoryRoot
+    || persisted.nonce !== lease.nonce
+  ) throw new Error("Refusing to release a direct-room lease owned by another session");
+  await rm(lease.path);
+}
+
+async function acquireDirectCheckoutLease(options: {
+  repository: RepositoryInfo & { initialTree: string };
+  roomId: string;
+  sessionDirectory: string;
+}): Promise<DirectCheckoutLease> {
+  const commonDirectory = await realpath(path.resolve(options.repository.root, await git(options.repository.root, ["rev-parse", "--git-common-dir"])));
+  const leaseDirectory = path.join(commonDirectory, "multicode");
+  const leasePath = path.join(leaseDirectory, "checkout-lease.json");
+  await mkdir(leaseDirectory, { recursive: true, mode: 0o700 });
+  const lease: DirectCheckoutLease = {
+    version: 3,
+    roomId: options.roomId,
+    repositoryRoot: options.repository.root,
+    sessionDirectory: options.sessionDirectory,
+    baseCommit: options.repository.head,
+    initialTree: options.repository.initialTree,
+    nonce: randomBytes(32).toString("base64url"),
+    createdAt: new Date().toISOString(),
+    path: leasePath,
+  };
+  let handle;
+  try {
+    handle = await open(leasePath, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      let owner = "another room";
+      try {
+        const existing = JSON.parse(await readFile(leasePath, "utf8")) as Record<string, unknown>;
+        if (typeof existing.roomId === "string") owner = `room ${existing.roomId}`;
+      } catch { /* Preserve an invalid lease for explicit recovery instead of deleting it. */ }
+      throw new Error(`Checkout is already leased by ${owner}; stop or recover that room before continuing`);
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(JSON.stringify(lease, null, 2));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return lease;
 }
 
 export async function createTaskWorktree(options: {
@@ -429,7 +643,7 @@ export async function cleanupParticipantWorkspace(options: {
 }
 
 export interface AgentTurnSnapshot { commit: string; sequence: number }
-export interface WorkspaceChange { operation: "create" | "update" | "delete" | "rename"; path: string; sourcePath?: string }
+export interface WorkspaceChange { operation: "create" | "update" | "delete" | "rename"; path: string; sourcePath?: string; content?: string }
 export interface PendingWorkspaceProposal { version: 1; sequence: number; roomId: string; baseCommit: string; agentCommit: string; humanCommit: string; patchPath: string; createdAt: string; status: "pending" }
 
 async function captureSnapshotCommit(options: { cwd: string; roomId: string; sequence: number; baseCommit: string; parentCommit: string }): Promise<string> {
@@ -439,10 +653,24 @@ async function captureSnapshotCommit(options: { cwd: string; roomId: string; seq
 }
 
 async function verifyOwnedHostWorktrees(sharedPath: string, agentPath: string, roomId: string): Promise<void> {
-  const shared = await realpath(sharedPath); const agent = await realpath(agentPath); const sessionDirectory = path.dirname(shared); const markerPath = path.join(sessionDirectory, ".multicode-session.json");
-  if (path.dirname(agent) !== sessionDirectory || path.basename(shared) !== "shared" || path.basename(agent) !== "agent") throw new Error("Refusing destructive operation outside MultiCode-owned host worktrees");
+  const shared = await realpath(sharedPath); const agent = await realpath(agentPath); const sessionDirectory = path.dirname(agent); const markerPath = path.join(sessionDirectory, ".multicode-session.json");
+  if (path.basename(agent) !== "agent") throw new Error("Refusing destructive operation outside a MultiCode-owned agent worktree");
   const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
-  if (marker.version !== 2 || marker.roomId !== sanitizeRoomId(roomId) || marker.sharedPath !== shared || marker.agentPath !== agent || typeof marker.creationNonce !== "string" || marker.creationNonce.length < 32) throw new Error("Refusing destructive operation because the host worktree marker is invalid");
+  const validNonce = typeof marker.creationNonce === "string" && marker.creationNonce.length >= 32;
+  const validV2 = marker.version === 2
+    && path.dirname(shared) === sessionDirectory
+    && path.basename(shared) === "shared"
+    && marker.sharedPath === shared;
+  const validV3 = marker.version === 3
+    && marker.workspacePath === shared
+    && typeof marker.leasePath === "string";
+  if (marker.roomId !== sanitizeRoomId(roomId) || marker.agentPath !== agent || !validNonce || (!validV2 && !validV3)) throw new Error("Refusing destructive operation because the host workspace marker is invalid");
+  if (validV3) {
+    const lease = JSON.parse(await readFile(marker.leasePath as string, "utf8")) as Record<string, unknown>;
+    if (lease.version !== 3 || lease.roomId !== marker.roomId || lease.repositoryRoot !== shared || lease.nonce !== marker.creationNonce) {
+      throw new Error("Refusing destructive operation because the direct checkout lease is invalid");
+    }
+  }
   const [sharedCommon, agentCommon] = await Promise.all([git(shared, ["rev-parse", "--git-common-dir"]), git(agent, ["rev-parse", "--git-common-dir"])]);
   if (await realpath(path.resolve(shared, sharedCommon)) !== await realpath(path.resolve(agent, agentCommon))) throw new Error("Host worktrees do not belong to the same repository");
 }
@@ -468,6 +696,18 @@ async function gitRaw(cwd: string, args: string[]): Promise<string> {
   return (await execFileAsync("git", args, { cwd, encoding: "utf8", maxBuffer: 20 * 1024 * 1024 })).stdout;
 }
 
+async function readTreeText(cwd: string, treeId: string, filePath: string): Promise<string> {
+  const contents = await new Promise<Buffer>((resolve, reject) => {
+    execFile("git", ["show", `${treeId}:${filePath}`], { cwd, encoding: "buffer", maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) { reject(new Error(Buffer.from(stderr).toString("utf8") || error.message)); return; }
+      resolve(Buffer.from(stdout));
+    });
+  });
+  if (contents.byteLength > 96 * 1024) throw new Error(`Agent result for ${filePath} exceeds the collaborative text limit`);
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(contents); }
+  catch { throw new Error(`Agent result for ${filePath} is not collaborative UTF-8 text`); }
+}
+
 export async function mergeAgentWorkspace(options: {
   sharedPath: string;
   agentPath: string;
@@ -476,7 +716,8 @@ export async function mergeAgentWorkspace(options: {
   baseCommit: string;
   turn: AgentTurnSnapshot;
   withCommitLock: <T>(operation: () => Promise<T>) => Promise<T>;
-  onApplied?: (changes: WorkspaceChange[]) => Promise<void>;
+  /** Journal and materialize the merged changes while the workspace lock is held. */
+  onCommitted?: (changes: WorkspaceChange[]) => Promise<void>;
 }): Promise<{ status: "unchanged" | "merged" | "conflicted"; proposalPath?: string; changes?: WorkspaceChange[] }> {
   await verifyOwnedHostWorktrees(options.sharedPath, options.agentPath, options.roomId);
   const agentCommit = await captureSnapshotCommit({ cwd: options.agentPath, roomId: `${options.roomId}-agent-final`, sequence: options.turn.sequence, baseCommit: options.baseCommit, parentCommit: options.turn.commit });
@@ -500,16 +741,21 @@ export async function mergeAgentWorkspace(options: {
     const fields = nameStatus.split("\0").filter(Boolean); const changes: WorkspaceChange[] = [];
     for (let index = 0; index < fields.length;) {
       const status = fields[index++] as string;
-      if (status.startsWith("R")) { const sourcePath = fields[index++] as string; const destinationPath = fields[index++] as string; changes.push({ operation: "rename", sourcePath, path: destinationPath }); }
-      else { const filePath = fields[index++] as string; changes.push({ operation: status === "A" ? "create" : status === "D" ? "delete" : "update", path: filePath }); }
+      if (status.startsWith("R")) {
+        const sourcePath = fields[index++] as string; const destinationPath = fields[index++] as string;
+        changes.push({ operation: "rename", sourcePath, path: destinationPath, content: await readTreeText(options.sharedPath, mergedTree, destinationPath) });
+      }
+      else {
+        const filePath = fields[index++] as string; const operation = status === "A" ? "create" : status === "D" ? "delete" : "update";
+        changes.push({ operation, path: filePath, ...(operation !== "delete" ? { content: await readTreeText(options.sharedPath, mergedTree, filePath) } : {}) });
+      }
     }
     const applied = await options.withCommitLock(async () => {
       const verification = await captureSnapshotCommit({ cwd: options.sharedPath, roomId: `${options.roomId}-merge-verify`, sequence: options.turn.sequence + attempt, baseCommit: options.baseCommit, parentCommit: humanCommit });
       if (await tree(options.sharedPath, verification) !== await tree(options.sharedPath, humanCommit)) return false;
       await applyPatch(options.sharedPath, patchText, true);
-      await applyPatch(options.sharedPath, patchText, false);
-      try { await options.onApplied?.(changes); }
-      catch (error) { await applyPatch(options.sharedPath, patchText, false, true); throw error; }
+      if (options.onCommitted) await options.onCommitted(changes);
+      else await applyPatch(options.sharedPath, patchText, false);
       return true;
     });
     if (applied) return { status: "merged", changes };

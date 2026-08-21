@@ -40,6 +40,7 @@ import {
   prepareAgentTurnWorkspace,
   restoreParticipantWorkspace,
   sanitizeRoomId,
+  WorkspaceProjectionTracker,
   type ParticipantWorkspaceState,
   type AgentTurnSnapshot,
   type WorkspaceChange,
@@ -389,6 +390,7 @@ async function assertNoSymlinkPath(root: string, target: string): Promise<void> 
 class RoomAuthority {
   private workspaceTail: Promise<void> = Promise.resolve();
   private readonly committedEvents = new Map<string, { actorId: string; event: CollaborationEvent }>();
+  private readonly projections = new WorkspaceProjectionTracker();
   private constructor(
     private readonly workspacePath: string,
     private readonly editorKey: Buffer,
@@ -447,11 +449,11 @@ class RoomAuthority {
   }
 
   async reconcileAgentChanges(changes: WorkspaceChange[]): Promise<CollaborationEvent[]> {
-    return this.enqueueWorkspace(() => this.reconcileWorkspaceChangesLocked(changes, "agent"));
+    return this.enqueueWorkspace(() => this.reconcileWorkspaceChangesLocked(changes, "agent", true));
   }
 
   async reconcileAgentChangesLocked(changes: WorkspaceChange[]): Promise<CollaborationEvent[]> {
-    return this.reconcileWorkspaceChangesLocked(changes, "agent");
+    return this.reconcileWorkspaceChangesLocked(changes, "agent", true);
   }
 
   async reconcileExternalWorkspace(): Promise<CollaborationEvent[]> {
@@ -470,18 +472,25 @@ class RoomAuthority {
         else changes.push({ operation: "delete", path: record.path });
       }
       for (const [file] of created) if (!consumedCreates.has(file)) changes.push({ operation: "create", path: file });
-      for (const record of active) { const value = current.get(record.path); if (value && value.hash !== record.contentHash) changes.push({ operation: "update", path: record.path }); }
+      for (const record of active) {
+        const value = current.get(record.path);
+        if (
+          value
+          && value.hash !== record.contentHash
+          && !this.projections.matches(record.path, value.content, { fileId: record.fileId, documentEpoch: record.documentEpoch })
+        ) changes.push({ operation: "update", path: record.path });
+      }
       return this.reconcileWorkspaceChangesLocked(changes, "external");
     });
   }
 
-  private async reconcileWorkspaceChangesLocked(changes: WorkspaceChange[], actorId: string): Promise<CollaborationEvent[]> {
+  private async reconcileWorkspaceChangesLocked(changes: WorkspaceChange[], actorId: string, materializeAfterCommit = false): Promise<CollaborationEvent[]> {
       const operations: WorkspaceTransactionOperation[] = [];
       for (const change of changes) {
         if (change.operation === "rename") {
           if (!change.sourcePath) throw new Error("Agent rename is missing its source path");
           const destination = safeRoomFile(this.workspacePath, change.path);
-          const content = await this.readCollaborativeText(destination.target);
+          const content = change.content ?? await this.readCollaborativeText(destination.target);
           operations.push({ type: "rename", sourcePath: change.sourcePath, destinationPath: change.path, content });
           continue;
         }
@@ -490,12 +499,18 @@ class RoomAuthority {
           continue;
         }
         const target = safeRoomFile(this.workspacePath, change.path);
-        const content = await this.readCollaborativeText(target.target);
+        const content = change.content ?? await this.readCollaborativeText(target.target);
         const existing = this.session.manifest.fileByPath(change.path);
         operations.push(existing ? { type: "replace", path: change.path, content } : { type: "create", path: change.path, content });
       }
       if (!operations.length) return [];
       const result = await this.session.applyWorkspaceTransaction(actorId, operations);
+      if (materializeAfterCommit) await this.materializeWorkspaceOperations(operations, result.sequence);
+      else for (const operation of operations) {
+          if (operation.type === "rename") this.projections.forget(operation.sourcePath);
+          if (operation.type === "delete") this.projections.forget(operation.path);
+          else this.rememberProjection(operation.type === "rename" ? operation.destinationPath : operation.path, result.sequence);
+        }
       const parts: CollaborationEvent[] = [];
       for (const operation of operations) {
         if (operation.type === "create" || operation.type === "delete" || operation.type === "rename") {
@@ -584,7 +599,7 @@ class RoomAuthority {
         const destination = safeRoomFile(this.workspacePath, operation.path); await assertNoSymlinkPath(this.workspacePath, destination.target);
         if (typeof operation.content !== "string" || Buffer.byteLength(operation.content) > maxCollaborativeTextBytes) throw new Error("Collaborative text file is too large");
         const result = await this.session.applyManifestOperation(actorId, operation, event.id);
-        await this.materialize(result.record.fileId);
+        await this.materialize(result.record.fileId, result.sequence);
         return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
       }
       if (operation.type === "rename") {
@@ -596,14 +611,17 @@ class RoomAuthority {
         await mkdir(path.dirname(destination.target), { recursive: true });
         await rename(source.target, destination.target).catch(async (error: NodeJS.ErrnoException) => {
           if (error.code !== "ENOENT") throw error;
-          await this.materialize(result.record.fileId);
+          await this.materialize(result.record.fileId, result.sequence);
         });
+        this.projections.forget(operation.sourcePath);
+        this.rememberProjection(result.record.path, result.sequence);
         return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
       }
       const target = safeRoomFile(this.workspacePath, operation.path);
       await assertNoSymlinkPath(this.workspacePath, target.target);
       const result = await this.session.applyManifestOperation(actorId, operation, event.id);
       await rm(target.target, { force: true });
+      this.projections.forget(operation.path);
       return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
     }
     if (event.kind !== "document.update") throw new Error("Participants cannot publish agent previews");
@@ -616,17 +634,51 @@ class RoomAuthority {
     if (!record || record.fileId !== updatePayload.fileId || record.documentEpoch !== updatePayload.documentEpoch) throw new Error("Document identity changed; resynchronization required");
     await assertNoSymlinkPath(this.workspacePath, safeRoomFile(this.workspacePath, record.path).target);
     const result = await this.session.applyDocumentUpdate(actorId, fileId, Buffer.from(updatePayload.update, "base64url"), event.id);
-    await this.materialize(result.fileId);
+    await this.materialize(result.fileId, result.sequence);
     return { ...event, sequence: result.sequence, actorId, committedAt: new Date().toISOString() };
   }
 
-  private async materialize(fileId: string): Promise<void> {
+  private async materialize(fileId: string, authoritySequence?: number): Promise<void> {
     const record = this.session.manifest.file(fileId);
     if (!record || record.deleted || record.kind !== "text") throw new Error("Authoritative manifest file no longer exists");
     const { target } = safeRoomFile(this.workspacePath, record.path);
     await assertNoSymlinkPath(this.workspacePath, target);
     await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(target, this.session.documents.document(fileId).getText("content").toString(), "utf8");
+    const contents = this.session.documents.document(fileId).getText("content").toString();
+    await writeFile(target, contents, "utf8");
+    this.projections.record(record.path, contents, {
+      fileId: record.fileId,
+      documentEpoch: record.documentEpoch,
+      ...(authoritySequence !== undefined ? { authoritySequence } : {}),
+    });
+  }
+
+  private rememberProjection(filePath: string, authoritySequence: number): void {
+    const record = this.session.manifest.fileByPath(filePath);
+    if (!record || record.deleted || record.kind !== "text") return;
+    const contents = this.session.documents.document(record.fileId).getText("content").toString();
+    this.projections.record(record.path, contents, { fileId: record.fileId, documentEpoch: record.documentEpoch, authoritySequence });
+  }
+
+  private async materializeWorkspaceOperations(operations: WorkspaceTransactionOperation[], authoritySequence: number): Promise<void> {
+    for (const operation of operations) {
+      if (operation.type === "rename") {
+        const source = safeRoomFile(this.workspacePath, operation.sourcePath);
+        await assertNoSymlinkPath(this.workspacePath, source.target);
+        await rm(source.target, { force: true });
+        this.projections.forget(operation.sourcePath);
+        const record = this.session.manifest.fileByPath(operation.destinationPath);
+        if (record) await this.materialize(record.fileId, authoritySequence);
+      } else if (operation.type === "delete") {
+        const target = safeRoomFile(this.workspacePath, operation.path);
+        await assertNoSymlinkPath(this.workspacePath, target.target);
+        await rm(target.target, { force: true });
+        this.projections.forget(operation.path);
+      } else {
+        const record = this.session.manifest.fileByPath(operation.path);
+        if (record) await this.materialize(record.fileId, authoritySequence);
+      }
+    }
   }
 
   private decryptEvent(event: CollaborationEvent): Uint8Array {
@@ -942,7 +994,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   };
   retryProposal = async () => {
     const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal"); let collaborationEvents: CollaborationEvent[] = [];
-    const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+    const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onCommitted: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
     if (merge.status !== "merged" && merge.status !== "unchanged") throw new Error("The proposal still conflicts with current human changes");
     for (const event of collaborationEvents) relay.publishCollaborationEvent(event); await publishCheckpoint(); pendingConflict = undefined;
     await Promise.all([rm(proposal.proposalPath, { force: true }), rm(proposal.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); relay.publishAgentEvent({ ...proposal.event, status: "resolved" } as AgentEvent);
@@ -959,7 +1011,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
         if (turn && (!event.status || event.status === "completed" || event.status === "success")) {
           try {
             let collaborationEvents: CollaborationEvent[] = [];
-            const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+            const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onCommitted: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
             if (merge.status === "merged") {
               for (const collaborationEvent of collaborationEvents) relay.publishCollaborationEvent(collaborationEvent);
               await publishCheckpoint();
@@ -1232,7 +1284,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     };
     retryProposal = async () => {
       const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal"); let collaborationEvents: CollaborationEvent[] = [];
-      const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+      const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onCommitted: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
       if (merge.status !== "merged" && merge.status !== "unchanged") throw new Error("The proposal still conflicts with current human changes");
       for (const event of collaborationEvents) sendToRelay({ type: "relay.collab.event", event }); await publishCheckpoint(); pendingConflict = undefined;
       await Promise.all([rm(proposal.proposalPath, { force: true }), rm(proposal.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); const resolved = { ...proposal.event, status: "resolved" } as AgentEvent;
@@ -1249,7 +1301,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
           if (turn && (!event.status || event.status === "completed" || event.status === "success")) {
             try {
               let collaborationEvents: CollaborationEvent[] = [];
-              const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onApplied: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
+              const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation), onCommitted: async (changes) => { collaborationEvents = await authority.reconcileAgentChangesLocked(changes); } });
               if (merge.status === "merged") {
                 for (const collaborationEvent of collaborationEvents) {
                   sendToRelay({ type: "relay.collab.event", event: collaborationEvent });

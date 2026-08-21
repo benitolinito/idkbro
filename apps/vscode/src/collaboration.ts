@@ -7,6 +7,7 @@ import WebSocket from "ws";
 import * as Y from "yjs";
 import { isSensitiveWorkspacePath } from "@multicode/protocol";
 import type { AgentEvent, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
+import { WorkspaceProjectionTracker } from "@multicode/workspace";
 import { SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
 
 interface EncryptedUpdate { file: string; nonce: string; tag: string; ciphertext: string; }
@@ -15,6 +16,7 @@ const execFileAsync = promisify(execFile);
 interface CollaborationWireEvent {
   kind: string;
   payload: string;
+  sequence?: number | undefined;
   actorId?: string | undefined;
   transactionId?: string | undefined;
   partIndex?: number | undefined;
@@ -30,6 +32,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly subscribedDocuments = new Set<string>();
   private readonly pendingLocalText = new Map<string, string>();
   private readonly documentIdentity = new Map<string, { fileId: string; documentEpoch: number }>();
+  private readonly projections = new WorkspaceProjectionTracker();
   private readonly suppressed = new Map<string, number>();
   private readonly disposables: vscode.Disposable[];
   private readonly presenceDecorations = new Map<string, vscode.TextEditorDecorationType>();
@@ -137,6 +140,7 @@ export class CollaborationBridge implements vscode.Disposable {
   setWorkspaceRoot(root: vscode.Uri | undefined): void {
     this.workspaceRootUri = root;
     this.ignoredPaths.clear();
+    this.projections.clear();
   }
 
   disconnect(): void {
@@ -145,6 +149,7 @@ export class CollaborationBridge implements vscode.Disposable {
     const socket = this.socket; this.socket = undefined; this.key = undefined; this.promptKey = undefined; this.inviteToken = ""; this.welcomed = false;
     for (const doc of this.docs.values()) doc.destroy();
     this.docs.clear(); this.readyDocuments.clear(); this.subscribedDocuments.clear(); this.pendingLocalText.clear(); this.documentIdentity.clear();
+    this.projections.clear();
     for (const actorId of [...this.presenceDecorations.keys()]) this.clearPresence(actorId);
     this.participantNames.clear();
     for (const transaction of this.workspaceTransactions.values()) clearTimeout(transaction.timer); this.workspaceTransactions.clear();
@@ -298,7 +303,7 @@ export class CollaborationBridge implements vscode.Disposable {
       this.proposalChanged.fire(this.proposalUri); void vscode.commands.executeCommand("setContext", "multicode.hasProposal", true); return;
     }
     if (event.kind === "manifest.operation") { await this.applyManifestEvent(event.payload); return; }
-    if (event.kind === "document.snapshot") { await this.applyDocumentSnapshot(event.payload); return; }
+    if (event.kind === "document.snapshot") { await this.applyDocumentSnapshot(event); return; }
     if (event.kind !== "document.update") return;
     const encrypted = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as EncryptedUpdate;
     if (encrypted.file !== "__document__") throw new Error("Invalid document update");
@@ -311,7 +316,7 @@ export class CollaborationBridge implements vscode.Disposable {
     }
     const update = Buffer.from(value.update, "base64url"); const doc = this.document(value.file);
     Y.applyUpdate(doc, update, "remote");
-    await this.renderDocument(value.file, doc.getText("content").toString());
+    await this.renderDocument(value.file, doc.getText("content").toString(), event.sequence);
   }
   private subscribe(document: vscode.TextDocument): void {
     const file = this.file(document);
@@ -324,8 +329,8 @@ export class CollaborationBridge implements vscode.Disposable {
     const payload = Buffer.from(JSON.stringify(this.encrypt("__control__", new TextEncoder().encode(JSON.stringify({ file }))))).toString("base64url");
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "document.subscribe", payload } }));
   }
-  private async applyDocumentSnapshot(payload: string): Promise<void> {
-    const encrypted = JSON.parse(Buffer.from(payload, "base64url").toString()) as EncryptedUpdate;
+  private async applyDocumentSnapshot(event: CollaborationWireEvent): Promise<void> {
+    const encrypted = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as EncryptedUpdate;
     if (encrypted.file !== "__snapshot__") throw new Error("Invalid document snapshot");
     const snapshot = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { file?: unknown; fileId?: unknown; documentEpoch?: unknown; update?: unknown };
     if (typeof snapshot.file !== "string" || typeof snapshot.fileId !== "string" || typeof snapshot.documentEpoch !== "number" || typeof snapshot.update !== "string") throw new Error("Invalid document snapshot");
@@ -350,7 +355,7 @@ export class CollaborationBridge implements vscode.Disposable {
       if (update) this.sendDocumentUpdate(snapshot.file, update);
       return;
     }
-    if (pending === undefined) await this.renderDocument(snapshot.file, canonical);
+    if (pending === undefined) await this.renderDocument(snapshot.file, canonical, event.sequence);
   }
   private sendDocumentUpdate(file: string, update: Uint8Array): void {
     if (!this.key || this.socket?.readyState !== WebSocket.OPEN) return;
@@ -360,13 +365,15 @@ export class CollaborationBridge implements vscode.Disposable {
     const payload = Buffer.from(JSON.stringify(this.encrypt("__document__", plaintext))).toString("base64url");
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "document.update", payload } }));
   }
-  private async renderDocument(file: string, contents: string): Promise<void> {
+  private async renderDocument(file: string, contents: string, authoritySequence?: number): Promise<void> {
     const root = this.workspaceRoot(); if (!root) return;
     const uri = vscode.Uri.joinPath(root, ...file.split("/"));
     const open = await vscode.workspace.openTextDocument(uri);
     const saveProjection = shouldSaveRenderedDocument(this.workspaceDiskOwner);
     if (open.getText() === contents) {
       if (saveProjection && open.isDirty && !await open.save()) throw new Error(`Could not save collaborative update to ${file}`);
+      const identity = this.documentIdentity.get(file);
+      this.projections.record(file, contents, { ...identity, ...(authoritySequence !== undefined ? { authoritySequence } : {}) });
       return;
     }
     this.suppressed.set(file, (this.suppressed.get(file) ?? 0) + 1);
@@ -380,6 +387,8 @@ export class CollaborationBridge implements vscode.Disposable {
       // worktrees have no daemon projector, so their extension remains the
       // single writer and persists the rendered buffer.
       if (saveProjection && !await open.save()) throw new Error(`Could not save collaborative update to ${file}`);
+      const identity = this.documentIdentity.get(file);
+      this.projections.record(file, contents, { ...identity, ...(authoritySequence !== undefined ? { authoritySequence } : {}) });
     }
     finally {
       const remaining = (this.suppressed.get(file) ?? 1) - 1;
@@ -470,6 +479,8 @@ export class CollaborationBridge implements vscode.Disposable {
       if (open?.isDirty) { void vscode.window.showWarningMessage(`MultiCode did not import an external write to ${file} because the editor has unsaved changes.`); return; }
       const bytes = await vscode.workspace.fs.readFile(uri); if (bytes.byteLength > maxCollaborativeTextBytes) return;
       const contents = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      const identity = this.documentIdentity.get(file);
+      if (this.projections.matches(file, contents, identity)) return;
       if (!this.readyDocuments.has(file)) { this.pendingLocalText.set(file, contents); this.subscribeFile(file); return; }
       const doc = this.document(file); const text = doc.getText("content"); if (text.toString() === contents) return;
       let update: Uint8Array | undefined; const listener = (value: Uint8Array) => { update = value; }; doc.on("update", listener);
@@ -501,6 +512,7 @@ export class CollaborationBridge implements vscode.Disposable {
       if (operation.type === "create") {
         const destination = roomUri(operation.path); this.markStructural(destination); await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(destination, ".."));
         await vscode.workspace.fs.writeFile(destination, new TextEncoder().encode(operation.content));
+        this.projections.record(operation.path, operation.content);
       }
       else if (operation.type === "rename") {
         const source = roomUri(operation.sourcePath); const destination = roomUri(operation.destinationPath); this.markStructural(source); this.markStructural(destination); await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(destination, ".."));
@@ -514,12 +526,14 @@ export class CollaborationBridge implements vscode.Disposable {
       this.applyingRemoteManifest -= 1;
     }
     if (operation.type === "rename") {
+      this.projections.move(operation.sourcePath, operation.destinationPath);
       const doc = this.docs.get(operation.sourcePath); if (doc) { this.docs.delete(operation.sourcePath); this.docs.set(operation.destinationPath, doc); }
       const identity = this.documentIdentity.get(operation.sourcePath); if (identity) { this.documentIdentity.delete(operation.sourcePath); this.documentIdentity.set(operation.destinationPath, identity); }
       if (this.readyDocuments.delete(operation.sourcePath)) this.readyDocuments.add(operation.destinationPath);
       if (this.subscribedDocuments.delete(operation.sourcePath)) this.subscribedDocuments.add(operation.destinationPath);
       const pending = this.pendingLocalText.get(operation.sourcePath); if (pending !== undefined) { this.pendingLocalText.delete(operation.sourcePath); this.pendingLocalText.set(operation.destinationPath, pending); }
     } else if (operation.type === "delete") {
+      this.projections.forget(operation.path);
       this.docs.get(operation.path)?.destroy(); this.docs.delete(operation.path); this.documentIdentity.delete(operation.path);
       this.readyDocuments.delete(operation.path); this.subscribedDocuments.delete(operation.path); this.pendingLocalText.delete(operation.path);
     }
