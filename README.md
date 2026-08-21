@@ -44,7 +44,7 @@ code --install-extension apps/vscode/multicode-vscode-0.4.1.vsix
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
 
-- **MultiCode: Host Room** — start Codex in the current workspace and copy the new room code to the clipboard.
+- **MultiCode: Host Room** — start Codex and open its isolated shared worktree in a new connected window without replacing the original checkout.
 - **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
 - **MultiCode: Open Chat** — open the shared Codex-style conversation sidebar.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.

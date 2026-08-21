@@ -4,7 +4,7 @@ Host or join a shared Codex session without leaving VS Code. The extension inclu
 
 ## Commands
 
-- **MultiCode: Host Room** creates isolated shared and Codex worktrees, opens the shared workspace, and copies the complete encrypted invite token.
+- **MultiCode: Host Room** creates isolated shared and Codex worktrees, opens the shared workspace in a new connected window, and copies the complete encrypted invite token.
 - Pressing **Host Room** from an existing MultiCode room worktree automatically starts the new room from its original repository; reopening the original folder is not required.
 - **MultiCode: Join Room** creates an isolated participant worktree without switching or resetting the original checkout.
 - **MultiCode: Open Chat** opens the shared conversation sidebar.
