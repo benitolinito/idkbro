@@ -3,6 +3,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import * as vscode from "vscode";
+import { hostApprovalCliArgs } from "./approval.js";
 import { MultiCodeChatView } from "./chat-view.js";
 import { CollaborationBridge } from "./collaboration.js";
 import { resolveHostingDirectory } from "./host-workspace.js";
@@ -165,7 +166,7 @@ class MultiCodeController implements vscode.Disposable {
 
   async resolveApproval(requestId: string | number, decision: ApprovalDecision): Promise<void> {
     if (this.mode === "host" && this.roomWorkspace) {
-      await this.runCliCommand(["approve", String(requestId), decision], this.roomWorkspace);
+      await this.runCliCommand(hostApprovalCliArgs(this.roomSessionId, requestId, decision), this.roomWorkspace);
       return;
     }
     if (this.collaboration.resolveApproval(requestId, decision)) return;

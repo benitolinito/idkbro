@@ -49,6 +49,7 @@ import {
   type WorkspaceChange,
 } from "@multicode/workspace";
 import WebSocket from "ws";
+import { discoverLiveSessionForWorkspace } from "./live-session.js";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
@@ -1685,16 +1686,7 @@ interface LiveSessionStatus { roomId: string; mode: string; workspacePath: strin
 async function sessionDirectoryFor(roomId?: string): Promise<{ roomId: string; directory: string }> {
   const root = path.join(homedir(), ".multicode", "sessions");
   if (roomId) { const safe = sanitizeRoomId(roomId); return { roomId: safe, directory: path.join(root, safe) }; }
-  const cwd = path.resolve(process.cwd());
-  for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
-    if (!entry.isDirectory()) continue;
-    const directory = path.join(root, entry.name);
-    try {
-      const marker = JSON.parse(await readFile(path.join(directory, ".multicode-session.json"), "utf8")) as { repositoryRoot?: string; sharedPath?: string; agentPath?: string; roomId?: string };
-      if ([marker.repositoryRoot, marker.sharedPath, marker.agentPath].some((candidate) => candidate && path.resolve(candidate) === cwd)) return { roomId: marker.roomId ?? entry.name, directory };
-    } catch { /* Ignore unrelated or incomplete session directories. */ }
-  }
-  throw new Error("Specify a room ID, or run this command from a repository with a live MultiCode session");
+  return discoverLiveSessionForWorkspace(root, process.cwd());
 }
 
 async function liveSessionRequest<T>(roomId: string | undefined, payload: unknown, timeoutMs = 5_000): Promise<T> {
