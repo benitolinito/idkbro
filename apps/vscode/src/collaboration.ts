@@ -90,7 +90,7 @@ export class CollaborationBridge implements vscode.Disposable {
     ];
   }
 
-  connect(relayUrl: string, inviteToken: string, name: string, requestedRole: "viewer" | "editor" = "editor", workspaceDiskOwner: WorkspaceDiskOwner = "extension"): void {
+  connect(relayUrl: string, inviteToken: string, name: string, requestedRole: "viewer" | "editor" = "editor", workspaceDiskOwner: WorkspaceDiskOwner = "extension", captureLocalText = true): void {
     if (
       this.relayUrl === relayUrl
       && this.inviteToken === inviteToken
@@ -100,7 +100,7 @@ export class CollaborationBridge implements vscode.Disposable {
       && (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING)
     ) return;
 
-    const localBuffers = requestedRole === "viewer" ? [] : vscode.workspace.textDocuments.flatMap((document) => {
+    const localBuffers = requestedRole === "viewer" || !captureLocalText ? [] : vscode.workspace.textDocuments.flatMap((document) => {
       const file = this.file(document);
       return file ? [[file, document.getText()] as const] : [];
     });
@@ -132,7 +132,7 @@ export class CollaborationBridge implements vscode.Disposable {
       this.socket = undefined;
       if (this.inviteToken) {
         this.statusChanged.fire("reconnecting");
-        this.reconnectTimer = setTimeout(() => this.connect(this.relayUrl, this.inviteToken, this.displayName, this.requestedRole, this.workspaceDiskOwner), 5_000);
+        this.reconnectTimer = setTimeout(() => this.connect(this.relayUrl, this.inviteToken, this.displayName, this.requestedRole, this.workspaceDiskOwner, true), 5_000);
       }
     });
   }

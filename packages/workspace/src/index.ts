@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { access, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -55,7 +55,20 @@ export interface DirectHostedWorkspace {
   lease: DirectCheckoutLease;
 }
 
+export interface DirectParticipantWorkspaceState {
+  roomId: string;
+  root: string;
+  baseCommit: string;
+  initialTree: string;
+  sessionDirectory: string;
+  markerPath: string;
+  lease: DirectCheckoutLease;
+  projectedCommit: string;
+  checkpointSequence: number;
+}
+
 export interface ManagedRoomWorktree {
+  version: 2 | 3;
   role: "shared" | "agent";
   roomId: string;
   repositoryRoot: string;
@@ -227,7 +240,7 @@ export async function inspectManagedRoomWorktree(cwd: string): Promise<ManagedRo
       ? "agent"
       : null;
   if (!role) return null;
-  return { role, roomId: value.roomId, repositoryRoot: value.repositoryRoot, sessionDirectory };
+  return { version: value.version as 2 | 3, role, roomId: value.roomId, repositoryRoot: value.repositoryRoot, sessionDirectory };
 }
 
 export async function inspectDirectCheckout(options: { cwd: string; expectedBaseCommit?: string }): Promise<RepositoryInfo & { initialTree: string }> {
@@ -242,8 +255,7 @@ export async function inspectDirectCheckout(options: { cwd: string; expectedBase
 
 /**
  * Prepares the v3 host layout: the original checkout is the room projection and
- * the only additional Git worktree is the agent sandbox. This is intentionally
- * separate from createRoomWorktrees until the direct-checkout migration flips.
+ * the only additional Git worktree is the temporary agent sandbox.
  */
 export async function prepareDirectHostedWorkspace(options: {
   cwd: string;
@@ -323,6 +335,45 @@ export async function releaseDirectCheckoutLease(lease: DirectCheckoutLease): Pr
   await rm(lease.path);
 }
 
+/** Ends a v3 host session without touching the user's checkout contents. */
+export async function closeDirectHostedWorkspace(workspace: DirectHostedWorkspace): Promise<void> {
+  await verifyOwnedHostWorktrees(workspace.workspacePath, workspace.agentPath, workspace.roomId);
+  try {
+    await git(workspace.workspacePath, ["worktree", "remove", "--force", workspace.agentPath]);
+  } finally {
+    await releaseDirectCheckoutLease(workspace.lease);
+  }
+}
+
+/** Force-removes both worktrees from a superseded v2 host session. */
+export async function cleanupLegacyHostedWorkspace(options: {
+  roomId: string;
+  dataDirectory?: string;
+}): Promise<{ repositoryRoot: string; sharedPath: string; agentPath: string }> {
+  const roomId = sanitizeRoomId(options.roomId);
+  const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
+  const sessionDirectory = path.join(dataDirectory, roomId);
+  const markerPath = path.join(sessionDirectory, ".multicode-session.json");
+  let marker: Record<string, unknown>;
+  try {
+    marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+  } catch {
+    throw new Error(`No valid legacy MultiCode host workspace exists for ${roomId}`);
+  }
+  if (
+    marker.version !== 2
+    || marker.roomId !== roomId
+    || typeof marker.repositoryRoot !== "string"
+    || typeof marker.sharedPath !== "string"
+    || typeof marker.agentPath !== "string"
+  ) throw new Error(`No valid legacy MultiCode host workspace exists for ${roomId}`);
+  await verifyOwnedHostWorktrees(marker.sharedPath, marker.agentPath, roomId);
+  await git(marker.repositoryRoot, ["worktree", "remove", "--force", marker.agentPath]);
+  await git(marker.repositoryRoot, ["worktree", "remove", "--force", marker.sharedPath]);
+  await rm(sessionDirectory, { recursive: true, force: false });
+  return { repositoryRoot: marker.repositoryRoot, sharedPath: marker.sharedPath, agentPath: marker.agentPath };
+}
+
 async function acquireDirectCheckoutLease(options: {
   repository: RepositoryInfo & { initialTree: string };
   roomId: string;
@@ -364,6 +415,149 @@ async function acquireDirectCheckoutLease(options: {
     await handle.close();
   }
   return lease;
+}
+
+export async function prepareDirectParticipantWorkspace(options: {
+  cwd: string;
+  roomId: string;
+  baseCommit: string;
+  dataDirectory?: string;
+}): Promise<DirectParticipantWorkspaceState> {
+  const repository = await inspectDirectCheckout({ cwd: options.cwd, expectedBaseCommit: options.baseCommit });
+  const roomId = sanitizeRoomId(options.roomId);
+  const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
+  const sessionDirectory = path.join(dataDirectory, "rooms", roomId);
+  const markerPath = path.join(sessionDirectory, ".multicode-room.json");
+  await mkdir(path.dirname(sessionDirectory), { recursive: true, mode: 0o700 });
+  try {
+    await mkdir(sessionDirectory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Session state already exists for room ${roomId}`);
+    throw error;
+  }
+
+  let lease: DirectCheckoutLease | undefined;
+  try {
+    lease = await acquireDirectCheckoutLease({ repository, roomId, sessionDirectory });
+    const state: DirectParticipantWorkspaceState = {
+      roomId,
+      root: repository.root,
+      baseCommit: repository.head,
+      initialTree: repository.initialTree,
+      sessionDirectory,
+      markerPath,
+      lease,
+      projectedCommit: repository.head,
+      checkpointSequence: 0,
+    };
+    await persistDirectParticipantState(state);
+    return state;
+  } catch (error) {
+    if (lease) await releaseDirectCheckoutLease(lease).catch(() => undefined);
+    await rm(sessionDirectory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export async function applyDirectWorkspaceCheckpoint(state: DirectParticipantWorkspaceState, checkpoint: WorkspaceCheckpoint): Promise<void> {
+  await verifyDirectParticipantWorkspace(state);
+  if (checkpoint.baseCommit !== state.baseCommit) throw new Error("Room checkpoint base does not match this checkout");
+  if (checkpoint.sequence <= state.checkpointSequence) return;
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-apply-"));
+  const bundlePath = path.join(temporaryDirectory, "checkpoint.bundle");
+  const localRef = `refs/multicode/received/${sanitizeRoomId(state.roomId)}`;
+  try {
+    await writeFile(bundlePath, Buffer.from(checkpoint.bundle, "base64"));
+    await git(state.root, ["bundle", "verify", bundlePath]);
+    await git(state.root, ["fetch", bundlePath, `${checkpoint.ref}:${localRef}`]);
+    const receivedCommit = await git(state.root, ["rev-parse", localRef]);
+    if (receivedCommit !== checkpoint.commit) throw new Error("Received checkpoint hash does not match the host");
+    const [currentTree, projectedTree] = await Promise.all([
+      captureWorkspaceTree(state.root),
+      git(state.root, ["rev-parse", `${state.projectedCommit}^{tree}`]),
+    ]);
+    if (currentTree !== projectedTree) throw new Error("Local checkout changed after room synchronization; refusing to overwrite it with a checkpoint");
+    const patchText = await gitRaw(state.root, ["diff", "--binary", state.projectedCommit, checkpoint.commit]);
+    let applied = false;
+    try {
+      await applyPatch(state.root, patchText, true);
+      await applyPatch(state.root, patchText, false);
+      applied = true;
+      const resultingTree = await captureWorkspaceTree(state.root);
+      const checkpointTree = await git(state.root, ["rev-parse", `${checkpoint.commit}^{tree}`]);
+      if (resultingTree !== checkpointTree) throw new Error("Checkpoint projection did not produce the advertised workspace tree");
+      const nextState = { ...state, projectedCommit: checkpoint.commit, checkpointSequence: checkpoint.sequence };
+      await persistDirectParticipantState(nextState);
+      state.projectedCommit = nextState.projectedCommit;
+      state.checkpointSequence = nextState.checkpointSequence;
+    } catch (error) {
+      if (applied) await applyPatch(state.root, patchText, false, true).catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+export async function releaseDirectParticipantWorkspace(state: DirectParticipantWorkspaceState): Promise<string> {
+  await verifyDirectParticipantWorkspace(state);
+  await releaseDirectCheckoutLease(state.lease);
+  await rm(state.sessionDirectory, { recursive: true, force: false });
+  return state.root;
+}
+
+async function persistDirectParticipantState(state: DirectParticipantWorkspaceState): Promise<void> {
+  const contents = JSON.stringify({
+    version: 3,
+    roomId: state.roomId,
+    repositoryRoot: state.root,
+    workspacePath: state.root,
+    baseCommit: state.baseCommit,
+    initialTree: state.initialTree,
+    projectedCommit: state.projectedCommit,
+    checkpointSequence: state.checkpointSequence,
+    lease: state.lease,
+  }, null, 2);
+  const temporaryMarker = `${state.markerPath}.${randomBytes(12).toString("hex")}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporaryMarker, "wx", 0o600);
+    await handle.writeFile(contents);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryMarker, state.markerPath);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporaryMarker, { force: true });
+  }
+}
+
+async function verifyDirectParticipantWorkspace(state: DirectParticipantWorkspaceState): Promise<void> {
+  const [root, markerPath, sessionDirectory] = await Promise.all([realpath(state.root), realpath(state.markerPath), realpath(state.sessionDirectory)]);
+  if (
+    root !== path.resolve(state.root)
+    || markerPath !== path.join(sessionDirectory, ".multicode-room.json")
+    || path.basename(sessionDirectory) !== state.roomId
+  ) throw new Error("Refusing to operate on an unverified direct room checkout");
+  const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+  const persistedLease = marker.lease as Record<string, unknown> | undefined;
+  if (
+    marker.version !== 3
+    || marker.roomId !== state.roomId
+    || marker.repositoryRoot !== root
+    || marker.baseCommit !== state.baseCommit
+    || marker.initialTree !== state.initialTree
+    || marker.projectedCommit !== state.projectedCommit
+    || marker.checkpointSequence !== state.checkpointSequence
+    || !persistedLease
+    || persistedLease.path !== state.lease.path
+    || persistedLease.nonce !== state.lease.nonce
+  ) throw new Error("Refusing to operate because the direct room marker is invalid");
+  const lease = JSON.parse(await readFile(state.lease.path, "utf8")) as Record<string, unknown>;
+  if (lease.version !== 3 || lease.roomId !== state.roomId || lease.repositoryRoot !== root || lease.nonce !== state.lease.nonce) {
+    throw new Error("Refusing to operate because the direct checkout lease is invalid");
+  }
 }
 
 export async function createTaskWorktree(options: {
@@ -424,6 +618,20 @@ export async function createRoomWorktrees(options: {
     await git(repository.root, ["worktree", "remove", "--force", agentPath]).catch(() => undefined);
     await rm(sessionDirectory, { recursive: true, force: true });
     throw error;
+  }
+}
+
+async function captureWorkspaceTree(cwd: string): Promise<string> {
+  const repository = await inspectRepository(cwd);
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "multicode-tree-"));
+  const indexPath = path.join(temporaryDirectory, "index");
+  try {
+    const environment = { GIT_INDEX_FILE: indexPath };
+    await gitWithEnv(repository.root, ["read-tree", repository.head], environment);
+    await gitWithEnv(repository.root, ["add", "-A", "--", "."], environment);
+    return await gitWithEnv(repository.root, ["write-tree"], environment);
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
   }
 }
 
@@ -619,6 +827,28 @@ export async function cleanupParticipantWorkspace(options: {
     marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
   } catch {
     throw new Error(`No valid preserved MultiCode room workspace exists for ${roomId}`);
+  }
+  if (marker.version === 3) {
+    const lease = marker.lease as DirectCheckoutLease | undefined;
+    if (
+      typeof marker.repositoryRoot !== "string"
+      || typeof marker.baseCommit !== "string"
+      || typeof marker.initialTree !== "string"
+      || typeof marker.projectedCommit !== "string"
+      || typeof marker.checkpointSequence !== "number"
+      || !lease
+    ) throw new Error(`No valid direct MultiCode room state exists for ${roomId}`);
+    return releaseDirectParticipantWorkspace({
+      roomId,
+      root: marker.repositoryRoot,
+      baseCommit: marker.baseCommit,
+      initialTree: marker.initialTree,
+      sessionDirectory: roomDirectory,
+      markerPath,
+      lease,
+      projectedCommit: marker.projectedCommit,
+      checkpointSequence: marker.checkpointSequence,
+    });
   }
   if (typeof marker.repositoryRoot !== "string" || typeof marker.workspacePath !== "string" || typeof marker.creationNonce !== "string") {
     throw new Error(`No valid preserved MultiCode room workspace exists for ${roomId}`);

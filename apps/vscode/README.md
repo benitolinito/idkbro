@@ -4,9 +4,9 @@ Host or join a shared Codex session without leaving VS Code. The extension inclu
 
 ## Commands
 
-- **MultiCode: Host Room** creates isolated shared and Codex worktrees, opens the shared workspace in a new connected window, and copies the complete encrypted invite token.
-- Pressing **Host Room** from an existing MultiCode room worktree automatically starts the new room from its original repository; reopening the original folder is not required.
-- **MultiCode: Join Room** creates an isolated participant worktree without switching or resetting the original checkout.
+- **MultiCode: Host Room** leases the clean checkout, creates one temporary Codex worktree, stays in the current window, and copies the complete encrypted invite token.
+- Starting from a legacy v2 MultiCode room worktree discards its shared/agent worktrees and switches the same window back to the original repository before hosting or joining.
+- **MultiCode: Join Room** synchronizes the room into the current clean checkout without moving its branch or resetting its index.
 - **MultiCode: Open Chat** opens the shared conversation sidebar.
 - **MultiCode: Send Prompt** adds a prompt to the shared FIFO queue.
 - **MultiCode: Stop or Leave Room** ends the current process.
@@ -16,4 +16,4 @@ Host or join a shared Codex session without leaving VS Code. The extension inclu
 
 The packaged extension includes the MultiCode CLI. During development it also detects this repository's built CLI. Set `multicode.executable` only when you want to use a different CLI installation.
 
-Open a clone of the same Git repository before hosting or joining. Hosts also need an authenticated Codex CLI. Bootstrap uses a verified checkpoint; live UTF-8 text and file operations use the host's durable Yjs/manifest authority. Original checkouts stay untouched, and room worktrees are preserved on leave for recovery or export.
+Open a clean clone of the same Git repository at the host's base commit before hosting or joining. Hosts also need an authenticated Codex CLI. Bootstrap uses a verified checkpoint; live UTF-8 text and file operations use the host's durable Yjs/manifest authority. Room changes appear directly in both users' local checkouts and remain there after leaving.

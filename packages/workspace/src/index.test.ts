@@ -6,6 +6,9 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   applyWorkspaceCheckpoint,
+  applyDirectWorkspaceCheckpoint,
+  closeDirectHostedWorkspace,
+  cleanupLegacyHostedWorkspace,
   cleanupParticipantWorkspace,
   createTaskWorktree,
   createRoomWorktrees,
@@ -17,6 +20,7 @@ import {
   prepareParticipantWorkspace,
   prepareAgentTurnWorkspace,
   prepareDirectHostedWorkspace,
+  prepareDirectParticipantWorkspace,
   restoreParticipantWorkspace,
   releaseDirectCheckoutLease,
   sanitizeRoomId,
@@ -203,6 +207,11 @@ describe("v2 host room worktrees", () => {
     const repositoryRoot = await realpath(repository);
     expect(await inspectManagedRoomWorktree(room.sharedPath)).toMatchObject({ role: "shared", roomId: "room", repositoryRoot });
     expect(await inspectManagedRoomWorktree(room.agentPath)).toMatchObject({ role: "agent", roomId: "room", repositoryRoot });
+
+    const removed = await cleanupLegacyHostedWorkspace({ roomId: room.roomId, dataDirectory });
+    expect(removed).toMatchObject({ repositoryRoot, sharedPath: room.sharedPath, agentPath: room.agentPath });
+    await expect(readFile(path.join(room.sharedPath, "file.txt"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(room.agentPath, "file.txt"), "utf8")).rejects.toThrow();
   });
 
   it("retries prompt preparation while the agent index has a transient lock", async () => {
@@ -305,8 +314,9 @@ describe("v3 direct host workspace", () => {
 
     const lease = JSON.parse(await readFile(hosted.lease.path, "utf8")) as Record<string, unknown>;
     expect(lease).toMatchObject({ version: 3, roomId: "direct-room", repositoryRoot: root, baseCommit: hosted.baseCommit, initialTree: hosted.initialTree });
-    await releaseDirectCheckoutLease(hosted.lease);
+    await closeDirectHostedWorkspace(hosted);
     await expect(readFile(hosted.lease.path, "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(hosted.agentPath, "README.md"), "utf8")).rejects.toThrow();
   });
 
   it("rejects dirty or mismatched checkouts before creating direct-room state", async () => {
@@ -377,5 +387,65 @@ describe("v3 direct host workspace", () => {
     await expect(prepareDirectHostedWorkspace({ cwd: repository, roomId: "second", dataDirectory: secondData })).rejects.toThrow(/already leased by room first/);
     await expect(readFile(path.join(secondData, "second", ".multicode-session.json"), "utf8")).rejects.toThrow();
     await releaseDirectCheckoutLease(first.lease);
+  });
+});
+
+describe("v3 direct participant workspace", () => {
+  it("projects checkpoints into the original checkout without moving HEAD", async () => {
+    const host = await mkdtemp(path.join(tmpdir(), "multicode-direct-participant-host-"));
+    const participant = await mkdtemp(path.join(tmpdir(), "multicode-direct-participant-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-participant-data-"));
+    await execFileAsync("git", ["init", "-q", host]);
+    await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(host, "README.md"), "initial\n");
+    await execFileAsync("git", ["-C", host, "add", "README.md"]);
+    await execFileAsync("git", ["-C", host, "commit", "-qm", "initial"]);
+    const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
+    await execFileAsync("git", ["clone", "-q", host, participant]);
+    await writeFile(path.join(host, "README.md"), "room edit\n");
+    await writeFile(path.join(host, "added.txt"), "added in room\n");
+    const checkpoint = await createWorkspaceCheckpoint({ cwd: host, roomId: "direct-join", sequence: 1, baseCommit });
+    if (!checkpoint) throw new Error("Expected checkpoint");
+
+    const state = await prepareDirectParticipantWorkspace({ cwd: participant, roomId: "direct-join", baseCommit, dataDirectory });
+    expect(state.root).toBe(await realpath(participant));
+    await applyDirectWorkspaceCheckpoint(state, checkpoint);
+
+    expect(await readFile(path.join(participant, "README.md"), "utf8")).toBe("room edit\n");
+    expect(await readFile(path.join(participant, "added.txt"), "utf8")).toBe("added in room\n");
+    expect((await execFileAsync("git", ["-C", participant, "rev-parse", "HEAD"])).stdout.trim()).toBe(baseCommit);
+    expect((await execFileAsync("git", ["-C", participant, "status", "--porcelain"])).stdout).toContain("README.md");
+
+    expect(await cleanupParticipantWorkspace({ roomId: state.roomId, dataDirectory })).toBe(state.root);
+    expect(await readFile(path.join(participant, "README.md"), "utf8")).toBe("room edit\n");
+    await expect(readFile(state.markerPath, "utf8")).rejects.toThrow();
+  });
+
+  it("refuses a later checkpoint after an unsynchronized local edit", async () => {
+    const host = await mkdtemp(path.join(tmpdir(), "multicode-direct-conflict-host-"));
+    const participant = await mkdtemp(path.join(tmpdir(), "multicode-direct-conflict-participant-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-conflict-data-"));
+    await execFileAsync("git", ["init", "-q", host]);
+    await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(host, "file.txt"), "base\n");
+    await execFileAsync("git", ["-C", host, "add", "file.txt"]);
+    await execFileAsync("git", ["-C", host, "commit", "-qm", "base"]);
+    const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
+    await execFileAsync("git", ["clone", "-q", host, participant]);
+    const state = await prepareDirectParticipantWorkspace({ cwd: participant, roomId: "direct-conflict", baseCommit, dataDirectory });
+
+    await writeFile(path.join(host, "file.txt"), "first\n");
+    const first = await createWorkspaceCheckpoint({ cwd: host, roomId: state.roomId, sequence: 1, baseCommit });
+    if (!first) throw new Error("Expected first checkpoint");
+    await applyDirectWorkspaceCheckpoint(state, first);
+    await writeFile(path.join(participant, "file.txt"), "local unsynchronized\n");
+    await writeFile(path.join(host, "file.txt"), "second\n");
+    const second = await createWorkspaceCheckpoint({ cwd: host, roomId: state.roomId, sequence: 2, baseCommit, parentCommit: first.commit });
+    if (!second) throw new Error("Expected second checkpoint");
+
+    await expect(applyDirectWorkspaceCheckpoint(state, second)).rejects.toThrow(/Local checkout changed/);
+    expect(await readFile(path.join(participant, "file.txt"), "utf8")).toBe("local unsynchronized\n");
   });
 });

@@ -3,8 +3,8 @@ import { inspectManagedRoomWorktree, type ManagedRoomWorktree } from "@multicode
 type ManagedWorktreeInspector = (directory: string) => Promise<ManagedRoomWorktree | null>;
 
 /**
- * Hosting always starts from the original checkout. VS Code remains focused on
- * the room worktree so stopping and re-hosting does not require changing folders.
+ * Direct rooms always start from the original checkout. The extension uses this
+ * to migrate a legacy room-worktree window back to that checkout in place.
  */
 export async function resolveHostingDirectory(
   directory: string,

@@ -8,6 +8,7 @@ describe("resolveHostingDirectory", () => {
 
   it("redirects a managed room worktree to its original repository", async () => {
     const inspect = vi.fn(async () => ({
+      version: 2 as const,
       role: "shared" as const,
       roomId: "room",
       repositoryRoot: "/original/repo",

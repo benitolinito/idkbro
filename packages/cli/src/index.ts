@@ -29,19 +29,22 @@ import {
 } from "@multicode/protocol";
 import { PostgresRelayRoomStore, RelayServer, RoomRelay } from "@multicode/relay";
 import {
-  applyWorkspaceCheckpoint,
+  applyDirectWorkspaceCheckpoint,
+  closeDirectHostedWorkspace,
+  cleanupLegacyHostedWorkspace,
   cleanupParticipantWorkspace,
-  createRoomWorktrees,
   createWorkspaceCheckpoint,
   inspectManagedRoomWorktree,
   inspectRepository,
   mergeAgentWorkspace,
-  prepareParticipantWorkspace,
+  prepareDirectHostedWorkspace,
+  prepareDirectParticipantWorkspace,
   prepareAgentTurnWorkspace,
-  restoreParticipantWorkspace,
+  releaseDirectParticipantWorkspace,
   sanitizeRoomId,
   WorkspaceProjectionTracker,
-  type ParticipantWorkspaceState,
+  type DirectHostedWorkspace,
+  type DirectParticipantWorkspaceState,
   type AgentTurnSnapshot,
   type WorkspaceChange,
 } from "@multicode/workspace";
@@ -786,7 +789,7 @@ async function prepareRoom(dryRun = false, includeSensitive = false): Promise<{
   const sensitive = tracked.filter(isSensitiveWorkspacePath);
   if (sensitive.length && !includeSensitive) throw new Error(`Tracked sensitive files require explicit confirmation: ${sensitive.slice(0, 5).join(", ")}. Re-run with --include-sensitive only if every participant may receive them.`);
   console.log(out.success(`${out.label("Repository")} ${out.value(repository.root)}`));
-  if (repository.dirty) console.log(out.warning("Uncommitted and untracked changes will be included in synchronized checkpoints."));
+  if (repository.dirty) throw new Error("Commit or stash all tracked and untracked changes before starting a room");
   if (repository.operationInProgress) throw new Error("Finish the current Git operation before creating a room");
   if (dryRun) {
     console.log(out.success(`${out.label("Base commit")} ${out.muted(repository.head)}`));
@@ -800,11 +803,12 @@ async function prepareRoom(dryRun = false, includeSensitive = false): Promise<{
   return { roomId, workspacePath: repository.root, baseCommit: repository.head };
 }
 
-async function prepareHostedWorkspace(roomId: string): Promise<{ workspacePath: string; agentPath: string; baseCommit: string; checkpointCommit: string; sessionDirectory: string }> {
-  const room = await createRoomWorktrees({ cwd: process.cwd(), roomId });
-  console.log(out.success(`${out.label("Room workspace")} ${out.value(room.sharedPath)}`));
+async function prepareHostedWorkspace(roomId: string): Promise<DirectHostedWorkspace> {
+  const room = await prepareDirectHostedWorkspace({ cwd: process.cwd(), roomId });
+  console.log(out.success(`${out.label("Room workspace")} ${out.value(room.workspacePath)}`));
+  console.log(out.success(`${out.label("Room session")} ${out.value(room.roomId)}`));
   console.log(out.success(`${out.label("Codex workspace")} ${out.value(room.agentPath)}`));
-  return { workspacePath: room.sharedPath, agentPath: room.agentPath, baseCommit: room.baseCommit, checkpointCommit: room.checkpointCommit, sessionDirectory: room.sessionDirectory };
+  return room;
 }
 
 async function createRoom(options: { agent: string; prompt?: string; model?: string; dryRun?: boolean; includeSensitive?: boolean }): Promise<void> {
@@ -814,19 +818,28 @@ async function createRoom(options: { agent: string; prompt?: string; model?: str
   const hosted = await prepareHostedWorkspace(room.roomId);
 
   const adapter = new CodexAppServerAdapter();
-  const stop = installStopHandlers(async () => {
-    console.error(`\n${err.info("■", "Stopping local room…")}`);
-    await adapter.stop();
-  });
-  const eventTask = (async () => {
-    for await (const event of adapter.events()) printAgentEvent(event);
-  })();
-  const { threadId } = await adapter.start({ cwd: hosted.agentPath, ...(options.model ? { model: options.model } : {}) });
-  console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
-  if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
-  else console.log(`${out.muted("Room is running locally. Pass")} ${out.command("--prompt")} ${out.muted("to begin a turn.")}`);
-  await eventTask;
-  stop();
+  try {
+    const stop = installStopHandlers(async () => {
+      console.error(`\n${err.info("■", "Stopping local room…")}`);
+      await adapter.stop();
+    });
+    const eventTask = (async () => {
+      for await (const event of adapter.events()) printAgentEvent(event);
+    })();
+    const { threadId } = await adapter.start({ cwd: hosted.agentPath, ...(options.model ? { model: options.model } : {}) });
+    console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
+    if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
+    else console.log(`${out.muted("Room is running locally. Pass")} ${out.command("--prompt")} ${out.muted("to begin a turn.")}`);
+    try {
+      await eventTask;
+    } finally {
+      stop();
+      await adapter.stop();
+    }
+  } finally {
+    await adapter.stop().catch(() => undefined);
+    await closeDirectHostedWorkspace(hosted);
+  }
 }
 
 function parsePort(value: string): number {
@@ -912,6 +925,13 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const prepared = await prepareRoom(false, options.includeSensitive);
   if (!prepared.workspacePath || !prepared.baseCommit) return;
   const hosted = await prepareHostedWorkspace(prepared.roomId);
+  let hostedClosed = false;
+  const closeHosted = async (): Promise<void> => {
+    if (hostedClosed) return;
+    hostedClosed = true;
+    await closeDirectHostedWorkspace(hosted);
+  };
+  try {
   const workspacePath = hosted.workspacePath;
   const agentPath = hosted.agentPath;
   const baseCommit = hosted.baseCommit;
@@ -1114,6 +1134,9 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     cleanupSignals();
     await shutdown();
   }
+  } finally {
+    await closeHosted();
+  }
 }
 
 async function openWebSocket(url: URL): Promise<WebSocket> {
@@ -1200,6 +1223,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   let sharedWatcher: SharedWorkspaceWatcher | undefined;
   let ipc: LocalIpcServer | undefined;
   let authorityForShutdown: RoomAuthority | undefined;
+  let hostedForShutdown: DirectHostedWorkspace | undefined;
   let stopping = false;
   const shutdown = (): Promise<void> => {
     shutdownTask ??= (async () => {
@@ -1211,6 +1235,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       if (socket?.readyState === WebSocket.OPEN) socket.close(1000, "Host stopped room");
       await adapter.stop();
       await authorityForShutdown?.close();
+      if (hostedForShutdown) await closeDirectHostedWorkspace(hostedForShutdown);
     })();
     return shutdownTask;
   };
@@ -1223,6 +1248,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const prepared = await prepareRoom(false, options.includeSensitive);
     if (!prepared.workspacePath || !prepared.baseCommit) return;
     const hosted = await prepareHostedWorkspace(created.roomId);
+    hostedForShutdown = hosted;
     const workspacePath = hosted.workspacePath;
     const agentPath = hosted.agentPath;
     const authority = await RoomAuthority.create({
@@ -1475,19 +1501,22 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   let joined = false;
   let joinedRoomId: string | undefined;
   let input: Interface | undefined;
-  let workspaceState: ParticipantWorkspaceState | undefined;
+  let workspaceState: DirectParticipantWorkspaceState | undefined;
   let syncTask = Promise.resolve();
   const checkpointReceiver = new CheckpointReceiver();
 
   const synchronize = async (roomId: string, checkpoint: WorkspaceCheckpoint): Promise<void> => {
     if (relayTransportKey) checkpoint = openCheckpoint(relayTransportKey, checkpoint);
-    workspaceState ??= await prepareParticipantWorkspace({
+    workspaceState ??= await prepareDirectParticipantWorkspace({
       cwd: process.cwd(),
       roomId,
       baseCommit: checkpoint.baseCommit,
     });
-    if (workspaceState) console.error(`\n${err.label("Room workspace")} ${workspaceState.root}`);
-    await applyWorkspaceCheckpoint(workspaceState, checkpoint);
+    if (workspaceState) {
+      console.error(`\n${err.label("Room workspace")} ${workspaceState.root}`);
+      console.error(`${err.label("Room session")} ${workspaceState.roomId}`);
+    }
+    await applyDirectWorkspaceCheckpoint(workspaceState, checkpoint);
     console.error(`\n${err.success(`${err.label("Workspace synchronized")} ${err.muted(`${checkpoint.commit.slice(0, 12)} · checkpoint ${checkpoint.sequence}`)}`)}`);
     if (socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "workspace.ack", sequence: checkpoint.sequence, commit: checkpoint.commit }));
@@ -1581,10 +1610,9 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
     await syncTask;
   } finally {
     cleanupSignals();
-    if (workspaceState) {
-      await restoreParticipantWorkspace(workspaceState);
-      console.error(err.success(`${err.label("Original checkout unchanged")} ${err.value(workspaceState.originalRoot)}`));
-      console.error(err.info("↻", `Room workspace preserved for recovery/export: ${workspaceState.root}`));
+    if (workspaceState && (!options.bootstrapOnly || !joined)) {
+      await releaseDirectParticipantWorkspace(workspaceState);
+      console.error(err.success(`${err.label("Room changes retained locally")} ${err.value(workspaceState.root)}`));
     }
   }
 }
@@ -1638,8 +1666,18 @@ async function serveSession(options: { session: string; socket?: string }): Prom
 }
 
 async function cleanupRoomWorkspace(roomId: string, options: { force?: boolean }): Promise<void> {
-  const removed = await cleanupParticipantWorkspace({ roomId, ...(options.force ? { force: true } : {}) });
-  console.log(out.success(`${out.label("Removed room workspace")} ${out.value(removed)}`));
+  try {
+    const removed = await cleanupParticipantWorkspace({ roomId, ...(options.force ? { force: true } : {}) });
+    console.log(out.success(`${out.label("Removed room workspace")} ${out.value(removed)}`));
+  } catch (participantError) {
+    if (!options.force) throw participantError;
+    try {
+      const removed = await cleanupLegacyHostedWorkspace({ roomId });
+      console.log(out.success(`${out.label("Removed legacy host worktrees")} ${out.value(`${removed.sharedPath}, ${removed.agentPath}`)}`));
+    } catch {
+      throw participantError;
+    }
+  }
 }
 
 interface LiveSessionStatus { roomId: string; mode: string; workspacePath: string; agentPath: string; participants: RoomParticipant[]; pendingProposal: string | null; relayConnected?: boolean }

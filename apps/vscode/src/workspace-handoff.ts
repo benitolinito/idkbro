@@ -8,6 +8,7 @@ export interface WorkspaceHandoff {
   role: "viewer" | "editor";
   mode: "host" | "join";
   roomLabel: string;
+  roomId?: string;
   updatedAt: number;
 }
 

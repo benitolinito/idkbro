@@ -18,7 +18,7 @@ Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 - Each originating IP can host at most five active rooms.
 - Viewers, editors, prompters, and reviewers are independent capabilities controlled by the host.
 - Prompts from all participants execute through one FIFO queue.
-- Every user works in a validated MultiCode-owned worktree; original checkouts are never switched, reset, stashed, or cleaned.
+- Each person works directly in their clean local checkout. MultiCode leases that checkout for one room, while Codex alone runs in a temporary isolated worktree.
 - Human edits are durably committed before broadcast. Multi-file Codex results are buffered and finalized as one logical workspace transaction.
 - The public relay sees routing metadata and encrypted payload sizes, not source, prompts, agent output, previews, proposals, or checkpoint contents.
 
@@ -44,7 +44,7 @@ code --install-extension apps/vscode/multicode-vscode-0.4.2.vsix
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
 
-- **MultiCode: Host Room** — start Codex and open its isolated shared worktree in a new connected window without replacing the original checkout.
+- **MultiCode: Host Room** — start Codex and collaboration in the current checkout and current VS Code window.
 - **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
 - **MultiCode: Open Chat** — open the shared Codex-style conversation sidebar.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
@@ -87,7 +87,7 @@ From the Git repository you want to work on:
 multicode host
 ```
 
-MultiCode creates isolated shared/agent worktrees, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
+MultiCode leases the clean checkout, creates one temporary Codex worktree, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
 
 ```text
 Room token: K7MNP-4XQ2R.<room-secret>
@@ -226,22 +226,23 @@ Run `multicode --help` for operator/development commands. End users only need
 
 ## Git safety model
 
-The host and Codex use MultiCode-owned isolated worktrees. The original checkout
-is never switched, stashed, reset, or cleaned.
-Hosting from a MultiCode-managed `shared` or `agent` worktree is rejected to
-prevent accidentally nesting one room inside another.
+The host and each participant use their original clean checkout. MultiCode never
+moves its branch or resets its index; room files appear as ordinary local working-tree
+changes. A per-repository lease prevents two rooms from owning one checkout at once.
+Codex uses one temporary detached worktree, which is removed when the host stops.
+Hosting or joining from a legacy v2 MultiCode `shared` or `agent` worktree force-removes
+both legacy worktrees, then redirects to the original repository in the same VS Code window.
 
-Participants receive an isolated room worktree. Bootstrap checkpoints are streamed from
+Bootstrap checkpoints are streamed from
 the host in bounded 128 KiB chunks and verified by byte count, SHA-256 hash, Git
 bundle verification, and expected commit before application. The relay retains
 only checkpoint metadata, so a late joiner explicitly requests the current
 bundle from the host.
 
-A checkpoint never resets a dirty participant room worktree. Live document and manifest updates do not use Git resets. Preserve or export
-those local changes first, then resynchronize. Leaving a room preserves its
-worktree by default; remove a clean preserved worktree explicitly with
-`multicode cleanup <room-id>`, or use `--force` only when its local changes may
-be discarded.
+A checkpoint is applied only when the checkout still exactly matches its last
+synchronized room state. It never resets `HEAD`, the index, or unrelated local
+changes. Leaving releases the lease and retains the synchronized files locally;
+participants do not need to wait for the host to push or pull during a room.
 
 Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
 
@@ -280,7 +281,7 @@ the same version only produce temporary Actions artifacts.
 | `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                     |
 | `@multicode/protocol`       | Shared schemas and event types                                                                    |
 | `@multicode/session-core`   | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC |
-| `@multicode/workspace`      | Safe worktrees, bootstrap checkpoints, B/A/H merges, proposals, and transactional application     |
+| `@multicode/workspace`      | Checkout leases, Codex worktrees, bootstrap checkpoints, B/A/H merges, and transactional application |
 | `@multicode/agent-adapters` | Codex app-server integration                                                                      |
 | `@multicode/relay`          | Embedded and standalone WebSocket relays                                                          |
 | `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                         |
