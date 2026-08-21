@@ -47,6 +47,7 @@ export class ChatModel {
   private activePrompt: QueuedPrompt | undefined;
   private selfId: string | undefined;
   private readonly timeline: TimelineItem[] = [];
+  private readonly reasoningItems = new Map<string, { turnId: string; text: string; completed: boolean }>();
 
   start(mode: "host" | "join", roomLabel?: string): void {
     this.connection = "starting";
@@ -57,6 +58,7 @@ export class ChatModel {
     this.queue = [];
     this.activePrompt = undefined;
     this.selfId = undefined;
+    this.reasoningItems.clear();
     this.timeline.splice(0);
     this.add("system", mode === "host" ? "Starting a shared Codex room…" : "Joining the shared Codex room…");
   }
@@ -80,6 +82,7 @@ export class ChatModel {
     this.queue = [];
     this.activePrompt = undefined;
     this.selfId = undefined;
+    this.reasoningItems.clear();
     this.add("system", message);
   }
 
@@ -187,10 +190,10 @@ export class ChatModel {
   private handleAgent(event: AgentEvent): void {
     switch (event.type) {
       case "agent.reasoning.delta":
-        this.append(`reasoning:${event.itemId}`, "reasoning", event.text, "Thinking");
+        this.updateReasoning(event.turnId, event.itemId, event.text, false);
         break;
       case "agent.reasoning.completed":
-        this.complete(`reasoning:${event.itemId}`, "reasoning", event.text, "Thinking");
+        this.updateReasoning(event.turnId, event.itemId, event.text, true);
         break;
       case "agent.message.delta":
         this.append(`message:${event.itemId}`, "assistant", event.text, "Codex");
@@ -218,6 +221,10 @@ export class ChatModel {
       }
       case "turn.completed":
         this.activePrompt = undefined;
+        for (const reasoning of this.reasoningItems.values()) {
+          if (reasoning.turnId === event.turnId) reasoning.completed = true;
+        }
+        this.renderReasoning(event.turnId);
         this.add("system", `Turn completed${event.status ? ` · ${event.status}` : ""}`);
         break;
       case "agent.error":
@@ -237,6 +244,23 @@ export class ChatModel {
   private addPrompt(prompt: QueuedPrompt): void {
     const id = `prompt:${prompt.promptId}`;
     if (!this.find(id)) this.upsert(id, "user", prompt.text, prompt.participantName);
+  }
+
+  private updateReasoning(turnId: string, itemId: string, text: string, completed: boolean): void {
+    const current = this.reasoningItems.get(itemId);
+    this.reasoningItems.set(itemId, {
+      turnId,
+      text: completed ? (text || current?.text || "") : `${current?.text ?? ""}${text}`,
+      completed,
+    });
+    this.renderReasoning(turnId);
+  }
+
+  private renderReasoning(turnId: string): void {
+    const items = [...this.reasoningItems.values()].filter((item) => item.turnId === turnId);
+    if (!items.length) return;
+    const text = items.map((item) => item.text.trim()).filter(Boolean).join("\n\n");
+    this.upsert(`reasoning:${turnId}`, "reasoning", text, "Thinking", items.every((item) => item.completed) ? "completed" : "running");
   }
 
   private add(kind: TimelineKind, text: string, title?: string): void {

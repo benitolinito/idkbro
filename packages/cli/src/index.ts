@@ -560,8 +560,14 @@ class RoomAuthority {
       if (typeof subscription.file !== "string") throw new Error("Invalid document subscription");
       await this.assertCollaborativePolicy(subscription.file);
       const { fileId, target } = safeRoomFile(this.workspacePath, subscription.file);
-      const text = await this.readCollaborativeText(target);
-      await this.session.ensureDocumentText(actorId, fileId, text, event.id);
+      // Opening/subscribing is read-only after a document has entered the
+      // authoritative Yjs manifest. Rereading the materialized worktree here
+      // can race a preceding update's writeFile and replace current CRDT state
+      // with stale disk contents.
+      if (!this.session.manifest.fileByPath(fileId)) {
+        const text = await this.readCollaborativeText(target);
+        await this.session.ensureDocumentText(actorId, fileId, text, event.id);
+      }
       const snapshot = this.session.documentSnapshot(fileId);
       return this.encryptedEvent("document.snapshot", "__snapshot__", new TextEncoder().encode(JSON.stringify({ file: fileId, fileId: snapshot.record.fileId, documentEpoch: snapshot.record.documentEpoch, update: Buffer.from(snapshot.update).toString("base64url") })), undefined, actorId, actorId);
     }

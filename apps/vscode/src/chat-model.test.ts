@@ -48,7 +48,7 @@ describe("ChatModel", () => {
     model.handle({ type: "agent.event", event: { type: "turn.completed", threadId: "t", turnId: "turn", status: "completed" } });
 
     expect(model.snapshot().timeline).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "reasoning", text: "Inspecting files" }),
+      expect.objectContaining({ kind: "reasoning", id: "reasoning:turn", text: "Inspecting files", status: "completed" }),
       expect.objectContaining({ kind: "assistant", text: "Done" }),
       expect.objectContaining({ kind: "command", text: "24 passed", status: "completed" }),
       expect.objectContaining({ kind: "system", text: "Turn completed · completed" }),
@@ -81,5 +81,18 @@ describe("ChatModel", () => {
     expect(model.snapshot().canApprove).toBe(false);
     model.handle({ type: "participant.capabilities", participantId: "editor", capabilities: ["viewer", "editor", "prompter", "reviewer"] });
     expect(model.snapshot().canApprove).toBe(true);
+  });
+
+  it("groups multiple reasoning items from one turn into one timeline entry", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    model.handle({ type: "agent.event", event: { type: "agent.reasoning.delta", threadId: "t", turnId: "turn", itemId: "r1", text: "Inspecting files" } });
+    model.handle({ type: "agent.event", event: { type: "agent.reasoning.completed", threadId: "t", turnId: "turn", itemId: "r1", text: "Inspecting files" } });
+    model.handle({ type: "agent.event", event: { type: "agent.reasoning.delta", threadId: "t", turnId: "turn", itemId: "r2", text: "Checking tests" } });
+
+    const reasoning = model.snapshot().timeline.filter((item) => item.kind === "reasoning");
+    expect(reasoning).toEqual([
+      expect.objectContaining({ id: "reasoning:turn", text: "Inspecting files\n\nChecking tests", status: "running" }),
+    ]);
   });
 });

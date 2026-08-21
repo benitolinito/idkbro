@@ -30,7 +30,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly subscribedDocuments = new Set<string>();
   private readonly pendingLocalText = new Map<string, string>();
   private readonly documentIdentity = new Map<string, { fileId: string; documentEpoch: number }>();
-  private readonly suppressed = new Set<string>();
+  private readonly suppressed = new Map<string, number>();
   private readonly disposables: vscode.Disposable[];
   private readonly presenceDecorations = new Map<string, vscode.TextEditorDecorationType>();
   private readonly presenceExpiry = new Map<string, ReturnType<typeof setTimeout>>();
@@ -184,7 +184,7 @@ export class CollaborationBridge implements vscode.Disposable {
     return doc;
   }
   private async localChange(event: vscode.TextDocumentChangeEvent): Promise<void> {
-    const file = this.file(event.document); if (!file || this.suppressed.has(file)) return;
+    const file = this.file(event.document); if (!file || (this.suppressed.get(file) ?? 0) > 0) return;
     if (await this.isIgnored(file)) return;
     if (!this.canEdit) { const doc = this.docs.get(file); if (doc) await this.renderDocument(file, doc.getText("content").toString()); return; }
     if (!this.readyDocuments.has(file)) {
@@ -197,6 +197,10 @@ export class CollaborationBridge implements vscode.Disposable {
       return;
     }
     const doc = this.document(file); const text = doc.getText("content");
+    // A remote render has already been incorporated into Yjs. This equality
+    // check is a final guard against treating a delayed VS Code notification as
+    // a new local edit and applying the same whole-document change twice.
+    if (text.toString() === event.document.getText()) return;
     let update: Uint8Array | undefined;
     const listener = (value: Uint8Array) => { update = value; }; doc.on("update", listener);
     doc.transact(() => {
@@ -365,7 +369,7 @@ export class CollaborationBridge implements vscode.Disposable {
       if (saveProjection && open.isDirty && !await open.save()) throw new Error(`Could not save collaborative update to ${file}`);
       return;
     }
-    this.suppressed.add(file);
+    this.suppressed.set(file, (this.suppressed.get(file) ?? 0) + 1);
     try {
       const edit = new vscode.WorkspaceEdit();
       edit.replace(uri, new vscode.Range(open.positionAt(0), open.positionAt(open.getText().length)), contents);
@@ -377,7 +381,11 @@ export class CollaborationBridge implements vscode.Disposable {
       // single writer and persists the rendered buffer.
       if (saveProjection && !await open.save()) throw new Error(`Could not save collaborative update to ${file}`);
     }
-    finally { this.suppressed.delete(file); }
+    finally {
+      const remaining = (this.suppressed.get(file) ?? 1) - 1;
+      if (remaining > 0) this.suppressed.set(file, remaining);
+      else this.suppressed.delete(file);
+    }
   }
   private resynchronizeOpenDocuments(): void {
     for (const document of vscode.workspace.textDocuments) {

@@ -151,8 +151,23 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .assistant .bubble { background: var(--vscode-editor-background); }
     details.card { border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editor-background); }
     details.card summary { padding: 7px 9px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; }
-    details.card pre { margin: 0; padding: 8px 9px; border-top: 1px solid var(--vscode-panel-border); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 280px; overflow: auto; }
-    .reasoning details { opacity: .86; }
+    details.card pre, details.thinking-card pre { margin: 0; padding: 8px 9px; border-top: 1px solid var(--vscode-panel-border); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 280px; overflow: auto; }
+    details.thinking-card { border: 0; background: transparent; }
+    details.thinking-card summary { display: flex; align-items: center; gap: 6px; padding: 4px; width: fit-content; }
+    details.thinking-card summary::-webkit-details-marker { display: none; }
+    .thinking-chevron { display: inline-block; color: var(--vscode-descriptionForeground); font-size: 10px; transition: transform 120ms ease; }
+    details.thinking-card[open] .thinking-chevron { transform: rotate(90deg); }
+    .thinking-label { color: var(--vscode-descriptionForeground); font-weight: 600; }
+    .thinking-card.running .thinking-label { animation: thinkingPulse 1.4s ease-in-out infinite; }
+    .thinking-dots { display: inline-flex; gap: 2px; margin-left: -3px; }
+    .thinking-dots span { width: 2px; height: 2px; border-radius: 50%; background: var(--vscode-descriptionForeground); animation: thinkingDot 1.2s ease-in-out infinite; }
+    .thinking-dots span:nth-child(2) { animation-delay: 150ms; }
+    .thinking-dots span:nth-child(3) { animation-delay: 300ms; }
+    .thinking-card.completed .thinking-dots { display: none; }
+    details.thinking-card pre { margin-left: 14px; border: 0; border-left: 1px solid var(--vscode-panel-border); color: var(--vscode-descriptionForeground); }
+    @keyframes thinkingPulse { 50% { opacity: .45; } }
+    @keyframes thinkingDot { 0%, 65%, 100% { opacity: .25; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-2px); } }
+    @media (prefers-reduced-motion: reduce) { .thinking-card.running .thinking-label, .thinking-dots span { animation: none; } }
     .system, .error { display: flex; gap: 7px; align-items: flex-start; color: var(--vscode-descriptionForeground); font-size: 11px; padding: 3px 4px; }
     .error { color: var(--vscode-errorForeground); }
     .approval { padding: 9px; border-radius: 7px; color: var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); font-size: 11px; }
@@ -195,6 +210,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     const elements = Object.fromEntries(['dot','room','people','queue','conversation','prompt','send','copy','stop','output'].map(id => [id, document.getElementById(id)]));
     let state = { connection: 'idle', participants: [], queue: [], timeline: [] };
     let joinVisible = false;
+    const expandedReasoning = new Set();
 
     const post = (type, extra = {}) => vscode.postMessage({ type, ...extra });
     const node = (tag, className, text) => { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined) value.textContent = text; return value; };
@@ -244,9 +260,27 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         wrap.append(meta, node('div', 'bubble', item.text));
         return wrap;
       }
-      if (item.kind === 'reasoning' || item.kind === 'command' || item.kind === 'diff') {
+      if (item.kind === 'reasoning') {
+        const running = item.status === 'running';
+        const details = node('details', 'thinking-card ' + (running ? 'running' : 'completed'));
+        details.open = expandedReasoning.has(item.id);
+        details.addEventListener('toggle', () => {
+          if (details.open) expandedReasoning.add(item.id);
+          else expandedReasoning.delete(item.id);
+        });
+        const summary = node('summary');
+        summary.setAttribute('aria-label', running ? 'Thinking, show reasoning' : 'Thinking complete, show reasoning');
+        const dots = node('span', 'thinking-dots');
+        dots.setAttribute('aria-hidden', 'true');
+        dots.append(node('span'), node('span'), node('span'));
+        summary.append(node('span', 'thinking-chevron', '▶'), node('span', 'thinking-label', 'Thinking'), dots);
+        details.append(summary, node('pre', '', item.text));
+        wrap.append(details);
+        return wrap;
+      }
+      if (item.kind === 'command' || item.kind === 'diff') {
         const details = node('details', 'card');
-        if (item.kind !== 'reasoning' || item.status === 'running') details.open = item.status === 'running';
+        details.open = item.status === 'running';
         const label = (item.title || item.kind) + (item.status && item.status !== 'completed' ? ' · ' + item.status : '');
         details.append(node('summary', '', label), node('pre', '', item.text));
         wrap.append(details);
