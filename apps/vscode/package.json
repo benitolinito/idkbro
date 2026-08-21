@@ -29,6 +29,7 @@
     "yjs": "^13.6.27"
   },
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:multicode.host",
     "onCommand:multicode.join",
     "onCommand:multicode.openChat",

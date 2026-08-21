@@ -58,6 +58,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly externalChangeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly recentStructuralPaths = new Map<string, number>();
   private readonly ignoredPaths = new Map<string, boolean>();
+  private workspaceRootUri: vscode.Uri | undefined;
 
   constructor(private readonly onRoomMessage?: (message: RoomServerMessage) => void) {
     const diskWatcher = vscode.workspace.createFileSystemWatcher("**/*");
@@ -120,6 +121,11 @@ export class CollaborationBridge implements vscode.Disposable {
     });
   }
 
+  setWorkspaceRoot(root: vscode.Uri | undefined): void {
+    this.workspaceRootUri = root;
+    this.ignoredPaths.clear();
+  }
+
   disconnect(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -148,7 +154,7 @@ export class CollaborationBridge implements vscode.Disposable {
     return this.relativeFile(document.uri);
   }
   private relativeFile(uri: vscode.Uri): string | undefined {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const root = this.workspaceRoot()?.fsPath;
     if (!root || uri.scheme !== "file") return undefined;
     const relative = path.relative(root, uri.fsPath).split(path.sep).join("/");
     return !relative || relative.startsWith("../") || path.posix.isAbsolute(relative) ? undefined : relative;
@@ -332,7 +338,7 @@ export class CollaborationBridge implements vscode.Disposable {
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "document.update", payload } }));
   }
   private async renderDocument(file: string, contents: string): Promise<void> {
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri; if (!root) return;
+    const root = this.workspaceRoot(); if (!root) return;
     const uri = vscode.Uri.joinPath(root, ...file.split("/"));
     const open = await vscode.workspace.openTextDocument(uri);
     if (open.getText() === contents) { if (open.isDirty) await open.save(); return; }
@@ -438,7 +444,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private async isIgnored(file: string): Promise<boolean> {
     if (/(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return true;
     const cached = this.ignoredPaths.get(file); if (cached !== undefined) return cached;
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath; if (!root) return true;
+    const root = this.workspaceRoot()?.fsPath; if (!root) return true;
     try { await execFileAsync("git", ["-C", root, "check-ignore", "-q", "--", file]); this.ignoredPaths.set(file, true); return true; }
     catch (error) { const ignored = (error as NodeJS.ErrnoException & { code?: number }).code === 1 ? false : true; this.ignoredPaths.set(file, ignored); return ignored; }
   }
@@ -449,7 +455,7 @@ export class CollaborationBridge implements vscode.Disposable {
       | { type: "create"; path: string; content: string }
       | { type: "rename"; sourcePath: string; destinationPath: string }
       | { type: "delete"; path: string };
-    const root = vscode.workspace.workspaceFolders?.[0]?.uri; if (!root) return;
+    const root = this.workspaceRoot(); if (!root) return;
     const roomUri = (file: string): vscode.Uri => {
       if (!file || file.includes("\\") || path.posix.normalize(file) !== file || file.startsWith("../") || path.posix.isAbsolute(file)) throw new Error("Invalid manifest path");
       return vscode.Uri.joinPath(root, ...file.split("/"));
@@ -515,6 +521,9 @@ export class CollaborationBridge implements vscode.Disposable {
   private clearPresence(actorId: string): void {
     const timer = this.presenceExpiry.get(actorId); if (timer) clearTimeout(timer); this.presenceExpiry.delete(actorId);
     const decoration = this.presenceDecorations.get(actorId); decoration?.dispose(); this.presenceDecorations.delete(actorId);
+  }
+  private workspaceRoot(): vscode.Uri | undefined {
+    return this.workspaceRootUri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
   }
   private decrypt(value: EncryptedUpdate): Uint8Array {
     const decipher = createDecipheriv("aes-256-gcm", this.key as Buffer, Buffer.from(value.nonce, "base64url")); decipher.setAuthTag(Buffer.from(value.tag, "base64url"));
