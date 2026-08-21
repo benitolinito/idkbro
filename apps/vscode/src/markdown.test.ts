@@ -9,6 +9,8 @@ describe("renderChatMarkdown", () => {
     expect(html).toContain("<strong>Passed</strong>");
     expect(html).toContain("<code>npm test</code>");
     expect(html).toContain('<code class="language-ts">');
+    expect(html).toContain('<span class="tok-keyword">const</span>');
+    expect(html).toContain('<span class="tok-constant">true</span>');
   });
 
   it("does not activate raw HTML or unsafe links", () => {

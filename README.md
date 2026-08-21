@@ -1,5 +1,7 @@
 # MultiCode
 
+> Extension prompt check: this README was updated successfully through the MultiCode extension.
+
 MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.

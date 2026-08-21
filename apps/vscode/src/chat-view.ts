@@ -4,6 +4,7 @@ import type { RoomServerMessage } from "@multicode/protocol";
 import type { ApprovalDecision } from "@multicode/protocol";
 import { ChatModel } from "./chat-model.js";
 import { renderChatMarkdown } from "./markdown.js";
+import { renderWorkspaceDiff } from "./syntax-highlight.js";
 
 export interface ChatActions {
   back(): void | Promise<void>;
@@ -115,9 +116,13 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     const state = this.model.snapshot();
     const renderedState = {
       ...state,
-      timeline: state.timeline.map((item) => item.kind === "user" || item.kind === "assistant" || item.kind === "reasoning"
-        ? { ...item, markdownHtml: renderChatMarkdown(item.text) }
-        : item),
+      timeline: state.timeline.map((item) => {
+        if (item.kind === "user" || item.kind === "assistant" || item.kind === "reasoning") {
+          return { ...item, markdownHtml: renderChatMarkdown(item.text) };
+        }
+        if (item.kind === "diff") return { ...item, diffHtml: renderWorkspaceDiff(item.text) };
+        return item;
+      }),
     };
     this.view.badge = state.connection === "connected" && state.participants.length > 0
       ? { value: state.participants.length, tooltip: `${state.participants.length} collaborator${state.participants.length === 1 ? "" : "s"}` }
@@ -165,7 +170,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .person { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px 3px 3px; border-radius: 999px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); white-space: nowrap; font-size: 11px; }
     .avatar { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-weight: 700; }
     .host { color: var(--vscode-charts-yellow); margin-left: 1px; }
-    #conversation { overflow-y: auto; padding: 12px 10px 22px; scroll-behavior: smooth; }
+    #conversation { overflow-y: auto; padding: 12px 10px 22px; scroll-behavior: auto; overflow-anchor: none; }
     .empty { height: 100%; display: grid; place-content: center; text-align: center; color: var(--vscode-descriptionForeground); padding: 24px; }
     .empty-logo { margin: 0 auto 12px; width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: 20px; font-weight: 800; }
     .empty h2 { color: var(--vscode-foreground); font-size: 15px; margin: 0 0 6px; }
@@ -192,6 +197,15 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .markdown code { padding: 1px 4px; border-radius: 3px; color: var(--vscode-textPreformat-foreground); background: var(--vscode-textCodeBlock-background); font: 11px/1.45 var(--vscode-editor-font-family); }
     .markdown pre { margin: 7px 0; padding: 8px 9px; max-height: 300px; overflow: auto; border-radius: 5px; background: var(--vscode-textCodeBlock-background); }
     .markdown pre code { padding: 0; background: transparent; white-space: pre; }
+    .tok-keyword { color: var(--vscode-symbolIcon-keywordForeground, #c586c0); }
+    .tok-string { color: var(--vscode-symbolIcon-stringForeground, #ce9178); }
+    .tok-number { color: var(--vscode-symbolIcon-numberForeground, #b5cea8); }
+    .tok-comment { color: var(--vscode-descriptionForeground, #6a9955); font-style: italic; }
+    .tok-function { color: var(--vscode-symbolIcon-functionForeground, #dcdcaa); }
+    .tok-type { color: var(--vscode-symbolIcon-classForeground, #4ec9b0); }
+    .tok-property { color: var(--vscode-symbolIcon-propertyForeground, #9cdcfe); }
+    .tok-constant { color: var(--vscode-symbolIcon-constantForeground, #569cd6); }
+    .tok-operator { color: var(--vscode-symbolIcon-operatorForeground, #d4d4d4); }
     .markdown a { color: var(--vscode-textLink-foreground); text-decoration: none; }
     .markdown a:hover { color: var(--vscode-textLink-activeForeground); text-decoration: underline; }
     .markdown hr { border: 0; border-top: 1px solid var(--vscode-panel-border); margin: 10px 0; }
@@ -218,6 +232,21 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .change-file-name { color: var(--vscode-foreground); }
     .change-count { min-width: 25px; text-align: right; font: 12px/1.3 var(--vscode-editor-font-family); }
     .change-binary { grid-column: 2 / 4; color: var(--vscode-descriptionForeground); font: 10px/1.3 var(--vscode-editor-font-family); text-transform: uppercase; }
+    .diff-preview { max-height: 390px; overflow: auto; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-textCodeBlock-background); }
+    .diff-file-preview + .diff-file-preview { border-top: 1px solid var(--vscode-panel-border); }
+    .diff-file-heading { position: sticky; top: 0; z-index: 1; padding: 6px 9px; overflow: hidden; color: var(--vscode-descriptionForeground); background: var(--vscode-editor-background); font: 10px/1.4 var(--vscode-editor-font-family); text-overflow: ellipsis; white-space: nowrap; }
+    .diff-lines { min-width: max-content; width: 100%; padding: 3px 0; }
+    .diff-line { display: grid; grid-template-columns: 12px 34px 34px minmax(max-content, 1fr); min-height: 20px; border-left: 3px solid transparent; font: 11px/20px var(--vscode-editor-font-family); }
+    .diff-line code { display: block; padding: 0 10px 0 7px; color: var(--vscode-editor-foreground); white-space: pre; }
+    .diff-marker { color: var(--vscode-editorLineNumber-foreground); text-align: center; user-select: none; }
+    .diff-gutter { padding-right: 6px; color: var(--vscode-editorLineNumber-foreground); text-align: right; user-select: none; }
+    .diff-add { border-left-color: var(--vscode-gitDecoration-addedResourceForeground, #3fb950); background: var(--vscode-diffEditor-insertedLineBackground, rgba(46, 160, 67, .18)); }
+    .diff-delete { border-left-color: var(--vscode-gitDecoration-deletedResourceForeground, #f47067); background: var(--vscode-diffEditor-removedLineBackground, rgba(248, 81, 73, .18)); }
+    .diff-add .diff-marker, .diff-add .diff-gutter { color: var(--vscode-gitDecoration-addedResourceForeground, #3fb950); }
+    .diff-delete .diff-marker, .diff-delete .diff-gutter { color: var(--vscode-gitDecoration-deletedResourceForeground, #f47067); }
+    .diff-meta { grid-template-columns: 46px 34px minmax(max-content, 1fr); color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-textLink-foreground) 7%, transparent); }
+    .diff-meta code { color: var(--vscode-descriptionForeground); font-style: italic; }
+    .diff-preview-truncated { padding: 7px 9px; color: var(--vscode-descriptionForeground); border-top: 1px solid var(--vscode-panel-border); font-size: 10px; }
     details.activity-card { border: 0; background: transparent; }
     details.activity-card > summary { display: grid; grid-template-columns: 18px minmax(0, auto) auto 10px; align-items: center; gap: 6px; width: fit-content; max-width: 100%; min-height: 28px; padding: 3px 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; border-radius: 5px; }
     details.activity-card > summary:hover { background: var(--vscode-list-hoverBackground); }
@@ -255,12 +284,27 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     }
     .system, .error { display: flex; gap: 7px; align-items: flex-start; color: var(--vscode-descriptionForeground); font-size: 11px; padding: 3px 4px; }
     .error { color: var(--vscode-errorForeground); }
-    .approval { padding: 9px; border-radius: 7px; color: var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); font-size: 11px; }
-    .approval-head { display: flex; align-items: center; gap: 6px; font-weight: 700; }
-    .approval-status { margin-left: auto; color: var(--vscode-descriptionForeground); font-weight: 400; }
-    .approval-body { margin-top: 6px; color: var(--vscode-foreground); white-space: pre-wrap; overflow-wrap: anywhere; }
-    .approval-actions { display: flex; gap: 6px; margin-top: 9px; }
-    .approval-actions button { padding: 5px 9px; }
+    .approval { overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 10px; background: var(--vscode-editor-background); font-size: 12px; }
+    .approval-main { display: flex; min-width: 0; flex-direction: column; gap: 8px; padding: 13px 13px 10px; }
+    .approval-head { display: flex; min-width: 0; align-items: center; gap: 7px; color: var(--vscode-descriptionForeground); font-size: 11px; }
+    .approval-icon { display: grid; width: 18px; height: 18px; flex: none; place-items: center; color: var(--vscode-descriptionForeground); }
+    .approval-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; }
+    .approval-kind { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .approval-status { margin-left: auto; padding: 1px 6px; border-radius: 999px; color: var(--vscode-descriptionForeground); background: var(--vscode-badge-background); font-size: 10px; text-transform: capitalize; }
+    .approval-title { color: var(--vscode-foreground); font-size: 13px; font-weight: 600; line-height: 1.35; }
+    .approval-cwd { margin-top: -4px; overflow: hidden; color: var(--vscode-descriptionForeground); font: 10px/1.4 var(--vscode-editor-font-family); text-overflow: ellipsis; white-space: nowrap; }
+    .approval-command { margin: 0; padding: 9px 10px; max-height: 180px; overflow: auto; border-radius: 6px; color: var(--vscode-textPreformat-foreground); background: var(--vscode-textCodeBlock-background); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 var(--vscode-editor-font-family); }
+    .approval-reason { color: var(--vscode-foreground); line-height: 1.45; overflow-wrap: anywhere; }
+    .approval-reason-label { display: block; margin-bottom: 2px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+    .approval-actions { display: flex; align-items: center; gap: 7px; padding: 8px 13px 12px; }
+    .approval-actions-right { display: flex; gap: 7px; margin-left: auto; }
+    .approval-actions button { min-height: 28px; padding: 5px 10px; border-radius: 6px; font-size: 11px; }
+    .approval-actions button.approval-cancel { padding-inline: 4px; color: var(--vscode-descriptionForeground); background: transparent; }
+    .approval-actions button.approval-cancel:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+    .approval-actions button.approval-deny { color: var(--vscode-foreground); background: transparent; border: 1px solid var(--vscode-panel-border); }
+    .approval-actions button.approval-deny:hover { background: var(--vscode-toolbar-hoverBackground); }
+    .approval-actions button.approval-allow { font-weight: 600; }
+    .approval-waiting { padding: 0 13px 12px; color: var(--vscode-descriptionForeground); font-size: 11px; }
     #queue { display: none; margin: 8px 10px 0; border: 1px solid var(--vscode-panel-border); border-radius: 7px; padding: 7px 9px; color: var(--vscode-descriptionForeground); font-size: 11px; }
     #queue.visible { display: block; }
     #queue strong { color: var(--vscode-foreground); }
@@ -316,6 +360,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     const collapsedSteps = new Set();
     const seenActivitySteps = new Set();
     let liveTimerFrame;
+    let conversationRenderVersion = 0;
 
     const post = (type, extra = {}) => vscode.postMessage({ type, ...extra });
     const node = (tag, className, text) => { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined) value.textContent = text; return value; };
@@ -464,6 +509,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const duration = finishedAt === undefined || !Number.isFinite(startedAt) ? undefined : elapsed(finishedAt - startedAt);
       const activityId = 'activity:' + (items[0]?.turnId || items[0]?.id || 'unknown');
       const details = node('details', 'activity-card ' + (running ? 'running' : 'completed') + (failed ? ' failed' : ''));
+      details.dataset.activityId = activityId;
       if ((running && !collapsedActivities.has(activityId)) || (!running && expandedActivities.has(activityId))) details.setAttribute('open', '');
 
       let label = duration ? 'Worked for ' + duration : 'Worked';
@@ -480,16 +526,20 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         summary.append(timer);
       }
       summary.append(node('span', 'activity-chevron', '▶'));
-      summary.addEventListener('click', () => {
-        if (details.open) {
-          expandedActivities.delete(activityId);
-          collapsedActivities.add(activityId);
-        } else {
+      const rememberActivityOpen = open => {
+        if (open) {
           expandedActivities.add(activityId);
           collapsedActivities.delete(activityId);
+        } else {
+          expandedActivities.delete(activityId);
+          collapsedActivities.add(activityId);
         }
+      };
+      summary.addEventListener('click', () => rememberActivityOpen(!details.open));
+      details.addEventListener('toggle', () => {
+        rememberActivityOpen(details.open);
+        summary.setAttribute('aria-label', label + (details.open ? ', hide activity' : ', show activity'));
       });
-      details.addEventListener('toggle', () => summary.setAttribute('aria-label', label + (details.open ? ', hide activity' : ', show activity')));
 
       const steps = node('div', 'activity-steps');
       for (const item of items) {
@@ -511,15 +561,17 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
           node('span', 'step-label', stepLabel),
           node('span', 'step-chevron', '▶'),
         );
-        stepSummary.addEventListener('click', () => {
-          if (step.open) {
-            expandedSteps.delete(item.id);
-            collapsedSteps.add(item.id);
-          } else {
+        const rememberStepOpen = open => {
+          if (open) {
             expandedSteps.add(item.id);
             collapsedSteps.delete(item.id);
+          } else {
+            expandedSteps.delete(item.id);
+            collapsedSteps.add(item.id);
           }
-        });
+        };
+        stepSummary.addEventListener('click', () => rememberStepOpen(!step.open));
+        step.addEventListener('toggle', () => rememberStepOpen(step.open));
         const body = item.text || (item.kind === 'command' ? (stepRunning ? 'Waiting for output…' : 'Command completed without output.') : 'No reasoning summary.');
         step.append(stepSummary, item.kind === 'reasoning'
           ? markdownNode('step-markdown markdown', item.markdownHtml)
@@ -532,17 +584,46 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
     function renderItem(item) {
       const wrap = node('article', 'item ' + item.kind);
+      wrap.dataset.timelineKey = item.id;
       if (item.kind === 'approval') {
+        const approval = item.approval || {};
+        const command = approval.command;
+        const cwd = approval.cwd;
+        const reason = approval.reason;
+        const commandRequest = typeof command === 'string' && command.length > 0;
+        const main = node('div', 'approval-main');
         const head = node('div', 'approval-head');
-        head.append(node('span', '', '!'), node('span', '', item.title || 'Approval required'));
-        if (item.status) head.append(node('span', 'approval-status', item.status));
-        wrap.append(head, node('div', 'approval-body', item.text));
+        const icon = node('span', 'approval-icon');
+        icon.setAttribute('aria-hidden', 'true');
+        icon.innerHTML = commandRequest
+          ? '<svg viewBox="0 0 18 18"><rect x="2" y="3" width="14" height="12" rx="2"/><path d="m5 7 2 2-2 2M9.5 11h3"/></svg>'
+          : '<svg viewBox="0 0 18 18"><path d="M9 2.5 15 5v4.2c0 3.2-2.2 5.4-6 6.3-3.8-.9-6-3.1-6-6.3V5z"/><path d="M9 6v3.5M9 12.5h.01"/></svg>';
+        head.append(icon, node('span', 'approval-kind', commandRequest ? 'Command approval' : 'Codex approval'));
+        if (item.status && item.status !== 'pending') head.append(node('span', 'approval-status', item.status));
+        main.append(head, node('div', 'approval-title', commandRequest ? 'Allow Codex to run this command?' : 'Allow Codex to continue?'));
+        if (cwd) {
+          const cwdNode = node('div', 'approval-cwd', cwd);
+          cwdNode.title = cwd;
+          main.append(cwdNode);
+        }
+        if (commandRequest) main.append(node('pre', 'approval-command', command));
+        if (reason) {
+          const reasonNode = node('div', 'approval-reason');
+          reasonNode.append(node('span', 'approval-reason-label', 'Reason'), document.createTextNode(reason));
+          main.append(reasonNode);
+        } else if (!commandRequest) {
+          main.append(node('div', 'approval-reason', item.text));
+        }
+        wrap.append(main);
         if (item.approval && state.canApprove && item.status === 'pending') {
           const actions = node('div', 'approval-actions');
-          const allow = node('button', '', 'Allow'); allow.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'accept' });
-          const decline = node('button', 'secondary', 'Decline'); decline.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'decline' });
-          const cancel = node('button', 'secondary', 'Cancel turn'); cancel.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'cancel' });
-          actions.append(allow, decline, cancel); wrap.append(actions);
+          const cancel = node('button', 'approval-cancel', 'Cancel turn'); cancel.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'cancel' });
+          const right = node('div', 'approval-actions-right');
+          const deny = node('button', 'approval-deny', 'Deny'); deny.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'decline' });
+          const allow = node('button', 'approval-allow', 'Allow once'); allow.onclick = () => post('approval', { requestId: item.approval.requestId, decision: 'accept' });
+          right.append(deny, allow); actions.append(cancel, right); wrap.append(actions);
+        } else if (item.status === 'pending') {
+          wrap.append(node('div', 'approval-waiting', 'Waiting for host approval…'));
         }
         return wrap;
       }
@@ -572,6 +653,10 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
             if (details.open) collapsedChangeCards.add(item.id);
             else collapsedChangeCards.delete(item.id);
           });
+          details.addEventListener('toggle', () => {
+            if (details.open) collapsedChangeCards.delete(item.id);
+            else collapsedChangeCards.add(item.id);
+          });
           const files = node('div', 'change-files');
           for (const file of item.changes.files) {
             const row = node('button', 'change-file');
@@ -587,6 +672,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
             files.append(row);
           }
           details.append(summary, files);
+          if (item.diffHtml) details.append(markdownNode('diff-preview', item.diffHtml));
           wrap.append(details);
           return wrap;
         }
@@ -619,7 +705,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
     function renderConversation() {
       const box = elements.conversation;
+      const renderVersion = ++conversationRenderVersion;
+      const previousScrollTop = box.scrollTop;
       const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+      const anchor = [...box.children].find(child => child.offsetTop + child.offsetHeight > previousScrollTop);
+      const anchorKey = anchor?.dataset.timelineKey;
+      const anchorOffset = anchor ? anchor.offsetTop - previousScrollTop : 0;
       box.replaceChildren();
       if (state.connection === 'idle' && state.timeline.length <= 1) box.append(renderEmpty());
       else {
@@ -637,12 +728,23 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
             next += 1;
           }
           const wrap = node('article', 'item activity');
+          wrap.dataset.timelineKey = 'activity:' + (activity[0]?.turnId || activity[0]?.id || 'unknown');
           wrap.append(renderActivity(activity));
           box.append(wrap);
           index = next;
         }
       }
-      if (nearBottom) requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
+      const restoreScroll = () => {
+        if (renderVersion !== conversationRenderVersion) return;
+        if (nearBottom) {
+          box.scrollTop = box.scrollHeight;
+          return;
+        }
+        const restoredAnchor = anchorKey ? [...box.children].find(child => child.dataset.timelineKey === anchorKey) : undefined;
+        box.scrollTop = restoredAnchor ? restoredAnchor.offsetTop - anchorOffset : previousScrollTop;
+      };
+      restoreScroll();
+      requestAnimationFrame(restoreScroll);
     }
 
     function render() {

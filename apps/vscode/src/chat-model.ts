@@ -15,7 +15,13 @@ export interface TimelineItem {
   turnId?: string;
   command?: string;
   durationMs?: number;
-  approval?: { requestId: string | number; approvalKind: string };
+  approval?: {
+    requestId: string | number;
+    approvalKind: string;
+    command?: string;
+    cwd?: string;
+    reason?: string;
+  };
   changes?: {
     additions: number;
     deletions: number;
@@ -311,7 +317,11 @@ export class ChatModel {
         }
         break;
       case "approval.requested":
-        this.upsert(`approval:${event.requestId}`, "approval", this.approvalText(event), "Approval required", "pending", { requestId: event.requestId, approvalKind: event.approvalKind });
+        this.upsert(`approval:${event.requestId}`, "approval", this.approvalText(event), "Approval required", "pending", {
+          requestId: event.requestId,
+          approvalKind: event.approvalKind,
+          ...this.approvalDetails(event),
+        });
         break;
       case "approval.resolved": {
         const current = this.find(`approval:${event.requestId}`);
@@ -396,10 +406,23 @@ export class ChatModel {
   }
 
   private approvalText(event: Extract<AgentEvent, { type: "approval.requested" }>): string {
+    const { command, cwd, reason } = this.approvalDetails(event);
+    return [command ? `Command: ${command}` : undefined, cwd ? `Working directory: ${cwd}` : undefined, reason, !command && !cwd && !reason ? event.approvalKind : undefined].filter(Boolean).join("\n");
+  }
+
+  private approvalDetails(event: Extract<AgentEvent, { type: "approval.requested" }>): {
+    command?: string;
+    cwd?: string;
+    reason?: string;
+  } {
     const command = typeof event.details.command === "string" ? event.details.command : undefined;
     const cwd = typeof event.details.cwd === "string" ? event.details.cwd : undefined;
     const reason = typeof event.details.reason === "string" ? event.details.reason : undefined;
-    return [command ? `Command: ${command}` : undefined, cwd ? `Working directory: ${cwd}` : undefined, reason, !command && !cwd && !reason ? event.approvalKind : undefined].filter(Boolean).join("\n");
+    return {
+      ...(command ? { command } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(reason ? { reason } : {}),
+    };
   }
 
   private upsert(id: string, kind: TimelineKind, text: string, title?: string, status?: string, approval?: TimelineItem["approval"], metadata?: TimelineMetadata): void {

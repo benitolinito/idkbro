@@ -128,12 +128,17 @@ describe("ChatModel", () => {
     const model = new ChatModel();
     model.start("host");
     model.handle(welcome());
-    model.handle({ type: "agent.event", event: { type: "approval.requested", requestId: 91, approvalKind: "item/commandExecution/requestApproval", details: { command: "npm test", cwd: "/repo" } } });
+    model.handle({ type: "agent.event", event: { type: "approval.requested", requestId: 91, approvalKind: "item/commandExecution/requestApproval", details: { command: "npm test", cwd: "/repo", reason: "Verify the change" } } });
 
     expect(model.snapshot()).toMatchObject({
       canApprove: true,
       timeline: expect.arrayContaining([
-        expect.objectContaining({ kind: "approval", status: "pending", text: "Command: npm test\nWorking directory: /repo", approval: expect.objectContaining({ requestId: 91 }) }),
+        expect.objectContaining({
+          kind: "approval",
+          status: "pending",
+          text: "Command: npm test\nWorking directory: /repo\nVerify the change",
+          approval: expect.objectContaining({ requestId: 91, command: "npm test", cwd: "/repo", reason: "Verify the change" }),
+        }),
       ]),
     });
 
