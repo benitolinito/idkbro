@@ -215,7 +215,8 @@ export class ChatModel {
       case "collab.event":
         break;
       case "room.error":
-        this.fail(message.message);
+        if (message.fatal) this.connection = "error";
+        this.addError(message.message);
         break;
     }
   }
@@ -259,6 +260,12 @@ export class ChatModel {
         supportedReasoningEfforts: model.supportedReasoningEfforts.map((option) => ({ ...option })),
       })),
     };
+  }
+
+  private addError(message: string): void {
+    const last = this.timeline.at(-1);
+    if (last?.kind === "error" && last.text === message) return;
+    this.add("error", message);
   }
 
   private handleWorkspaceDiff(diff: WorkspaceDiff): void {

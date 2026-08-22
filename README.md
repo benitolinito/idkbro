@@ -1,8 +1,16 @@
+ss\\
+sdf
+
 # MultiCode
 
 > Extension prompt check: this README was updated successfully through the MultiCode extension.
+> brog Ilove you.
+> But
+> I
+> think
+> But
 
-MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
+> MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -278,15 +286,15 @@ The workflow runs all checks and publishes the packaged VSIX when that version
 does not already exist on the repository's Releases page. Further commits at
 the same version only produce temporary Actions artifacts.
 
-| Package                     | Responsibility                                                                                    |
-| --------------------------- | ------------------------------------------------------------------------------------------------- |
-| `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                     |
-| `@multicode/protocol`       | Shared schemas and event types                                                                    |
-| `@multicode/session-core`   | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC |
+| Package                     | Responsibility                                                                                       |
+| --------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                        |
+| `@multicode/protocol`       | Shared schemas and event types                                                                       |
+| `@multicode/session-core`   | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC    |
 | `@multicode/workspace`      | Checkout leases, Codex worktrees, bootstrap checkpoints, B/A/H merges, and transactional application |
-| `@multicode/agent-adapters` | Codex app-server integration                                                                      |
-| `@multicode/relay`          | Embedded and standalone WebSocket relays                                                          |
-| `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                         |
+| `@multicode/agent-adapters` | Codex app-server integration                                                                         |
+| `@multicode/relay`          | Embedded and standalone WebSocket relays                                                             |
+| `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                            |
 
 ## Current limitations
 

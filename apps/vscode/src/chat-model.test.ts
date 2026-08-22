@@ -189,4 +189,25 @@ describe("ChatModel", () => {
       expect.objectContaining({ id: "reasoning:turn", text: "Inspecting files\n\nChecking tests", status: "running" }),
     ]);
   });
+
+  it("keeps nonfatal room errors from breaking the connection or flooding the timeline", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    model.handle({ type: "room.error", message: "Collaboration rate limit exceeded" });
+    model.handle({ type: "room.error", message: "Collaboration rate limit exceeded" });
+
+    const state = model.snapshot();
+    expect(state.connection).toBe("connected");
+    expect(state.timeline.filter((item) => item.kind === "error")).toEqual([
+      expect.objectContaining({ text: "Collaboration rate limit exceeded" }),
+    ]);
+  });
+
+  it("marks fatal room errors as connection failures", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    model.handle({ type: "room.error", message: "Invalid room token", fatal: true });
+
+    expect(model.snapshot()).toMatchObject({ connection: "error" });
+  });
 });

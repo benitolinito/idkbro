@@ -278,7 +278,10 @@ export class RoomRelay {
       const rate = parsed.data.event.kind === "presence.update" ? ["presence", 60, 10_000] as const
         : parsed.data.event.kind === "manifest.operation" ? ["manifest", 30, 10_000] as const
         : ["document", 300, 10_000] as const;
-      if (!this.allowRate(state, rate[0], rate[1], rate[2])) { this.send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" }); return; }
+      if (!this.allowRate(state, rate[0], rate[1], rate[2])) {
+        if (this.allowRate(state, `error:${rate[0]}`, 1, rate[2])) this.send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" });
+        return;
+      }
       if ((parsed.data.event.kind === "document.update" || parsed.data.event.kind === "manifest.operation") && !state.participant.capabilities.includes("editor")) {
         this.send(socket, { type: "room.error", message: "Participant does not have editor capability" });
         return;

@@ -8,7 +8,7 @@ import * as Y from "yjs";
 import { isSensitiveWorkspacePath } from "@multicode/protocol";
 import type { AgentEvent, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
 import { WorkspaceProjectionTracker } from "@multicode/workspace";
-import { SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
+import { LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
 
 interface EncryptedUpdate { file: string; nonce: string; tag: string; ciphertext: string; }
 const maxCollaborativeTextBytes = 96 * 1024;
@@ -22,6 +22,7 @@ interface CollaborationWireEvent {
   partIndex?: number | undefined;
   partCount?: number | undefined;
 }
+interface PresenceUpdate { file: string; selections: Array<[number, number, number, number]>; }
 
 export class CollaborationBridge implements vscode.Disposable {
   private readonly statusChanged = new vscode.EventEmitter<"connecting" | "connected" | "reconnecting" | "disconnected">();
@@ -63,8 +64,10 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly externalChangeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly recentStructuralPaths = new Map<string, number>();
   private readonly ignoredPaths = new Map<string, boolean>();
+  private readonly warnedDirtyExternalPaths = new Set<string>();
   private workspaceRootUri: vscode.Uri | undefined;
   private readonly receiveQueue = new SerialTaskQueue();
+  private readonly presenceUpdates = new LatestValueThrottle<PresenceUpdate>(200, (value) => this.sendPresenceNow(value));
   // VS Code emits one change event per keystroke, while localChange performs
   // asynchronous ignore checks and network work. Keep those events ordered so
   // a later edit is never applied to a stale Yjs document.
@@ -144,6 +147,7 @@ export class CollaborationBridge implements vscode.Disposable {
   setWorkspaceRoot(root: vscode.Uri | undefined): void {
     this.workspaceRootUri = root;
     this.ignoredPaths.clear();
+    this.warnedDirtyExternalPaths.clear();
     this.projections.clear();
   }
 
@@ -158,6 +162,7 @@ export class CollaborationBridge implements vscode.Disposable {
     this.participantNames.clear();
     for (const transaction of this.workspaceTransactions.values()) clearTimeout(transaction.timer); this.workspaceTransactions.clear();
     for (const timer of this.externalChangeTimers.values()) clearTimeout(timer); this.externalChangeTimers.clear();
+    this.presenceUpdates.clear(); this.warnedDirtyExternalPaths.clear();
     this.selfId = "";
     this.statusChanged.fire("disconnected");
     socket?.close();
@@ -501,12 +506,25 @@ export class CollaborationBridge implements vscode.Disposable {
     try {
       if (await this.isIgnored(file)) return;
       if (!this.canEdit) { const doc = this.docs.get(file); if (doc) await this.renderDocument(file, doc.getText("content").toString()); return; }
-      const open = vscode.workspace.textDocuments.find((document) => this.file(document) === file);
-      if (open?.isDirty) { void vscode.window.showWarningMessage(`MultiCode did not import an external write to ${file} because the editor has unsaved changes.`); return; }
       const bytes = await vscode.workspace.fs.readFile(uri); if (bytes.byteLength > maxCollaborativeTextBytes) return;
       const contents = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       const identity = this.documentIdentity.get(file);
-      if (this.projections.matches(file, contents, identity)) return;
+      if (this.projections.matches(file, contents, identity)) { this.warnedDirtyExternalPaths.delete(file); return; }
+      const existing = this.docs.get(file);
+      if (existing?.getText("content").toString() === contents) {
+        this.projections.record(file, contents, identity);
+        this.warnedDirtyExternalPaths.delete(file);
+        return;
+      }
+      const open = vscode.workspace.textDocuments.find((document) => this.file(document) === file);
+      if (open?.isDirty) {
+        if (!this.warnedDirtyExternalPaths.has(file)) {
+          this.warnedDirtyExternalPaths.add(file);
+          void vscode.window.showWarningMessage(`MultiCode did not import an external write to ${file} because the editor has unsaved changes.`);
+        }
+        return;
+      }
+      this.warnedDirtyExternalPaths.delete(file);
       if (!this.readyDocuments.has(file)) { this.pendingLocalText.set(file, contents); this.subscribeFile(file); return; }
       const doc = this.document(file); const text = doc.getText("content"); if (text.toString() === contents) return;
       let update: Uint8Array | undefined; const listener = (value: Uint8Array) => { update = value; }; doc.on("update", listener);
@@ -570,8 +588,12 @@ export class CollaborationBridge implements vscode.Disposable {
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "manifest.operation", payload } }));
   }
   private publishPresence(document: vscode.TextDocument, selections: readonly vscode.Selection[]): void {
-    const file = this.file(document); if (!file || !this.key || this.socket?.readyState !== WebSocket.OPEN) return;
-    const update = Buffer.from(JSON.stringify({ file, selections: selections.map((selection) => [selection.start.line, selection.start.character, selection.end.line, selection.end.character]) }));
+    const file = this.file(document); if (!file) return;
+    this.presenceUpdates.push({ file, selections: selections.map((selection) => [selection.start.line, selection.start.character, selection.end.line, selection.end.character]) });
+  }
+  private sendPresenceNow(value: PresenceUpdate): void {
+    if (!this.key || this.socket?.readyState !== WebSocket.OPEN) return;
+    const update = Buffer.from(JSON.stringify(value));
     const payload = Buffer.from(JSON.stringify(this.encrypt("__presence__", update))).toString("base64url");
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "presence.update", payload } }));
   }

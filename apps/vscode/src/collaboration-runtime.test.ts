@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { SerialTaskQueue, shouldSaveRenderedDocument } from "./collaboration-runtime.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument } from "./collaboration-runtime.js";
+
+afterEach(() => { vi.useRealTimers(); });
 
 describe("collaboration runtime", () => {
   it("uses only the participant extension as a disk projector", () => {
@@ -32,5 +34,36 @@ describe("collaboration runtime", () => {
     await expect(queue.enqueue(async () => { throw new Error("bad event"); })).rejects.toThrow("bad event");
     await queue.enqueue(async () => undefined);
     await expect(queue.idle()).resolves.toBeUndefined();
+  });
+
+  it("coalesces ephemeral updates to the newest value within the interval", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const values: string[] = [];
+    const throttle = new LatestValueThrottle(200, (value: string) => values.push(value));
+
+    throttle.push("first");
+    throttle.push("stale");
+    throttle.push("latest");
+    expect(values).toEqual(["first"]);
+
+    vi.advanceTimersByTime(199);
+    expect(values).toEqual(["first"]);
+    vi.advanceTimersByTime(1);
+    expect(values).toEqual(["first", "latest"]);
+  });
+
+  it("cancels a pending ephemeral update when cleared", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const values: string[] = [];
+    const throttle = new LatestValueThrottle(200, (value: string) => values.push(value));
+
+    throttle.push("first");
+    throttle.push("pending");
+    throttle.clear();
+    vi.advanceTimersByTime(200);
+
+    expect(values).toEqual(["first"]);
   });
 });

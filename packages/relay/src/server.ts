@@ -275,7 +275,10 @@ class CentralRoom {
       const rate = participantMessage.event.kind === "presence.update" ? ["presence", 60, 10_000] as const
         : participantMessage.event.kind === "manifest.operation" ? ["manifest", 30, 10_000] as const
         : ["document", 300, 10_000] as const;
-      if (!this.allowRate(socket, rate[0], rate[1], rate[2])) { send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" }); return; }
+      if (!this.allowRate(socket, rate[0], rate[1], rate[2])) {
+        if (this.allowRate(socket, `error:${rate[0]}`, 1, rate[2])) send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" });
+        return;
+      }
       if ((participantMessage.event.kind === "document.update" || participantMessage.event.kind === "manifest.operation") && !participant.capabilities.includes("editor")) {
         send(socket, { type: "room.error", message: "Participant does not have editor capability" });
         return;
