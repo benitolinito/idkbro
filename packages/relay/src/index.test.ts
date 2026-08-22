@@ -38,7 +38,7 @@ class MessageCollector {
   }
 }
 
-async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "editor"): Promise<{
+async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "editor", protocolCapabilities?: Array<"agent-config-v1" | "generic-tools-v1" | "structured-input-v1">): Promise<{
   socket: WebSocket;
   messages: MessageCollector;
   welcome: Extract<RoomServerMessage, { type: "room.welcome" }>;
@@ -49,7 +49,7 @@ async function connect(port: number, token: string, name: string, requestedRole?
     socket.once("open", resolve);
     socket.once("error", reject);
   });
-  socket.send(JSON.stringify({ type: "room.join", token, name, ...(requestedRole ? { requestedRole } : {}) }));
+  socket.send(JSON.stringify({ type: "room.join", token, name, ...(requestedRole ? { requestedRole } : {}), ...(protocolCapabilities ? { protocolCapabilities } : {}) }));
   const welcome = await messages.next("room.welcome");
   return { socket, messages, welcome };
 }
@@ -76,6 +76,9 @@ describe("RoomRelay", () => {
     });
     relays.push(relay);
     relay.publishAgentConfig({
+      provider: "codex",
+      displayName: "Codex",
+      capabilities: { modelSelection: true, effortSelection: true, steering: true, interruption: true, approvals: true, structuredQuestions: false },
       model: "gpt-5.6-sol",
       effort: "medium",
       models: [{ id: "sol", model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Balanced" }, { reasoningEffort: "high", description: "Deeper" }] }],
@@ -220,6 +223,28 @@ describe("RoomRelay", () => {
     expect((await viewer.messages.next("room.error")).message).toMatch(/prompter capability/);
     viewer.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "document.update", payload: "opaque" } }));
     expect((await viewer.messages.next("room.error")).message).toMatch(/editor capability/);
+  });
+
+  it("negotiates structured-input support and routes answers only from reviewers", async () => {
+    const answers: unknown[] = [];
+    const relay = new RoomRelay({
+      roomId: "room-input", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined,
+      onCollaborationEvent: async (_participant, event) => event,
+      onInput: async (_participant, requestId, value) => { answers.push({ requestId, value }); },
+    });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const client = await connect(port, "secret-token", "Grace", "editor", ["agent-config-v1", "generic-tools-v1", "structured-input-v1"]);
+    sockets.push(client.socket);
+    expect(client.welcome.participants.find((participant) => participant.id === client.welcome.selfId)?.protocolCapabilities).toContain("structured-input-v1");
+
+    client.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", answers: { choice: "Simple" } }));
+    expect((await client.messages.next("room.error")).message).toMatch(/reviewer capability/);
+    relay.setParticipantCapabilities(client.welcome.selfId, ["viewer", "editor", "prompter", "reviewer"]);
+    await client.messages.next("participant.capabilities");
+    client.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", answers: { choice: "Simple" } }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(answers).toEqual([{ requestId: "question-1", value: { choice: "Simple" } }]);
   });
 
   it("drops excess presence silently while reporting the drop metric", async () => {

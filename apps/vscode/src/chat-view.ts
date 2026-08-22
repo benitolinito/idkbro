@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
-import type { RoomServerMessage } from "@multicode/protocol";
+import type { AgentInputAnswers, RoomServerMessage } from "@multicode/protocol";
 import type { ApprovalDecision } from "@multicode/protocol";
 import { ChatModel } from "./chat-model.js";
 import { renderChatMarkdown } from "./markdown.js";
@@ -16,6 +16,7 @@ export interface ChatActions {
   removeQueuedPrompt(promptId: string): void | Promise<void>;
   steerQueuedPrompt(promptId: string): void | Promise<void>;
   approve(requestId: string | number, decision: ApprovalDecision): void | Promise<void>;
+  answer(requestId: string, answers: AgentInputAnswers | null): void | Promise<void>;
   copyInvite(): void | Promise<void>;
   openOutput(): void | Promise<void>;
   reviewChanges(): void | Promise<void>;
@@ -33,6 +34,7 @@ type WebviewMessage =
   | { type: "queueRemove"; promptId?: string }
   | { type: "queueSteer"; promptId?: string }
   | { type: "approval"; requestId?: string | number; decision?: ApprovalDecision }
+  | { type: "input"; requestId?: string; answers?: AgentInputAnswers | null }
   | { type: "copyInvite" }
   | { type: "openOutput" }
   | { type: "reviewChanges" }
@@ -104,6 +106,13 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         this.model.approvalSubmitting(message.requestId); this.publish();
         try { await this.actions.approve(message.requestId, message.decision); }
         catch (error) { this.model.approvalFailed(message.requestId, error instanceof Error ? error.message : String(error)); this.publish(); }
+        break;
+      }
+      case "input": {
+        if (!message.requestId) break;
+        this.model.inputSubmitting(message.requestId); this.publish();
+        try { await this.actions.answer(message.requestId, message.answers ?? null); }
+        catch (error) { this.model.inputFailed(message.requestId, error instanceof Error ? error.message : String(error)); this.publish(); }
         break;
       }
       case "submit": {
@@ -333,6 +342,14 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .approval-actions button.approval-deny:hover { background: var(--vscode-toolbar-hoverBackground); }
     .approval-actions button.approval-allow { font-weight: 600; }
     .approval-waiting { padding: 0 13px 12px; color: var(--vscode-descriptionForeground); font-size: 11px; }
+    .input { overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 10px; background: var(--vscode-editor-background); font-size: 12px; }
+    .input-main { display: grid; gap: 12px; padding: 13px; }
+    .input-question { display: grid; gap: 7px; }
+    .input-question strong { font-size: 12px; }
+    .input-option { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 7px; align-items: start; padding: 6px 7px; border-radius: 6px; background: var(--vscode-list-inactiveSelectionBackground); }
+    .input-option small { display: block; color: var(--vscode-descriptionForeground); }
+    .input-freeform { width: 100%; min-height: 58px; resize: vertical; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 5px; padding: 6px; }
+    .input-actions { display: flex; justify-content: flex-end; gap: 7px; padding: 0 13px 12px; }
     #queue { display: none; margin: 8px 10px 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
     #queue.visible { display: block; }
     .queue-head { display: flex; align-items: center; gap: 6px; padding: 0 4px 6px; }
@@ -378,7 +395,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     <main id="conversation"></main>
     <footer>
       <div class="composer">
-        <textarea id="prompt" placeholder="Ask Codex or describe a change…" aria-label="Prompt"></textarea>
+        <textarea id="prompt" placeholder="Ask the agent or describe a change…" aria-label="Prompt"></textarea>
         <div class="composerbar">
           <div class="pickers">
             <select id="model" class="picker" aria-label="Model" title="Model"></select>
@@ -517,6 +534,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       }
       elements.model.value = selectedModel;
       elements.model.title = models.find(model => model.model === selectedModel)?.description || 'Model';
+      elements.model.style.display = config?.capabilities?.modelSelection === false ? 'none' : '';
 
       const selected = models.find(model => model.model === selectedModel);
       const efforts = selected?.supportedReasoningEfforts?.length
@@ -532,6 +550,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       }
       elements.effort.value = selectedEffort;
       elements.effort.title = efforts.find(option => option.reasoningEffort === selectedEffort)?.description || 'Reasoning level';
+      elements.effort.style.display = config?.capabilities?.effortSelection === false ? 'none' : '';
       const enabled = state.connection === 'connected';
       elements.model.disabled = !enabled;
       elements.effort.disabled = !enabled || !efforts.length;
@@ -573,10 +592,6 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
         if (item.owned) {
           const actions = node('div', 'queue-actions');
-          const steer = node('button', 'queue-action queue-steer', '↪ Steer');
-          steer.title = state.activeTurnIds?.length ? 'Send this prompt into the active turn' : 'Steer is available while Codex is working';
-          steer.disabled = !state.activeTurnIds?.length;
-          steer.addEventListener('click', () => post('queueSteer', { promptId: item.id }));
           const edit = node('button', 'queue-action', 'Edit');
           edit.title = 'Edit queued prompt';
           edit.addEventListener('click', () => { editingQueuePromptId = item.id; queuedPromptDraft = item.text; renderQueue(); });
@@ -584,7 +599,14 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
           remove.title = 'Remove queued prompt';
           remove.setAttribute('aria-label', 'Remove queued prompt');
           remove.addEventListener('click', () => post('queueRemove', { promptId: item.id }));
-          actions.append(steer, edit, remove);
+          if (state.agentConfig?.capabilities?.steering !== false) {
+            const steer = node('button', 'queue-action queue-steer', '↪ Steer');
+            steer.title = state.activeTurnIds?.length ? 'Send this prompt into the active turn' : 'Steer is available while the agent is working';
+            steer.disabled = !state.activeTurnIds?.length;
+            steer.addEventListener('click', () => post('queueSteer', { promptId: item.id }));
+            actions.append(steer);
+          }
+          actions.append(edit, remove);
           row.append(actions);
         }
         card.append(row);
@@ -709,6 +731,55 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     function renderItem(item) {
       const wrap = node('article', 'item ' + item.kind);
       wrap.dataset.timelineKey = item.id;
+      if (item.kind === 'input') {
+        const request = item.input;
+        const main = node('div', 'input-main');
+        const head = node('div', 'approval-head');
+        head.append(node('span', 'approval-kind', 'Agent question'));
+        if (item.status && item.status !== 'pending') head.append(node('span', 'approval-status', item.status));
+        main.append(head);
+        const controls = [];
+        for (const question of request?.questions || []) {
+          const section = node('div', 'input-question');
+          section.append(node('strong', '', question.question));
+          const group = [];
+          for (const option of question.options || []) {
+            const label = node('label', 'input-option');
+            const control = document.createElement('input');
+            control.type = question.multiSelect ? 'checkbox' : 'radio';
+            control.name = 'question-' + question.id;
+            control.value = option.label;
+            const copy = node('span', '', option.label);
+            if (option.description) copy.append(node('small', '', option.description));
+            label.append(control, copy); section.append(label); group.push(control);
+          }
+          let freeform;
+          if (question.allowFreeform) {
+            freeform = node('textarea', 'input-freeform');
+            freeform.placeholder = 'Or type another answer';
+            section.append(freeform);
+          }
+          controls.push({ question, group, freeform }); main.append(section);
+        }
+        wrap.append(main);
+        if (request && state.canApprove && item.status === 'pending') {
+          const actions = node('div', 'input-actions');
+          const cancel = node('button', 'secondary', 'Cancel'); cancel.onclick = () => post('input', { requestId: request.requestId, answers: null });
+          const submit = node('button', '', 'Submit'); submit.onclick = () => {
+            const answers = {};
+            for (const entry of controls) {
+              const selected = entry.group.filter(control => control.checked).map(control => control.value);
+              const freeform = entry.freeform?.value.trim();
+              if (freeform) answers[entry.question.id] = freeform;
+              else if (entry.question.multiSelect) answers[entry.question.id] = selected;
+              else if (selected[0]) answers[entry.question.id] = selected[0];
+            }
+            post('input', { requestId: request.requestId, answers });
+          };
+          actions.append(cancel, submit); wrap.append(actions);
+        } else if (item.status === 'pending') wrap.append(node('div', 'approval-waiting', 'Waiting for a reviewer to answer…'));
+        return wrap;
+      }
       if (item.kind === 'approval') {
         const approval = item.approval || {};
         const command = approval.command;
@@ -722,9 +793,10 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         icon.innerHTML = commandRequest
           ? '<svg viewBox="0 0 18 18"><rect x="2" y="3" width="14" height="12" rx="2"/><path d="m5 7 2 2-2 2M9.5 11h3"/></svg>'
           : '<svg viewBox="0 0 18 18"><path d="M9 2.5 15 5v4.2c0 3.2-2.2 5.4-6 6.3-3.8-.9-6-3.1-6-6.3V5z"/><path d="M9 6v3.5M9 12.5h.01"/></svg>';
-        head.append(icon, node('span', 'approval-kind', commandRequest ? 'Command approval' : 'Codex approval'));
+        const agentName = state.agentConfig?.displayName || 'Agent';
+        head.append(icon, node('span', 'approval-kind', commandRequest ? 'Command approval' : agentName + ' approval'));
         if (item.status && item.status !== 'pending') head.append(node('span', 'approval-status', item.status));
-        main.append(head, node('div', 'approval-title', commandRequest ? 'Allow Codex to run this command?' : 'Allow Codex to continue?'));
+        main.append(head, node('div', 'approval-title', commandRequest ? 'Allow ' + agentName + ' to run this command?' : 'Allow ' + agentName + ' to continue?'));
         if (cwd) {
           const cwdNode = node('div', 'approval-cwd', cwd);
           cwdNode.title = cwd;
@@ -753,7 +825,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       }
       if (item.kind === 'user' || item.kind === 'assistant') {
         const meta = node('div', 'meta');
-        meta.append(node('strong', '', item.title || (item.kind === 'assistant' ? 'Codex' : 'You')));
+        meta.append(node('strong', '', item.title || (item.kind === 'assistant' ? (state.agentConfig?.displayName || 'Agent') : 'You')));
         if (item.status && item.status !== 'completed') meta.append(node('span', '', item.status));
         const formattedTime = messageTime(item.timestamp);
         const time = node('time', 'message-time', formattedTime.short);
@@ -851,7 +923,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
     function renderEmpty() {
       const empty = node('section', 'empty');
-      empty.append(node('div', 'empty-logo', 'M'), node('h2', '', 'Code together with Codex'), node('p', '', 'Host a room or join a teammate’s session.'));
+      empty.append(node('div', 'empty-logo', 'M'), node('h2', '', 'Code together with an agent'), node('p', '', 'Host a Codex or Claude room, or join a teammate’s session.'));
       const actions = node('div', 'actions');
       const host = node('button', '', 'Host room'); host.onclick = () => post('host');
       const join = node('button', 'secondary', 'Join room'); join.onclick = () => { joinVisible = !joinVisible; renderConversation(); };

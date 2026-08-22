@@ -9,13 +9,15 @@ import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/
 import { promisify } from "node:util";
 import chalk, { chalkStderr } from "chalk";
 import { Command } from "commander";
-import { CodexAppServerAdapter } from "@multicode/agent-adapters";
+import { createAgentAdapter } from "@multicode/agent-adapters";
 import { HostSession, LocalIpcServer, loadOrCreateRoomSecret, loadOrCreateSessionEpoch, PostgresJournal, requestLocalIpc, roomSecret, SqliteJournal, writeSessionToken, type WorkspaceTransactionOperation } from "@multicode/session-core";
 import {
   checkpointChunkBytes,
   isSensitiveWorkspacePath,
   parseApprovalRequestId,
   type AgentEvent,
+  type AgentInputAnswers,
+  type AgentProvider,
   type ApprovalDecision,
   type CollaborationEvent,
   type Capability,
@@ -58,6 +60,22 @@ const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
 const maxCollaborativeTextBytes = 96 * 1024;
 const inviteAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+let activeAgentDisplayName = "Agent";
+
+function agentProvider(value: string): AgentProvider {
+  if (value === "codex" || value === "claude") return value;
+  throw new Error(`Unsupported agent provider: ${value}. Use codex or claude.`);
+}
+
+function agentExecutable(provider: AgentProvider, configured?: string): string {
+  return configured?.trim() || (provider === "claude" ? process.env.MULTICODE_CLAUDE_EXECUTABLE?.trim() : process.env.MULTICODE_CODEX_EXECUTABLE?.trim()) || provider;
+}
+
+function adapterFor(providerValue: string, executablePath?: string) {
+  const provider = agentProvider(providerValue);
+  const executable = agentExecutable(provider, executablePath);
+  return createAgentAdapter({ provider, executablePath: executable, environment: process.env });
+}
 
 function localInviteCode(): string { const bytes = randomBytes(10); const value = [...bytes].map((byte) => inviteAlphabet[byte % inviteAlphabet.length]).join(""); return `${value.slice(0, 5)}-${value.slice(5)}`; }
 
@@ -86,13 +104,47 @@ const streamingAssistantItems = new Map<string, { turnId: string; text: string }
 function finishAssistantMessage(itemId: string, completedText?: string): void {
   const buffered = streamingAssistantItems.get(itemId);
   streamingAssistantItems.delete(itemId);
-  if (!buffered) process.stdout.write(`\n${chalk.green("●")} ${chalk.bold("Codex")}\n`);
+  if (!buffered) process.stdout.write(`\n${chalk.green("●")} ${chalk.bold(activeAgentDisplayName)}\n`);
   const rendered = renderTerminalMarkdown(completedText || buffered?.text || "");
   if (rendered) process.stdout.write(`${rendered}\n`);
 }
 
 function isApprovalDecision(value: unknown): value is ApprovalDecision {
   return value === "accept" || value === "decline" || value === "cancel";
+}
+
+function structuredAnswerCommand(value: string): { requestId: string; answers: AgentInputAnswers | null } | undefined {
+  const match = /^\/answer\s+(\S+)\s+([\s\S]+)$/.exec(value);
+  if (!match) return undefined;
+  const requestId = match[1] as string;
+  const raw = (match[2] as string).trim();
+  if (raw === "cancel") return { requestId, answers: null };
+  return { requestId, answers: parseAgentInputAnswers(JSON.parse(raw) as unknown) };
+}
+
+function parseAgentInputAnswers(parsed: unknown): AgentInputAnswers | null {
+  if (parsed === null) return null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Structured answers must be a JSON object or 'cancel'");
+  for (const [questionId, answer] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!questionId || questionId.length > 512) throw new Error("Structured answer question IDs must be 1–512 characters");
+    if (typeof answer === "string") { if (answer.length > 10_000) throw new Error("Structured answers must be at most 10,000 characters"); continue; }
+    if (!Array.isArray(answer) || answer.length > 20 || !answer.every((item) => typeof item === "string" && item.length <= 1_000)) throw new Error("Each structured answer must be a string or string array");
+  }
+  return parsed as AgentInputAnswers;
+}
+
+function denyUnsupportedStructuredInput(
+  event: Extract<AgentEvent, { type: "input.requested" }>,
+  participants: Map<string, RoomParticipant>,
+  resolve: (requestId: string, answers: AgentInputAnswers | null) => Promise<void>,
+): void {
+  if (process.stdin.isTTY || [...participants.values()].some((participant) => participant.capabilities.includes("reviewer") && participant.protocolCapabilities?.includes("structured-input-v1"))) return;
+  const timer = setTimeout(() => {
+    if ([...participants.values()].some((participant) => participant.capabilities.includes("reviewer") && participant.protocolCapabilities?.includes("structured-input-v1"))) return;
+    void resolve(event.requestId, null).catch(() => undefined);
+    console.error(err.warning("Claude's question was cancelled because no connected reviewer supports structured input."));
+  }, 1_500);
+  timer.unref();
 }
 
 async function versionOf(command: string, args: string[]): Promise<string | null> {
@@ -104,17 +156,20 @@ async function versionOf(command: string, args: string[]): Promise<string | null
   }
 }
 
-async function doctor(): Promise<void> {
-  const [gitVersion, codexVersion] = await Promise.all([
+async function doctor(options: { agent?: string; agentExecutable?: string } = {}): Promise<void> {
+  const provider = agentProvider(options.agent ?? "codex");
+  const executable = agentExecutable(provider, options.agentExecutable);
+  const [gitVersion, agentVersion] = await Promise.all([
     versionOf("git", ["--version"]),
-    versionOf("codex", ["--version"]),
+    versionOf(executable, ["--version"]),
   ]);
 
   const [nodeMajor = 0, nodeMinor = 0] = process.versions.node.split(".").map(Number);
   const checks = [
     { name: "Node.js", ok: nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 5), detail: process.version },
     { name: "Git", ok: Boolean(gitVersion), detail: gitVersion ?? "not found" },
-    { name: "Codex CLI", ok: Boolean(codexVersion), detail: codexVersion ?? "not found" },
+    { name: `${provider === "claude" ? "Claude" : "Codex"} CLI`, ok: Boolean(agentVersion), detail: agentVersion ?? `not found (${executable})` },
+    ...(provider === "claude" ? [{ name: "Anthropic API key", ok: Boolean(process.env.ANTHROPIC_API_KEY), detail: process.env.ANTHROPIC_API_KEY ? "configured in environment" : "ANTHROPIC_API_KEY is not set" }] : []),
   ];
 
   for (const check of checks) {
@@ -151,7 +206,7 @@ function printAgentEvent(event: AgentEvent): void {
       break;
     case "agent.message.delta": {
       if (!streamingAssistantItems.has(event.itemId)) {
-        process.stdout.write(`\n${chalk.green("●")} ${chalk.bold("Codex")}\n`);
+        process.stdout.write(`\n${chalk.green("●")} ${chalk.bold(activeAgentDisplayName)}\n`);
       }
       const current = streamingAssistantItems.get(event.itemId);
       streamingAssistantItems.set(event.itemId, { turnId: event.turnId, text: `${current?.text ?? ""}${event.text}` });
@@ -163,6 +218,15 @@ function printAgentEvent(event: AgentEvent): void {
     case "command.output":
       process.stdout.write(event.text);
       break;
+    case "tool.started":
+      console.error(`\n${err.info("◆", `${err.label(event.displayName)} ${err.muted(event.summary)}`)}`);
+      break;
+    case "tool.output":
+      if (event.text) console.error(err.muted(event.text));
+      break;
+    case "tool.completed":
+      console.error(event.status === "completed" ? err.success(`${event.displayName} completed`) : err.warning(`${event.displayName} ${event.status}`));
+      break;
     case "approval.requested":
       console.error(`\n${err.warning(`${err.label("Approval required on the host")} ${err.muted(`(${event.approvalKind}, request ${event.requestId})`)}`)}`);
       console.error(err.muted(`  Resolve with /approve ${event.requestId} accept|decline|cancel, or grant a participant reviewer capability.`));
@@ -170,8 +234,19 @@ function printAgentEvent(event: AgentEvent): void {
     case "approval.resolved":
       console.error(`\n${err.success(`${err.label("Approval resolved")} ${err.muted(`(request ${event.requestId}: ${event.decision})`)}`)}`);
       break;
+    case "input.requested":
+      console.error(`\n${err.warning(`${err.label("Input required on the host")} ${err.muted(`(request ${event.requestId})`)}`)}`);
+      for (const question of event.questions) console.error(`  ${question.id}: ${question.question} [${question.options.map((option) => option.label).join(" | ")}]`);
+      console.error(err.muted(`  Resolve with /answer ${event.requestId} {"${event.questions[0]?.id ?? "question"}":"answer"}, or /answer ${event.requestId} cancel.`));
+      break;
+    case "input.answered":
+      console.error(`\n${err.success(`${err.label("Input answered")} ${err.muted(`(request ${event.requestId})`)}`)}`);
+      break;
+    case "input.cancelled":
+      console.error(`\n${err.warning(`${err.label("Input cancelled")} ${err.muted(`(request ${event.requestId})`)}`)}`);
+      break;
     case "agent.error":
-      console.error(`\n${err.error(`${err.label("Codex")} ${event.message}`)}`);
+      console.error(`\n${err.error(`${err.label(activeAgentDisplayName)} ${event.message}`)}`);
       break;
     case "turn.completed":
       for (const [itemId, item] of streamingAssistantItems) {
@@ -414,6 +489,12 @@ function openTransport(key: Buffer, sealed: string, aad?: string): Uint8Array {
 
 function sealPrompt(key: Buffer, promptId: string, text: string): string { return sealTransport(key, new TextEncoder().encode(text), `prompt:${promptId}`); }
 function openPrompt(key: Buffer, promptId: string, text: string): string { return new TextDecoder().decode(openTransport(key, text, `prompt:${promptId}`)); }
+function sealInputAnswers(key: Buffer, requestId: string, answers: AgentInputAnswers | null): string { return sealTransport(key, new TextEncoder().encode(JSON.stringify({ answers })), `input:${requestId}`); }
+function openInputAnswers(key: Buffer, requestId: string, payload: string): AgentInputAnswers | null {
+  const decoded = JSON.parse(new TextDecoder().decode(openTransport(key, payload, `input:${requestId}`))) as unknown;
+  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded) || !("answers" in decoded)) throw new Error("Encrypted input response has no answers");
+  return parseAgentInputAnswers((decoded as { answers: unknown }).answers);
+}
 function sealAgentEvent(key: Buffer, event: AgentEvent): string {
   const safe = { ...event } as AgentEvent & { text?: string; output?: string; truncated?: boolean };
   if (typeof safe.text === "string" && safe.text.length > 96_000) { safe.text = safe.text.slice(0, 96_000); safe.truncated = true; }
@@ -886,17 +967,17 @@ async function prepareHostedWorkspace(roomId: string): Promise<DirectHostedWorks
   const room = await prepareDirectHostedWorkspace({ cwd: process.cwd(), roomId });
   console.log(out.success(`${out.label("Room workspace")} ${out.value(room.workspacePath)}`));
   console.log(out.success(`${out.label("Room session")} ${out.value(room.roomId)}`));
-  console.log(out.success(`${out.label("Codex workspace")} ${out.value(room.agentPath)}`));
+  console.log(out.success(`${out.label("Agent workspace")} ${out.value(room.agentPath)}`));
   return room;
 }
 
-async function createRoom(options: { agent: string; prompt?: string; model?: string; dryRun?: boolean; includeSensitive?: boolean }): Promise<void> {
-  if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
+async function createRoom(options: { agent: string; agentExecutable?: string; prompt?: string; model?: string; effort?: string; dryRun?: boolean; includeSensitive?: boolean }): Promise<void> {
+  const provider = agentProvider(options.agent);
   const room = await prepareRoom(options.dryRun, options.includeSensitive);
   if (options.dryRun || !room.workspacePath) return;
   const hosted = await prepareHostedWorkspace(room.roomId);
 
-  const adapter = new CodexAppServerAdapter();
+  const adapter = adapterFor(provider, options.agentExecutable);
   try {
     const stop = installStopHandlers(async () => {
       console.error(`\n${err.info("■", "Stopping local room…")}`);
@@ -905,8 +986,9 @@ async function createRoom(options: { agent: string; prompt?: string; model?: str
     const eventTask = (async () => {
       for await (const event of adapter.events()) printAgentEvent(event);
     })();
-    const { threadId } = await adapter.start({ cwd: hosted.agentPath, ...(options.model ? { model: options.model } : {}) });
-    console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
+    const { threadId } = await adapter.start({ cwd: hosted.agentPath, ...(options.model ? { model: options.model } : {}), ...(options.effort ? { effort: options.effort } : {}) });
+    activeAgentDisplayName = adapter.configuration().displayName;
+    console.log(out.success(`${out.label(`${activeAgentDisplayName} thread`)} ${out.muted(threadId)}`));
     if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
     else console.log(`${out.muted("Room is running locally. Pass")} ${out.command("--prompt")} ${out.muted("to begin a turn.")}`);
     try {
@@ -982,8 +1064,10 @@ function installStopHandlers(stop: () => Promise<void>): () => void {
 
 interface HostRoomOptions {
   agent: string;
+  agentExecutable?: string;
   prompt?: string;
   model?: string;
+  effort?: string;
   name: string;
   listen: string;
   port: string;
@@ -1000,7 +1084,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     await hostRemoteRoom({ ...options, relay: configuredRelay });
     return;
   }
-  if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
+  const provider = agentProvider(options.agent);
   const prepared = await prepareRoom(false, options.includeSensitive);
   if (!prepared.workspacePath || !prepared.baseCommit) return;
   const hosted = await prepareHostedWorkspace(prepared.roomId);
@@ -1030,7 +1114,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   let turnSequence = 0;
   let activeTurnBase: AgentTurnSnapshot | undefined;
   let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
-  const adapter = new CodexAppServerAdapter();
+  const adapter = adapterFor(provider, options.agentExecutable);
   const roomParticipants = new Map<string, RoomParticipant>();
   let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
   const token = participantCode;
@@ -1054,6 +1138,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     },
     onCollaborationEvent: (participant, event) => authority.commit(participant.id, event),
     onApproval: async (_participant, requestId, decision) => adapter.resolveApproval(requestId, decision),
+    onInput: async (_participant, requestId, answers, payload) => adapter.resolveInput(requestId, payload ? openInputAnswers(localTransportKey, requestId, payload) : answers ?? null),
     onCheckpointRequest: (participantId, sequence) => {
       if (!latestCheckpoint || latestCheckpoint.sequence !== sequence) throw new Error("Requested checkpoint is no longer available from the host");
       relay.publishWorkspaceCheckpoint(sealCheckpoint(localTransportKey, latestCheckpoint), participantId);
@@ -1067,7 +1152,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   });
   const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
   const ipc = new LocalIpcServer(ipcToken, async (payload) => {
-    const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown };
+    const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown; answers?: AgentInputAnswers | null };
     if (request.type === "status") return { roomId: prepared.roomId, mode: "local", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null };
     if (request.type === "prompt" && request.text) {
       const promptId = randomUUID();
@@ -1079,6 +1164,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     }
     if (request.type === "interrupt") { await adapter.interrupt(); return { interrupted: true }; }
     if (request.type === "approval.resolve" && request.requestId !== undefined && isApprovalDecision(request.decision)) { await adapter.resolveApproval(request.requestId, request.decision); return { resolved: true }; }
+    if (request.type === "input.resolve" && typeof request.requestId === "string") { await adapter.resolveInput(request.requestId, request.answers ?? null); return { resolved: true }; }
     if (request.type === "capabilities" && request.participantId && request.capabilities) { relay.setParticipantCapabilities(request.participantId, request.capabilities); return { updated: true }; }
     if (request.type === "proposal.discard" && pendingConflict) {
       const discarded = pendingConflict; pendingConflict = undefined; await Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); relay.publishAgentEvent({ ...discarded.event, status: "discarded" } as AgentEvent); return { discarded: true };
@@ -1118,6 +1204,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const eventTask = (async () => {
     for await (const event of adapter.events()) {
       printAgentEvent(event);
+      if (event.type === "input.requested") denyUnsupportedStructuredInput(event, roomParticipants, (requestId, answers) => adapter.resolveInput(requestId, answers));
       if (event.type === "turn.started") previewWatcher.beginTurn(event.turnId);
       if (event.type === "turn.completed") {
         let relayEvent: AgentEvent = event;
@@ -1174,9 +1261,11 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     const { threadId } = await adapter.start({
       cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
     });
+    activeAgentDisplayName = adapter.configuration().displayName;
     relay.publishAgentConfig(adapter.configuration());
-    console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
+    console.log(out.success(`${out.label(`${activeAgentDisplayName} thread`)} ${out.muted(threadId)}`));
     previewWatcher.start();
     sharedWatcher.start();
 
@@ -1200,6 +1289,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     input = promptInput((text) => {
       if (text === "/interrupt") { void adapter.interrupt(); return; }
       const approvalCommand = /^\/approve\s+(\S+)\s+(accept|decline|cancel)$/.exec(text); if (approvalCommand) { void adapter.resolveApproval(parseApprovalRequestId(approvalCommand[1] as string), approvalCommand[2] as ApprovalDecision).catch((error: unknown) => console.error(err.error(error instanceof Error ? error.message : String(error)))); return; }
+      if (text.startsWith("/answer ")) { try { const answer = structuredAnswerCommand(text); if (answer) void adapter.resolveInput(answer.requestId, answer.answers).catch((error: unknown) => console.error(err.error(error instanceof Error ? error.message : String(error)))); } catch (error) { console.error(err.error(error instanceof Error ? error.message : String(error))); } return; }
       if (text === "/participants") { for (const participant of roomParticipants.values()) console.error(`${participant.id}  ${participant.name}  [${participant.capabilities.join(", ")}]`); return; }
       const capabilityCommand = /^\/(grant|revoke)\s+(\S+)\s+(viewer|editor|prompter|reviewer)$/.exec(text);
       if (capabilityCommand) {
@@ -1307,10 +1397,10 @@ async function resumeRemoteRoom(relayUrl: string, roomId: string, resumeToken: s
 }
 
 async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
-  if (options.agent !== "codex") throw new Error("Only the codex adapter is available");
+  const provider = agentProvider(options.agent);
   const relayUrl = options.relay ?? defaultRelayUrl;
 
-  const adapter = new CodexAppServerAdapter();
+  const adapter = adapterFor(provider, options.agentExecutable);
   let socket: WebSocket | undefined;
   let input: Interface | undefined;
   let cleanupSignals: () => void = () => undefined;
@@ -1374,7 +1464,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
     const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
     ipc = new LocalIpcServer(ipcToken, async (payload) => {
-      const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown };
+      const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown; answers?: AgentInputAnswers | null };
       if (request.type === "status") return { roomId: created.roomId, mode: "remote", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null, relayConnected: socket?.readyState === WebSocket.OPEN };
       if (request.type === "prompt" && request.text) {
         const promptId = randomUUID();
@@ -1389,6 +1479,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       }
       if (request.type === "interrupt") { await adapter.interrupt(); return { interrupted: true }; }
       if (request.type === "approval.resolve" && request.requestId !== undefined && isApprovalDecision(request.decision)) { await adapter.resolveApproval(request.requestId, request.decision); return { resolved: true }; }
+      if (request.type === "input.resolve" && typeof request.requestId === "string") { await adapter.resolveInput(request.requestId, request.answers ?? null); return { resolved: true }; }
       if (request.type === "capabilities" && request.participantId && request.capabilities) { sendToRelay({ type: "relay.participant.capabilities", participantId: request.participantId, capabilities: request.capabilities }); return { updated: true }; }
       if (request.type === "proposal.discard" && pendingConflict) { const discarded = pendingConflict; pendingConflict = undefined; await Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); const event = { ...discarded.event, status: "discarded" } as AgentEvent; sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "discarded", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify(event))) }); return { discarded: true }; }
       if (request.type === "proposal.retry") { await retryProposal(); return { resolved: true }; }
@@ -1425,6 +1516,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const eventTask = (async () => {
       for await (const event of adapter.events()) {
         printAgentEvent(event);
+        if (event.type === "input.requested") denyUnsupportedStructuredInput(event, roomParticipants, (requestId, answers) => adapter.resolveInput(requestId, answers));
         if (event.type === "turn.started") previewWatcher?.beginTurn(event.turnId);
         if (event.type === "turn.completed") {
           let relayEvent: AgentEvent = event;
@@ -1462,9 +1554,11 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const { threadId } = await adapter.start({
       cwd: agentPath,
       ...(options.model ? { model: options.model } : {}),
+      ...(options.effort ? { effort: options.effort } : {}),
     });
+    activeAgentDisplayName = adapter.configuration().displayName;
     sendToRelay({ type: "relay.agent.config", config: adapter.configuration() });
-    console.log(out.success(`${out.label("Codex thread")} ${out.muted(threadId)}`));
+    console.log(out.success(`${out.label(`${activeAgentDisplayName} thread`)} ${out.muted(threadId)}`));
     previewWatcher.start();
     sharedWatcher.start();
     await publishCheckpoint(true);
@@ -1506,6 +1600,9 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         return;
       }
       if (message.type === "approval.submitted") { void adapter.resolveApproval(message.requestId, message.decision).catch((error: unknown) => console.error(err.error(`Approval failed: ${error instanceof Error ? error.message : String(error)}`))); return; }
+      if (message.type === "input.submitted") {
+        void Promise.resolve().then(() => adapter.resolveInput(message.requestId, message.payload ? openInputAnswers(relayTransportKey, message.requestId, message.payload) : message.answers ?? null)).catch((error: unknown) => console.error(err.error(`Input failed: ${error instanceof Error ? error.message : String(error)}`))); return;
+      }
       if (message.type === "prompt.steer") {
         void adapter.steer({
           promptId: message.prompt.promptId,
@@ -1556,6 +1653,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     input = promptInput((text) => {
       if (text === "/interrupt") { void adapter.interrupt(); return; }
       const approvalCommand = /^\/approve\s+(\S+)\s+(accept|decline|cancel)$/.exec(text); if (approvalCommand) { void adapter.resolveApproval(parseApprovalRequestId(approvalCommand[1] as string), approvalCommand[2] as ApprovalDecision).catch((error: unknown) => console.error(err.error(error instanceof Error ? error.message : String(error)))); return; }
+      if (text.startsWith("/answer ")) { try { const answer = structuredAnswerCommand(text); if (answer) void adapter.resolveInput(answer.requestId, answer.answers).catch((error: unknown) => console.error(err.error(error instanceof Error ? error.message : String(error)))); } catch (error) { console.error(err.error(error instanceof Error ? error.message : String(error))); } return; }
       if (text === "/participants") { for (const participant of roomParticipants.values()) console.error(`${participant.id}  ${participant.name}  [${participant.capabilities.join(", ")}]`); return; }
       const capabilityCommand = /^\/(grant|revoke)\s+(\S+)\s+(viewer|editor|prompter|reviewer)$/.exec(text);
       if (capabilityCommand) {
@@ -1665,7 +1763,10 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
         }
         const approval = /^\/approve\s+(\S+)\s+(accept|decline|cancel)$/.exec(text);
         if (approval) socket.send(JSON.stringify({ type: "approval.resolve", requestId: parseApprovalRequestId(approval[1] as string), decision: approval[2] }));
-        else { const promptId = randomUUID(); socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: relayTransportKey ? sealPrompt(relayTransportKey, promptId, text) : text })); }
+        else if (text.startsWith("/answer ")) {
+          try { const answer = structuredAnswerCommand(text); if (answer) socket.send(JSON.stringify({ type: "input.resolve", requestId: answer.requestId, ...(relayTransportKey ? { payload: sealInputAnswers(relayTransportKey, answer.requestId, answer.answers) } : { answers: answer.answers }) })); }
+          catch (error) { console.error(err.error(error instanceof Error ? error.message : String(error))); }
+        } else { const promptId = randomUUID(); socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: relayTransportKey ? sealPrompt(relayTransportKey, promptId, text) : text })); }
       });
     }).catch((error: unknown) => {
       console.error(err.error(`${err.label("Workspace synchronization failed")} ${error instanceof Error ? error.message : String(error)}`));
@@ -1674,7 +1775,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   };
 
   const closed = new Promise<void>((resolve, reject) => {
-    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, requestedRole: options.viewer ? "viewer" : "editor" }));
+    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, requestedRole: options.viewer ? "viewer" : "editor", protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"] }));
     socket.on("message", (data) => {
       let message: RoomServerMessage;
       try {
@@ -1839,6 +1940,12 @@ async function resolveLiveApproval(roomId: string | undefined, requestId: string
   console.log(out.success(`${out.label("Approval resolved")} ${out.muted(`request ${requestId}: ${decision}`)}`));
 }
 
+async function resolveLiveInput(roomId: string | undefined, requestId: string, answerJson: string): Promise<void> {
+  const command = structuredAnswerCommand(`/answer ${requestId} ${answerJson}`) as { requestId: string; answers: AgentInputAnswers | null };
+  await liveSessionRequest(roomId, { type: "input.resolve", requestId: command.requestId, answers: command.answers });
+  console.log(out.success(`${out.label("Input resolved")} ${out.muted(`request ${requestId}`)}`));
+}
+
 async function updateParticipantCapability(roomId: string | undefined, participantQuery: string, capability: Capability, grant: boolean): Promise<void> {
   const status = await liveSessionRequest<LiveSessionStatus>(roomId, { type: "status" });
   const participant = status.participants.find((candidate) => candidate.id === participantQuery || candidate.name === participantQuery);
@@ -1874,16 +1981,21 @@ const program = new Command()
   .description("Collaborate around a local coding-agent session")
   .version("0.2.0");
 
-program.command("doctor").description("Check local prerequisites").action(doctor);
+program.command("doctor").description("Check local prerequisites")
+  .option("--agent <agent>", "agent provider: codex or claude", "codex")
+  .option("--agent-executable <path>", "override the selected agent executable")
+  .action(doctor);
 
 const room = program.command("room", { hidden: true }).description("Internal room commands");
 room
   .command("create")
   .description("Create a local agent room in the current workspace")
   .option("--agent <agent>", "agent adapter", "codex")
+  .option("--agent-executable <path>", "override the selected agent executable")
   .option("--prompt <prompt>", "send an initial prompt")
-  .option("--model <model>", "override the configured Codex model")
-  .option("--dry-run", "validate the repository without starting Codex")
+  .option("--model <model>", "override the configured agent model")
+  .option("--effort <effort>", "override the configured reasoning effort")
+  .option("--dry-run", "validate the repository without starting an agent")
   .option("--include-sensitive", "explicitly include tracked credential-like files")
   .action(createRoom);
 
@@ -1891,8 +2003,10 @@ room
   .command("host")
   .description("Host an interactive room that other people can join")
   .option("--agent <agent>", "agent adapter", "codex")
+  .option("--agent-executable <path>", "override the selected agent executable")
   .option("--prompt <prompt>", "queue an initial prompt")
-  .option("--model <model>", "override the configured Codex model")
+  .option("--model <model>", "override the configured agent model")
+  .option("--effort <effort>", "override the configured reasoning effort")
   .option("--name <name>", "host display name", defaultName)
   .option("--listen <address>", "address to listen on", "127.0.0.1")
   .option("--port <port>", "port to listen on; use 0 for any free port", "7337")
@@ -1914,10 +2028,12 @@ room
 
 program
   .command("host")
-  .description(`Start a shared Codex room through ${defaultRelayUrl}`)
+  .description(`Start a shared agent room through ${defaultRelayUrl}`)
   .option("--agent <agent>", "agent adapter", "codex")
+  .option("--agent-executable <path>", "override the selected agent executable")
   .option("--prompt <prompt>", "queue an initial prompt")
-  .option("--model <model>", "override the configured Codex model")
+  .option("--model <model>", "override the configured agent model")
+  .option("--effort <effort>", "override the configured reasoning effort")
   .option("--name <name>", "host display name", defaultName)
   .option("--relay <url>", "override the central relay URL")
   .option("--viewer", "join without edit or prompt permissions")
@@ -1944,12 +2060,13 @@ program
 
 program.command("status").description("Show a live room's daemon status").argument("[room-id]").action(showSessionStatus);
 program.command("prompt").description("Submit a prompt through a live room daemon").argument("<text>").option("--session <room-id>").action(async (text: string, options: { session?: string }) => { await liveSessionRequest(options.session, { type: "prompt", text }); console.log(out.success("Prompt queued")); });
-program.command("interrupt").description("Interrupt the active Codex turn").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "interrupt" }); console.log(out.success("Interrupt requested")); });
-program.command("approve").description("Resolve a pending Codex approval on the host").argument("<request-id>").argument("<decision>", "accept, decline, or cancel").option("--session <room-id>").action(async (requestId: string, decision: string, options: { session?: string }) => resolveLiveApproval(options.session, requestId, decision));
+program.command("interrupt").description("Interrupt the active agent turn").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "interrupt" }); console.log(out.success("Interrupt requested")); });
+program.command("approve").description("Resolve a pending agent approval on the host").argument("<request-id>").argument("<decision>", "accept, decline, or cancel").option("--session <room-id>").action(async (requestId: string, decision: string, options: { session?: string }) => resolveLiveApproval(options.session, requestId, decision));
+program.command("answer").description("Answer a pending structured agent question").argument("<request-id>").argument("<answers>", "JSON object keyed by question ID, or cancel").option("--session <room-id>").action(async (requestId: string, answers: string, options: { session?: string }) => resolveLiveInput(options.session, requestId, answers));
 program.command("participants").description("List participants and capabilities").option("--session <room-id>").action(async (options: { session?: string }) => { const status = await liveSessionRequest<LiveSessionStatus>(options.session, { type: "status" }); for (const participant of status.participants) console.log(`${participant.id}\t${participant.name}\t${participant.capabilities.join(",")}`); });
 program.command("grant").description("Grant a participant capability").argument("<participant>").argument("<capability>").option("--session <room-id>").action(async (participant: string, capability: string, options: { session?: string }) => { if (!["viewer", "editor", "prompter", "reviewer"].includes(capability)) throw new Error("Invalid capability"); await updateParticipantCapability(options.session, participant, capability as Capability, true); });
 program.command("revoke").description("Revoke a participant capability").argument("<participant>").argument("<capability>").option("--session <room-id>").action(async (participant: string, capability: string, options: { session?: string }) => { if (!["viewer", "editor", "prompter", "reviewer"].includes(capability)) throw new Error("Invalid capability"); await updateParticipantCapability(options.session, participant, capability as Capability, false); });
-const proposal = program.command("proposal").description("Inspect or discard a pending Codex proposal");
+const proposal = program.command("proposal").description("Inspect or discard a pending agent proposal");
 proposal.command("show").option("--session <room-id>").action(async (options: { session?: string }) => { const status = await liveSessionRequest<LiveSessionStatus>(options.session, { type: "status" }); if (!status.pendingProposal) throw new Error("No pending proposal"); console.log(await readFile(status.pendingProposal, "utf8")); });
 proposal.command("discard").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "proposal.discard" }); console.log(out.success("Proposal discarded")); });
 proposal.command("resolve").description("Retry a manually resolved proposal against the newest human state").option("--session <room-id>").action(async (options: { session?: string }) => { await liveSessionRequest(options.session, { type: "proposal.retry" }, 30_000); console.log(out.success("Proposal resolved")); });

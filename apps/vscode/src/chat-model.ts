@@ -1,7 +1,7 @@
-import type { AgentConfig, AgentEvent, QueuedPrompt, RoomParticipant, RoomServerMessage, WorkspaceDiff } from "@multicode/protocol";
+import type { AgentConfig, AgentEvent, AgentInputAnswers, AgentQuestion, QueuedPrompt, RoomParticipant, RoomServerMessage, WorkspaceDiff } from "@multicode/protocol";
 
 export type ConnectionState = "idle" | "starting" | "connected" | "stopping" | "error";
-export type TimelineKind = "user" | "assistant" | "reasoning" | "command" | "diff" | "system" | "error" | "approval";
+export type TimelineKind = "user" | "assistant" | "reasoning" | "command" | "diff" | "system" | "error" | "approval" | "input";
 
 export interface TimelineItem {
   id: string;
@@ -22,6 +22,7 @@ export interface TimelineItem {
     cwd?: string;
     reason?: string;
   };
+  input?: { requestId: string; questions: AgentQuestion[]; answers?: AgentInputAnswers };
   changes?: {
     additions: number;
     deletions: number;
@@ -92,7 +93,7 @@ export class ChatModel {
     this.reasoningItems.clear();
     this.turnStartedAt.clear();
     this.timeline.splice(0);
-    this.add("system", mode === "host" ? "Starting a shared Codex room…" : "Joining the shared Codex room…");
+    this.add("system", mode === "host" ? "Starting a shared agent room…" : "Joining the shared agent room…");
   }
 
   ready(roomLabel: string): void {
@@ -247,6 +248,7 @@ export class ChatModel {
       timeline: this.timeline.map((item) => ({
         ...item,
         ...(item.approval ? { approval: { ...item.approval } } : {}),
+        ...(item.input ? { input: { ...item.input, questions: item.input.questions.map((question) => ({ ...question, options: question.options.map((option) => ({ ...option })) })), ...(item.input.answers ? { answers: { ...item.input.answers } } : {}) } } : {}),
         ...(item.changes ? { changes: { ...item.changes, files: item.changes.files.map((file) => ({ ...file })) } } : {}),
       })),
       canApprove: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("reviewer")),
@@ -300,7 +302,11 @@ export class ChatModel {
     this.add("error", `Approval ${requestId} was not sent: ${message}`, "Approval");
   }
 
+  inputSubmitting(requestId: string): void { const item = this.find(`input:${requestId}`); if (item) item.status = "resolving"; }
+  inputFailed(requestId: string, message: string): void { const item = this.find(`input:${requestId}`); if (item) item.status = "pending"; this.add("error", `Input ${requestId} was not sent: ${message}`, "Input"); }
+
   private handleAgent(event: AgentEvent): void {
+    const agentName = this.agentConfig?.displayName ?? "Agent";
     switch (event.type) {
       case "agent.reasoning.delta":
         this.updateReasoning(event.turnId, event.itemId, event.text, false);
@@ -309,10 +315,10 @@ export class ChatModel {
         this.updateReasoning(event.turnId, event.itemId, event.text, true);
         break;
       case "agent.message.delta":
-        this.append(`message:${event.itemId}`, "assistant", event.text, "Codex");
+        this.append(`message:${event.itemId}`, "assistant", event.text, agentName);
         break;
       case "agent.message.completed":
-        this.complete(`message:${event.itemId}`, "assistant", event.text, "Codex");
+        this.complete(`message:${event.itemId}`, "assistant", event.text, agentName);
         break;
       case "command.started": {
         const startedAt = this.turnStartedAt.get(event.turnId);
@@ -346,6 +352,19 @@ export class ChatModel {
           );
         }
         break;
+      case "tool.started": {
+        const startedAt = this.turnStartedAt.get(event.turnId);
+        this.upsert(`tool:${event.itemId}`, "command", "", event.displayName, "running", undefined, { turnId: event.turnId, command: event.summary, ...(startedAt ? { startedAt } : {}) });
+        break;
+      }
+      case "tool.output":
+        this.append(`tool:${event.itemId}`, "command", event.text, "Tool", "running");
+        break;
+      case "tool.completed": {
+        const current = this.find(`tool:${event.itemId}`); const finishedAt = new Date().toISOString();
+        this.upsert(`tool:${event.itemId}`, "command", event.output ?? current?.text ?? "", event.displayName, event.status, undefined, { turnId: event.turnId, ...(current?.command ? { command: current.command } : {}), finishedAt, ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}) });
+        break;
+      }
       case "approval.requested":
         this.upsert(`approval:${event.requestId}`, "approval", this.approvalText(event), "Approval required", "pending", {
           requestId: event.requestId,
@@ -359,6 +378,15 @@ export class ChatModel {
         this.upsert(`approval:${event.requestId}`, "approval", current?.text ?? `Request ${event.requestId}`, "Approval", status, current?.approval);
         break;
       }
+      case "input.requested":
+        { const activeTurnId = this.turnStartedAt.keys().next().value as string | undefined; this.upsert(`input:${event.requestId}`, "input", event.questions.map((question) => question.question).join("\n"), "Input required", "pending", undefined, activeTurnId ? { turnId: activeTurnId } : {}); }
+        { const item = this.find(`input:${event.requestId}`); if (item) item.input = { requestId: event.requestId, questions: event.questions.map((question) => ({ ...question, options: question.options.map((option) => ({ ...option })) })) }; }
+        break;
+      case "input.answered": {
+        const current = this.find(`input:${event.requestId}`); if (current) { current.status = "answered"; if (current.input) current.input.answers = { ...event.answers }; }
+        break;
+      }
+      case "input.cancelled": { const current = this.find(`input:${event.requestId}`); if (current) current.status = "cancelled"; break; }
       case "turn.completed":
         this.activePrompt = undefined;
         for (const reasoning of this.reasoningItems.values()) {
@@ -368,13 +396,13 @@ export class ChatModel {
         this.turnStartedAt.delete(event.turnId);
         break;
       case "agent.error":
-        this.add("error", event.message, "Codex");
+        this.add("error", event.message, agentName);
         break;
       case "agent.started":
-        this.add("system", "Codex connected");
+        this.add("system", `${agentName} connected`);
         break;
       case "agent.exited":
-        this.add("error", `Codex exited${event.exitCode === null ? "" : ` with code ${event.exitCode}`}`);
+        this.add("error", `${agentName} exited${event.exitCode === null ? "" : ` with code ${event.exitCode}`}`);
         break;
       case "turn.started":
         this.turnStartedAt.set(event.turnId, new Date().toISOString());

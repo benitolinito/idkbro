@@ -6,7 +6,7 @@ import * as vscode from "vscode";
 import WebSocket from "ws";
 import * as Y from "yjs";
 import { isSensitiveWorkspacePath } from "@multicode/protocol";
-import type { AgentEvent, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
+import type { AgentEvent, AgentInputAnswers, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
 import { WorkspaceProjectionTracker } from "@multicode/workspace";
 import { AcknowledgedEventQueue, LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
 
@@ -42,11 +42,11 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly participantNames = new Map<string, string>();
   private readonly previewOutput = vscode.window.createOutputChannel("MultiCode Preview");
   private readonly previewChanged = new vscode.EventEmitter<vscode.Uri>();
-  private readonly previewUri = vscode.Uri.parse("multicode-preview:/Codex changes.patch");
-  private previewText = "Codex has not produced a preview yet.";
+  private readonly previewUri = vscode.Uri.parse("multicode-preview:/Agent changes.patch");
+  private previewText = "The agent has not produced a preview yet.";
   private readonly proposalChanged = new vscode.EventEmitter<vscode.Uri>();
-  private readonly proposalUri = vscode.Uri.parse("multicode-proposal:/Pending Codex proposal.patch");
-  private proposalText = "There is no pending Codex proposal.";
+  private readonly proposalUri = vscode.Uri.parse("multicode-proposal:/Pending agent proposal.patch");
+  private proposalText = "There is no pending agent proposal.";
   private key: Buffer | undefined;
   private promptKey: Buffer | undefined;
   private relayUrl = "";
@@ -130,7 +130,7 @@ export class CollaborationBridge implements vscode.Disposable {
     const base = new URL(relayUrl); base.pathname = `${base.pathname.replace(/\/$/, "")}/rooms/${code}`;
     const socket = new WebSocket(base);
     this.socket = socket;
-    socket.on("open", () => { this.statusChanged.fire("connected"); socket.send(JSON.stringify({ type: "room.join", token: code, name, requestedRole })); });
+    socket.on("open", () => { this.statusChanged.fire("connected"); socket.send(JSON.stringify({ type: "room.join", token: code, name, requestedRole, protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"] })); });
     socket.on("message", (data) => {
       const raw = data.toString();
       void this.receiveQueue.enqueue(async () => {
@@ -212,6 +212,15 @@ export class CollaborationBridge implements vscode.Disposable {
   resolveApproval(requestId: string | number, decision: ApprovalDecision): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ type: "approval.resolve", requestId, decision }));
+    return true;
+  }
+
+  resolveInput(requestId: string, answers: AgentInputAnswers | null): boolean {
+    if (!this.welcomed || !this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
+    const nonce = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", this.promptKey, nonce); cipher.setAAD(Buffer.from(`input:${requestId}`));
+    const ciphertext = Buffer.concat([cipher.update(JSON.stringify({ answers }), "utf8"), cipher.final()]);
+    const payload = JSON.stringify({ version: 1, nonce: nonce.toString("base64url"), tag: cipher.getAuthTag().toString("base64url"), ciphertext: ciphertext.toString("base64url") });
+    this.socket.send(JSON.stringify({ type: "input.resolve", requestId, payload }));
     return true;
   }
 
@@ -357,7 +366,7 @@ export class CollaborationBridge implements vscode.Disposable {
       const encrypted = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as EncryptedUpdate;
       if (encrypted.file !== "__proposal__") throw new Error("Invalid agent proposal");
       const proposal = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { turnId: string; patchText: string; truncated?: boolean };
-      this.proposalText = `# Pending Codex proposal — not merged\n# Turn ${proposal.turnId}${proposal.truncated ? " · preview truncated" : ""}\n\n${proposal.patchText}`;
+      this.proposalText = `# Pending agent proposal — not merged\n# Turn ${proposal.turnId}${proposal.truncated ? " · preview truncated" : ""}\n\n${proposal.patchText}`;
       this.proposalChanged.fire(this.proposalUri); void vscode.commands.executeCommand("setContext", "multicode.hasProposal", true); return;
     }
     if (event.kind === "manifest.operation") { await this.applyManifestEvent(event.payload); return; }

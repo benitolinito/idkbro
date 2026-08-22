@@ -38,8 +38,14 @@ export const roomEventTypeSchema = z.enum([
   "command.started",
   "command.output",
   "command.exited",
+  "tool.started",
+  "tool.output",
+  "tool.completed",
   "approval.requested",
   "approval.resolved",
+  "input.requested",
+  "input.answered",
+  "input.cancelled",
   "file.changed",
   "diff.updated",
 ]);
@@ -94,11 +100,43 @@ export interface AgentModel {
   supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>;
 }
 
+export type AgentProvider = "codex" | "claude";
+
+export interface AgentCapabilities {
+  modelSelection: boolean;
+  effortSelection: boolean;
+  steering: boolean;
+  interruption: boolean;
+  approvals: boolean;
+  structuredQuestions: boolean;
+}
+
 export interface AgentConfig {
+  provider: AgentProvider;
+  displayName: string;
   models: AgentModel[];
   model?: string;
   effort?: string;
+  capabilities: AgentCapabilities;
 }
+
+export interface AgentQuestionOption {
+  label: string;
+  description: string;
+  preview?: string;
+}
+
+export interface AgentQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: AgentQuestionOption[];
+  multiSelect: boolean;
+  allowFreeform: boolean;
+}
+
+export type AgentInputAnswers = Record<string, string | string[]>;
+export type ProtocolCapability = "agent-config-v1" | "generic-tools-v1" | "structured-input-v1";
 
 export type ApprovalDecision = "accept" | "decline" | "cancel";
 
@@ -122,8 +160,14 @@ export type AgentEvent =
   | { type: "command.started"; threadId: string; turnId: string; itemId: string; command: string; cwd?: string }
   | { type: "command.output"; threadId: string; turnId: string; itemId: string; text: string }
   | { type: "command.exited"; threadId: string; turnId: string; itemId: string; exitCode: number | null; output?: string }
+  | { type: "tool.started"; threadId: string; turnId: string; itemId: string; toolName: string; displayName: string; summary: string; preview?: unknown }
+  | { type: "tool.output"; threadId: string; turnId: string; itemId: string; text: string }
+  | { type: "tool.completed"; threadId: string; turnId: string; itemId: string; toolName: string; displayName: string; status: "completed" | "failed" | "interrupted"; durationMs?: number; output?: string; preview?: unknown }
   | { type: "approval.requested"; requestId: string | number; approvalKind: string; details: Record<string, unknown> }
   | { type: "approval.resolved"; requestId: string | number; decision: ApprovalDecision }
+  | { type: "input.requested"; requestId: string; toolUseId: string; questions: AgentQuestion[] }
+  | { type: "input.answered"; requestId: string; answers: AgentInputAnswers }
+  | { type: "input.cancelled"; requestId: string; reason?: string }
   | { type: "agent.error"; message: string }
   | { type: "agent.exited"; exitCode: number | null; signal: string | null };
 
@@ -135,10 +179,12 @@ export interface AgentStartOptions {
 
 export interface AgentAdapter {
   start(options: AgentStartOptions): Promise<{ threadId: string }>;
+  configuration(): AgentConfig;
   sendPrompt(prompt: AgentPrompt): Promise<{ turnId: string }>;
   steer(prompt: AgentPrompt): Promise<{ turnId: string }>;
   interrupt(): Promise<void>;
   resolveApproval(requestId: string | number, decision: ApprovalDecision): Promise<void>;
+  resolveInput(requestId: string, answers: AgentInputAnswers | null): Promise<void>;
   events(): AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
 }
@@ -149,6 +195,7 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     token: z.string().min(1),
     name: z.string().trim().min(1).max(64),
     requestedRole: z.enum(["viewer", "editor"]).optional(),
+    protocolCapabilities: z.array(z.enum(["agent-config-v1", "generic-tools-v1", "structured-input-v1"])).max(16).optional(),
   }),
   z.object({
     type: z.literal("prompt.submit"),
@@ -179,6 +226,16 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("approval.resolve"),
     requestId: z.union([z.string().min(1).max(128), z.number().int()]),
     decision: z.enum(["accept", "decline", "cancel"]),
+  }),
+  z.object({
+    type: z.literal("input.resolve"),
+    requestId: z.string().min(1).max(128),
+    answers: z.record(z.string().min(1).max(512), z.union([
+      z.string().max(10_000),
+      z.array(z.string().max(1_000)).max(20),
+    ])).nullable().optional(),
+    /** End-to-end encrypted JSON `{ answers }` used by current clients. */
+    payload: z.string().min(1).max(64 * 1024).optional(),
   }),
   z.object({
     type: z.literal("collab.publish"),
@@ -248,9 +305,19 @@ const agentModelSchema = z.object({
 });
 
 const agentConfigSchema = z.object({
+  provider: z.enum(["codex", "claude"]).optional().default("codex"),
+  displayName: z.string().min(1).max(64).optional().default("Agent"),
   models: z.array(agentModelSchema).max(100),
   model: z.string().min(1).max(128).optional(),
   effort: z.string().min(1).max(32).optional(),
+  capabilities: z.object({
+    modelSelection: z.boolean(),
+    effortSelection: z.boolean(),
+    steering: z.boolean(),
+    interruption: z.boolean(),
+    approvals: z.boolean(),
+    structuredQuestions: z.boolean(),
+  }).optional().default({ modelSelection: true, effortSelection: true, steering: true, interruption: true, approvals: true, structuredQuestions: false }),
 });
 
 export const relayHostMessageSchema = z.discriminatedUnion("type", [
@@ -353,6 +420,8 @@ export interface RoomParticipant {
   host: boolean;
   synced: boolean;
   capabilities: Capability[];
+  /** Optional for backward compatibility with clients released before provider negotiation. */
+  protocolCapabilities?: ProtocolCapability[];
 }
 
 export type Capability = "viewer" | "editor" | "prompter" | "reviewer" | "host";
@@ -482,6 +551,7 @@ export type RoomServerMessage =
   | { type: "workspace.checkpoint.request"; participantId: string; sequence: number }
   | { type: "collab.submitted"; participantId: string; event: CollaborationEvent }
   | { type: "approval.submitted"; participantId: string; requestId: string | number; decision: ApprovalDecision }
+  | { type: "input.submitted"; participantId: string; requestId: string; answers?: AgentInputAnswers | null; payload?: string }
   | { type: "collab.event"; event: CollaborationEvent }
   | { type: "collab.rate_limited"; eventId: string; kind: CollaborationEvent["kind"]; retryAfterMs: number }
   | { type: "collab.rejected"; eventId: string; message: string }

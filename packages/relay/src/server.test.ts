@@ -113,6 +113,10 @@ describe("RelayServer", () => {
     expect(await participant.messages.next("agent.encrypted")).toMatchObject({ eventType: "agent.message.delta", payload: "opaque-ciphertext" });
     participant.socket.send(JSON.stringify({ type: "approval.resolve", requestId: "approval-1", decision: "accept" }));
     expect(await host.messages.next("approval.submitted")).toMatchObject({ participantId: joined.participant.id, requestId: "approval-1", decision: "accept" });
+    participant.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", payload: "opaque-encrypted-answers" }));
+    const submittedInput = await host.messages.next("input.submitted");
+    expect(submittedInput).toMatchObject({ participantId: joined.participant.id, requestId: "question-1", payload: "opaque-encrypted-answers" });
+    expect(submittedInput.answers).toBeUndefined();
 
     const collaboration = { id: randomUUID(), kind: "document.update", payload: "encrypted-update" } as const;
     participant.socket.send(JSON.stringify({ type: "collab.publish", event: collaboration }));

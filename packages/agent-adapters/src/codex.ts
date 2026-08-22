@@ -238,15 +238,21 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private nextRequestId = 1;
   private threadId: string | undefined;
   private activeTurnId: string | undefined;
-  private config: AgentConfig = { models: [] };
+  private config: AgentConfig = {
+    provider: "codex",
+    displayName: "Codex",
+    models: [],
+    capabilities: { modelSelection: true, effortSelection: true, steering: true, interruption: true, approvals: true, structuredQuestions: false },
+  };
 
-  constructor(private readonly executable = "codex") {}
+  constructor(private readonly executable = "codex", private readonly environment?: NodeJS.ProcessEnv) {}
 
   async start(options: AgentStartOptions): Promise<{ threadId: string }> {
     if (this.process) throw new Error("Codex adapter has already started");
 
     this.process = spawn(this.executable, ["app-server", "--stdio"], {
       cwd: options.cwd,
+      ...(this.environment ? { env: this.environment } : {}),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -293,9 +299,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
     const selectedDefinition = models.find((model) => model.model === selectedModel);
     const selectedEffort = options.effort ?? string(thread?.reasoningEffort) ?? selectedDefinition?.defaultReasoningEffort;
     this.config = {
+      provider: "codex",
+      displayName: "Codex",
       models,
       ...(selectedModel ? { model: selectedModel } : {}),
       ...(selectedEffort ? { effort: selectedEffort } : {}),
+      capabilities: { modelSelection: true, effortSelection: true, steering: true, interruption: true, approvals: true, structuredQuestions: false },
     };
     this.eventQueue.push({ type: "agent.started", threadId });
     return { threadId };
@@ -357,6 +366,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.write({ id: requestId, result: { decision } });
     this.pendingApprovals.delete(requestId);
     this.eventQueue.push({ type: "approval.resolved", requestId, decision });
+  }
+
+  async resolveInput(): Promise<void> {
+    throw new Error("Codex does not support structured input requests");
   }
 
   events(): AsyncIterable<AgentEvent> {

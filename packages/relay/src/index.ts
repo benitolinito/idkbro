@@ -6,6 +6,7 @@ import {
   type AgentConfig,
   type AgentEvent,
   type ApprovalDecision,
+  type AgentInputAnswers,
   type CollaborationEvent,
   type QueuedPrompt,
   type RoomParticipant,
@@ -31,6 +32,7 @@ export interface RoomRelayOptions {
   onSteer?: (prompt: QueuedPrompt) => Promise<void>;
   onCollaborationEvent: (participant: RoomParticipant, event: CollaborationEvent) => Promise<CollaborationEvent>;
   onApproval?: (participant: RoomParticipant, requestId: string | number, decision: ApprovalDecision) => Promise<void>;
+  onInput?: (participant: RoomParticipant, requestId: string, answers: AgentInputAnswers | null | undefined, payload?: string) => Promise<void>;
   onCheckpointRequest?: (participantId: string, sequence: number) => Promise<void> | void;
   onRoomEvent?: (message: RoomServerMessage) => void;
   maxParticipants?: number;
@@ -249,7 +251,7 @@ export class RoomRelay {
         socket.close(4003, "Invalid room token");
         return;
       }
-      this.join(socket, state, parsed.data.name, parsed.data.requestedRole ?? "editor");
+      this.join(socket, state, parsed.data.name, parsed.data.requestedRole ?? "editor", parsed.data.protocolCapabilities ?? []);
       return;
     }
 
@@ -321,6 +323,12 @@ export class RoomRelay {
       void this.options.onApproval?.(state.participant, parsed.data.requestId, parsed.data.decision).catch((error: unknown) => this.send(socket, { type: "room.error", message: error instanceof Error ? error.message : String(error) })); return;
     }
 
+    if (parsed.data.type === "input.resolve") {
+      if (!state.participant.capabilities.includes("reviewer")) { this.send(socket, { type: "room.error", message: "Participant does not have reviewer capability" }); return; }
+      if (parsed.data.answers === undefined && parsed.data.payload === undefined) { this.send(socket, { type: "room.error", message: "Input response is empty" }); return; }
+      void this.options.onInput?.(state.participant, parsed.data.requestId, parsed.data.answers, parsed.data.payload).catch((error: unknown) => this.send(socket, { type: "room.error", message: error instanceof Error ? error.message : String(error) })); return;
+    }
+
     if (parsed.data.type === "prompt.update" || parsed.data.type === "prompt.remove" || parsed.data.type === "prompt.steer") {
       const queueAction = parsed.data;
       if (!this.allowRate(state, "queue", 60, 60_000)) { this.send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }
@@ -380,7 +388,7 @@ export class RoomRelay {
     this.enqueue(prompt);
   }
 
-  private join(socket: WebSocket, state: ConnectionState, name: string, requestedRole: "viewer" | "editor"): void {
+  private join(socket: WebSocket, state: ConnectionState, name: string, requestedRole: "viewer" | "editor", protocolCapabilities: NonNullable<RoomParticipant["protocolCapabilities"]>): void {
     clearTimeout(state.authenticationTimer);
     if (this.participants().length + 1 >= this.maxParticipants) {
       this.send(socket, { type: "room.error", message: `Room participant limit of ${this.maxParticipants} reached`, fatal: true });
@@ -394,6 +402,7 @@ export class RoomRelay {
       host: false,
       synced: this.latestCheckpoint === null,
       capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "editor", "prompter"],
+      protocolCapabilities,
     };
     state.participant = participant;
     this.send(socket, {

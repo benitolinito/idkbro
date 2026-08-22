@@ -77,6 +77,9 @@ describe("ChatModel", () => {
     model.handle({
       type: "agent.config",
       config: {
+        provider: "codex",
+        displayName: "Codex",
+        capabilities: { modelSelection: true, effortSelection: true, steering: true, interruption: true, approvals: true, structuredQuestions: false },
         model: "gpt-5.6-sol",
         effort: "medium",
         models: [{ id: "sol", model: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", description: "Frontier", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Balanced" }]}],
@@ -108,6 +111,26 @@ describe("ChatModel", () => {
       expect.objectContaining({ kind: "assistant", text: "Done" }),
       expect.objectContaining({ kind: "command", command: "npm test", text: "24 passed", status: "completed", turnId: "turn", startedAt: expect.any(String) }),
     ]));
+  });
+
+  it("uses provider-neutral labels and tracks generic tools and structured questions", () => {
+    const model = new ChatModel();
+    model.start("host");
+    model.handle(welcome());
+    model.handle({ type: "agent.config", config: { provider: "claude", displayName: "Claude", model: "claude-test", models: [], capabilities: { modelSelection: true, effortSelection: false, steering: false, interruption: true, approvals: true, structuredQuestions: true } } });
+    model.handle({ type: "agent.event", event: { type: "tool.started", threadId: "t", turnId: "turn", itemId: "read", toolName: "Read", displayName: "Read file", summary: "Read file: README.md" } });
+    model.handle({ type: "agent.event", event: { type: "tool.completed", threadId: "t", turnId: "turn", itemId: "read", toolName: "Read", displayName: "Read file", status: "completed", durationMs: 4, output: "contents" } });
+    model.handle({ type: "agent.event", event: { type: "input.requested", requestId: "question-1", toolUseId: "tool-1", questions: [{ id: "q1", header: "Style", question: "Which style?", options: [{ label: "Simple", description: "Minimal" }], multiSelect: false, allowFreeform: true }] } });
+
+    expect(model.snapshot()).toMatchObject({
+      agentConfig: { provider: "claude", displayName: "Claude", capabilities: { steering: false, effortSelection: false } },
+      timeline: expect.arrayContaining([
+        expect.objectContaining({ kind: "command", id: "tool:read", command: "Read file: README.md", text: "contents", status: "completed" }),
+        expect.objectContaining({ kind: "input", id: "input:question-1", status: "pending", input: expect.objectContaining({ requestId: "question-1" }) }),
+      ]),
+    });
+    model.handle({ type: "agent.event", event: { type: "input.answered", requestId: "question-1", answers: { q1: "Simple" } } });
+    expect(model.snapshot().timeline.find((item) => item.id === "input:question-1")?.status).toBe("answered");
   });
 
   it("exposes colored file-change statistics for the review card", () => {

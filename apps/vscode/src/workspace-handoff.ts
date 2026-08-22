@@ -7,6 +7,7 @@ export interface WorkspaceHandoff {
   name: string;
   role: "viewer" | "editor";
   mode: "host" | "join";
+  provider?: "codex" | "claude";
   roomLabel: string;
   roomId?: string;
   updatedAt: number;

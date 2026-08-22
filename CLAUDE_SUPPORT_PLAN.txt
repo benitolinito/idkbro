@@ -1,0 +1,262 @@
+The best long-term design is a provider-neutral MultiCode core with separate Codex and Claude adapters. Claude should use the Claude Agent SDK—not the raw Messages API—because it already provides the agent loop, filesystem tools, streaming, permissions, sessions, interruption, and model discovery that MultiCode needs.
+A production-quality implementation is roughly 10–15 engineering days. A narrower MVP requiring users to have the Claude CLI installed could be done in 5–8 days.
+Two feasibility gates
+Before building UI, spend 1–2 days proving these:
+1. Steering semantics
+   Create a streaming-input Agent SDK prototype and send a second message while Claude is actively working. Confirm whether it truly redirects the active operation or becomes another queued turn. Anthropic documents streaming input as supporting direction changes, but MultiCode needs to verify the precise result and event lifecycle. Streaming input documentation
+   If it does not match Codex steering:
+   - Expose it as “Queue” rather than “Steer,” or
+   - Interrupt and restart with the new instruction, or
+   - Disable Claude steering through a capability flag until supported correctly.
+2. VSIX binary packaging
+   The Agent SDK starts a Claude CLI subprocess and normally receives its platform-specific binary through an optional dependency. MultiCode currently ships a single bundled JavaScript CLI with no node_modules, so simply importing the SDK will probably omit that binary. Hosting architecture
+   Test:
+   - Bundling the SDK through the existing esbuild command.
+   - Running it from an unpacked VSIX.
+   - Explicit pathToClaudeCodeExecutable.
+   - macOS ARM/x64, Linux ARM/x64, and Windows x64 packaging.
+Do not begin the full UI implementation until both questions have an accepted answer.
+Target architecture
+1. Make the agent interface truly provider-neutral
+Update the protocol with:
+type AgentProvider = "codex" | "claude";
+
+interface AgentCapabilities {
+  modelSelection: boolean;
+  effortSelection: boolean;
+  steering: boolean;
+  interruption: boolean;
+  approvals: boolean;
+  structuredQuestions: boolean;
+}
+
+interface AgentConfig {
+  provider: AgentProvider;
+  displayName: string;
+  models: AgentModel[];
+  model?: string;
+  effort?: string;
+  capabilities: AgentCapabilities;
+}
+Also add configuration() to the formal AgentAdapter interface. The Codex adapter already implements something equivalent, but the interface does not currently require it.
+Create an adapter factory:
+createAgentAdapter({
+  provider,
+  cwd,
+  executablePath,
+  environment,
+});
+This removes the hardcoded Codex checks and constructors currently spread through the CLI.
+Provider-specific behavior should stop at the adapter boundary. The queue, relay, encrypted messages, worktree preparation, diff preview, review, and merge flow should remain shared.
+2. Add ClaudeAgentAdapter
+Use @anthropic-ai/claude-agent-sdk with streaming input. Its query() API returns an asynchronous event stream and supports interruption, model changes, model discovery, and streamed input. TypeScript SDK reference
+Lifecycle:
+- start()
+  - Create an asynchronous push queue for user messages.
+  - Start query() with that queue.
+  - Enable partial messages for smooth token streaming.
+  - Wait for Claude’s initialization event.
+  - Call supportedModels().
+  - Publish agent.started and the provider configuration.
+- sendPrompt()
+  - Generate a MultiCode turn ID.
+  - Apply the selected model.
+  - Push the user message into the streaming input.
+  - Reject a second ordinary turn while one is already active; the existing MultiCode queue handles it.
+- steer()
+  - Inject input into the active query only if the feasibility spike confirms correct behavior.
+- interrupt()
+  - Call the SDK’s interrupt method.
+  - Resolve outstanding approvals/questions safely.
+- stop()
+  - Abort the input stream.
+  - Reject pending callbacks.
+  - Close the query and subprocess.
+  - Ensure no orphaned Claude processes remain.
+MultiCode should generate its own turn IDs because Claude session IDs do not map directly to the current Codex turn model.
+Event normalization
+Build a pure, heavily tested normalizeClaudeMessage() layer.
+Suggested mapping:
+Claude event	MultiCode event
+Initialization	agent.started
+Text delta	agent.message.delta
+Completed assistant content	agent.message.completed
+Thinking delta/block	reasoning.delta / reasoning.completed
+Bash tool invocation	command.started
+Bash output/result	command.output / command.exited
+Final result	turn.completed
+SDK/process failure	agent.error
+Process termination	agent.exited
+
+
+Claude’s partial stream contains low-level API events, followed by complete assistant and tool-result messages. The normalizer must prevent the complete message from duplicating already-streamed text. Streaming output documentation
+The current protocol treats almost everything as either reasoning or a shell command. Claude also has Read, Edit, Write, Glob, and other tools. Rather than displaying fake shell commands, add generic events:
+tool.started
+tool.output
+tool.completed
+Each should contain a tool ID, display name, safe summary, status, duration, and optionally structured preview data. Preserve the existing command events for Codex and Claude’s Bash tool.
+Unknown future Claude event types must be logged and ignored safely, not crash the session.
+Approvals and questions
+Claude’s canUseTool callback pauses execution until the application permits or denies the tool. User-input and permission documentation
+Implement it with a map of pending requests:
+Map<requestId, PendingPermission>
+The callback should:
+1. Emit an approval event containing the tool name, summarized input, and permission suggestions.
+2. Wait for a participant decision.
+3. Return allow with the validated input or deny with a reason.
+4. Remove itself on completion, abort, interruption, or disconnect.
+Support multiple simultaneous requests, stale response rejection, and double-resolution protection.
+Decision mapping:
+- Allow: permit the specific invocation.
+- Decline: deny that invocation while allowing the turn to continue.
+- Cancel turn: deny and interrupt the active turn.
+Claude’s AskUserQuestion tool is not a binary approval. Full Claude support therefore requires a new structured-input protocol:
+input.requested
+input.answered
+input.cancelled
+It should support multiple-choice options, multi-select, free-form answers, and question IDs. Add a question card in the extension and an equivalent CLI interaction. If this is deferred from the MVP, disable the tool explicitly and document the limitation.
+Authentication and security
+Use BYOK API-key authentication first.
+Do not attempt to reuse a user’s Claude.ai or Claude extension subscription login. Anthropic states that third-party products generally cannot offer Claude.ai login and subscription limits without approval. Agent SDK quickstart
+Recommended handling:
+- Store the Anthropic key in VS Code SecretStorage.
+- Inject it only into the locally spawned host process.
+- Never send it to the relay or participants.
+- Never place it in settings, room metadata, logs, handoff state, or prompt history.
+- Add multicode.configureClaudeApiKey.
+- Support normal environment authentication for standalone CLI users.
+Set:
+CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
+CLAUDE_AGENT_SDK_CLIENT_APP=multicode
+The scrub option prevents Claude-invoked Bash commands, hooks, and MCP servers from inheriting Anthropic or cloud credentials. Environment variables
+Additional safeguards:
+- Default to manual permission mode.
+- Require approval for Bash and mutations.
+- Resolve paths through realpath and deny access outside the agent worktree.
+- Test symlink escapes.
+- Redact credentials from SDK errors and diagnostic output.
+- Move session secrets away from directories reachable from the agent worktree. The current sibling layout makes paths such as ../token worth treating as an existing cross-provider risk.
+- Consider an OS sandbox or a local credential-injecting proxy for the hardened release. Anthropic recommends isolation and least privilege for deployed agents. Secure deployment guidance
+Extension and CLI UX
+Add:
+- Host-room provider picker: Codex or Claude.
+- multicode.defaultAgent.
+- Optional multicode.claudeExecutable.
+- Claude API-key setup command.
+- Provider-specific model picker populated by supportedModels().
+- Capability-driven controls so unsupported effort or steering controls do not appear.
+- Provider-neutral labels throughout the UI.
+- multicode host --agent claude.
+- multicode doctor --agent claude.
+Persist the provider in handoff state so restored rooms use the right executable and labels. Joining users should learn the provider and capabilities from room configuration; they should not need an Anthropic key.
+Keep Codex as the default initially to avoid changing existing behavior.
+Packaging strategy
+There are two viable releases:
+External-binary MVP
+Require the Claude CLI to be installed and locate it similarly to the existing Codex executable discovery.
+Advantages:
+- Faster.
+- Smaller VSIX.
+- Avoids platform-specific packaging immediately.
+Disadvantages:
+- Worse onboarding.
+- More version mismatch possibilities.
+- Users must install and authenticate another component.
+Bundled production release
+Build target-specific VSIX packages and include the matching Claude binary:
+- Darwin ARM64
+- Darwin x64
+- Linux ARM64
+- Linux x64
+- Windows x64
+CI should verify that every packaged VSIX:
+- Contains the expected executable.
+- Can execute --version.
+- Can initialize the SDK from a clean VS Code environment.
+- Reports a clear setup error if the binary is unavailable.
+This is the recommended final user experience.
+Installing the SDK will intentionally modify package-lock.json; that lockfile change should be reviewed and committed with the implementation. Normal npm run build must not modify it. Add a CI check that runs the build and fails if git diff -- package-lock.json is nonempty.
+Protocol and relay rollout
+Add optional provider, capability, generic-tool, and structured-question fields in a backward-compatible release.
+Rollout order:
+1. Deploy relay schema changes that accept both old and new clients.
+2. Release the provider-neutral CLI and adapters.
+3. Release the extension UI.
+4. Enable Claude behind an experimental setting.
+5. Promote it after packaging and live API tests pass.
+Add protocol capability negotiation. If an older participant cannot render a structured Claude question, the host should deny that question with a clear compatibility message instead of leaving the agent hung.
+Use “Agent” as the fallback label when provider identity is unavailable; assuming Codex could mislabel a Claude room.
+Testing requirements
+Unit tests
+- Claude text streaming without duplicated final messages.
+- Thinking events.
+- Bash and non-Bash tools.
+- Successful, failed, interrupted, and budget-limited results.
+- Unknown SDK event handling.
+- Input queue lifecycle.
+- Steering and interruption.
+- Concurrent approvals.
+- Aborted, stale, and duplicate approval responses.
+- Model discovery and unsupported effort controls.
+- Provider factory validation.
+Shared adapter contract tests
+Run the same behavioral suite against Codex and Claude:
+- Start and configuration.
+- Prompt and completion.
+- Only one active regular turn.
+- Queue behavior.
+- Steering where supported.
+- Interruption.
+- Approvals.
+- Clean shutdown.
+Use an injected fake SDK transport for deterministic tests rather than globally mocking the package.
+Security tests
+- .. traversal.
+- Symlink escape.
+- Credential scrubbing.
+- Malicious repository instructions.
+- Malformed tool inputs.
+- No API keys in logs, relay payloads, room state, or history.
+- Host crash while approval is pending.
+End-to-end tests
+For both local and central relay modes:
+- Host a Claude room.
+- Join from a second extension.
+- Stream a response.
+- Edit a file.
+- Preview the diff.
+- Approve and decline commands.
+- Queue a prompt.
+- Steer or interrupt.
+- Merge the completed work.
+- Recover from subprocess and relay failures.
+Live Anthropic tests should be opt-in CI jobs using secrets and strict token budgets. Pull-request tests should use fixtures and a fake transport.
+Delivery phases
+1. Feasibility and packaging spike — 1–2 days
+   - Prove steering, model switching, approvals, and binary packaging.
+   - Produce explicit go/no-go conclusions.
+2. Provider-neutral refactor — 1–2 days
+   - Adapter factory, provider identity, capabilities, generic labels.
+   - No user-visible Codex regression.
+3. Claude adapter core — 2–3 days
+   - Streaming lifecycle, models, events, interruption, shutdown.
+4. Permissions and security — 2–3 days
+   - Tool approvals, structured questions, path controls, secret handling.
+5. CLI and extension UX — 2–3 days
+   - Provider picker, credentials, doctor command, models, handoff state.
+6. Relay rollout and compatibility — 1–2 days
+   - Schema changes, negotiation, old-client behavior.
+7. Packaging and end-to-end hardening — 2–4 days
+   - Platform builds, clean-install tests, failure injection, release telemetry.
+Release acceptance criteria
+Claude support is ready when:
+- Claude can host a room using BYOK without exposing credentials.
+- Model selection reflects actual supported models.
+- Responses, thinking, and tools stream correctly without duplication.
+- File changes use the existing MultiCode diff/review/merge workflow.
+- Tool approvals cannot become stale or resolve the wrong request.
+- Queue, interrupt, and either verified steering or an honestly labeled alternative work.
+- Extension reload, relay reconnect, and Claude subprocess failure produce recoverable states.
+- Every supported VSIX target passes a clean-machine smoke test.
+- Existing Codex behavior and tests remain unchanged.
+- Builds no longer mutate package-lock.json.

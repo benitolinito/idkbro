@@ -299,6 +299,9 @@ describe("v3 direct host workspace", () => {
     expect(hosted.workspacePath).toBe(root);
     expect(hosted.agentPath).not.toBe(root);
     expect(path.basename(hosted.agentPath)).toBe("agent");
+    expect(path.dirname(hosted.agentPath)).not.toBe(hosted.sessionDirectory);
+    await writeFile(path.join(hosted.sessionDirectory, "token"), "room-secret");
+    await expect(readFile(path.join(hosted.agentPath, "..", "token"), "utf8")).rejects.toThrow();
     expect(await readFile(path.join(hosted.workspacePath, "README.md"), "utf8")).toBe("# Direct room\n");
     expect(await readFile(path.join(hosted.agentPath, "README.md"), "utf8")).toBe("# Direct room\n");
     await expect(readFile(path.join(hosted.sessionDirectory, "shared", "README.md"), "utf8")).rejects.toThrow();

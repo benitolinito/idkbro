@@ -9,7 +9,7 @@ import { CollaborationBridge } from "./collaboration.js";
 import { resolveHostingDirectory } from "./host-workspace.js";
 import { roomSessionFromOutput, roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 import { workspaceHandoffId, workspaceHandoffSecretKey, type WorkspaceHandoff } from "./workspace-handoff.js";
-import type { ApprovalDecision } from "@multicode/protocol";
+import type { AgentInputAnswers, AgentProvider, ApprovalDecision } from "@multicode/protocol";
 import { inspectManagedRoomWorktree } from "@multicode/workspace";
 
 type SessionMode = "host" | "join";
@@ -20,6 +20,7 @@ interface CliCommand {
 }
 
 const workspaceHandoffsKey = "multicode.workspace-handoffs.v1";
+const claudeApiKeySecret = "multicode.claude-api-key";
 
 class MultiCodeController implements vscode.Disposable {
   private readonly output = vscode.window.createOutputChannel("MultiCode");
@@ -30,6 +31,9 @@ class MultiCodeController implements vscode.Disposable {
   private roomWorkspace: string | undefined;
   private roomSessionId: string | undefined;
   private stopping = false;
+  private agentProvider: AgentProvider = "codex";
+  private claudeApiKey: string | undefined;
+  private reviewerGrantPending = false;
   private recentOutput = "";
   readonly chat: MultiCodeChatView;
   private roomWorkspaceReady = false;
@@ -47,12 +51,21 @@ class MultiCodeController implements vscode.Disposable {
       removeQueuedPrompt: (promptId) => this.removeQueuedPrompt(promptId),
       steerQueuedPrompt: (promptId) => this.steerQueuedPrompt(promptId),
       approve: (requestId, decision) => this.resolveApproval(requestId, decision),
+      answer: (requestId, answers) => this.resolveInput(requestId, answers),
       copyInvite: () => this.copyInvite(),
       openOutput: () => this.openOutput(),
       reviewChanges: () => this.reviewChanges(),
       openChangedFile: (file) => this.openChangedFile(file),
     });
     this.collaboration = new CollaborationBridge((message) => {
+      if (message.type === "agent.config") {
+        this.agentProvider = message.config.provider;
+        void this.updateWorkspaceHandoffProvider(message.config.provider);
+      }
+      if (message.type === "room.welcome" && this.mode === "host") {
+        const self = message.participants.find((participant) => participant.id === message.selfId);
+        if (self && !self.capabilities.includes("reviewer")) void this.grantHostReviewer(self.id);
+      }
       this.chat.handle(message);
       if (message.type === "agent.event" && message.event.type === "turn.completed") {
         void vscode.commands.executeCommand("git.refresh");
@@ -76,9 +89,28 @@ class MultiCodeController implements vscode.Disposable {
     if (!cwd) return;
 
     const config = vscode.workspace.getConfiguration("multicode");
+    const configuredProvider = config.get<AgentProvider>("defaultAgent", "codex");
+    const experimentalClaude = config.get<boolean>("experimentalClaude", false) || configuredProvider === "claude";
+    const providers = [
+      { label: "Codex", description: "OpenAI Codex app-server", provider: "codex" as const },
+      ...(experimentalClaude ? [{ label: "Claude", description: "Anthropic Claude Agent SDK (experimental)", provider: "claude" as const }] : []),
+    ];
+    providers.sort((left, right) => Number(right.provider === configuredProvider) - Number(left.provider === configuredProvider));
+    const selection = await vscode.window.showQuickPick(providers, { placeHolder: "Choose the coding agent for this room", ignoreFocusOut: true });
+    if (!selection) return;
+    this.agentProvider = selection.provider;
+    if (selection.provider === "claude") {
+      this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+      if (!this.claudeApiKey) {
+        if (!await this.configureClaudeApiKey()) return;
+        this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+      }
+    }
     const name = config.get<string>("displayName")?.trim() || this.defaultName();
     const relay = config.get<string>("relayUrl")?.trim();
-    const args = ["host", "--name", name];
+    const args = ["host", "--agent", selection.provider, "--name", name];
+    const providerExecutable = config.get<string>(selection.provider === "claude" ? "claudeExecutable" : "codexExecutable")?.trim();
+    if (providerExecutable) args.push("--agent-executable", providerExecutable);
     if (relay) args.push("--relay", relay);
     this.startSession("host", args, cwd);
   }
@@ -94,6 +126,7 @@ class MultiCodeController implements vscode.Disposable {
     if (!token || !this.validRoomToken(token)) return;
 
     this.mode = handoff.mode;
+    this.agentProvider = handoff.provider ?? "codex";
     this.roomCode = token;
     this.roomWorkspace = workspace;
     this.roomSessionId = handoff.roomId;
@@ -198,6 +231,28 @@ class MultiCodeController implements vscode.Disposable {
     throw new Error("MultiCode is reconnecting; the approval was not sent");
   }
 
+  async resolveInput(requestId: string, answers: AgentInputAnswers | null): Promise<void> {
+    if (this.mode === "host" && this.roomWorkspace) {
+      await this.runCliCommand(["answer", requestId, answers === null ? "cancel" : JSON.stringify(answers), ...(this.roomSessionId ? ["--session", this.roomSessionId] : [])], this.roomWorkspace);
+      return;
+    }
+    if (this.collaboration.resolveInput(requestId, answers)) return;
+    throw new Error("MultiCode is reconnecting; the answer was not sent");
+  }
+
+  async configureClaudeApiKey(): Promise<boolean> {
+    const value = await vscode.window.showInputBox({
+      title: "Configure Claude API Key",
+      prompt: "Enter an Anthropic API key. It is stored in VS Code SecretStorage and only injected into the local host process.",
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (!value?.trim()) return false;
+    await this.context.secrets.store(claudeApiKeySecret, value.trim());
+    void vscode.window.showInformationMessage("Claude API key stored securely for local MultiCode hosting.");
+    return true;
+  }
+
   async copyInvite(): Promise<void> {
     if (!this.roomCode) return;
     await vscode.env.clipboard.writeText(this.roomCode);
@@ -239,9 +294,14 @@ class MultiCodeController implements vscode.Disposable {
     const cwd = this.workspaceDirectory(false);
     this.output.clear();
     this.output.show(true);
-    this.output.appendLine("$ multicode doctor\n");
+    const provider = vscode.workspace.getConfiguration("multicode").get<AgentProvider>("defaultAgent", "codex");
+    this.agentProvider = provider;
+    if (provider === "claude") this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+    this.output.appendLine(`$ multicode doctor --agent ${provider}\n`);
     const command = this.cliCommand();
-    const child = spawn(command.executable, [...command.prefixArgs, "doctor"], { cwd, env: this.sessionEnvironment() });
+    const configuredExecutable = vscode.workspace.getConfiguration("multicode").get<string>(provider === "claude" ? "claudeExecutable" : "codexExecutable")?.trim();
+    const child = spawn(command.executable, [...command.prefixArgs, "doctor", "--agent", provider, ...(configuredExecutable ? ["--agent-executable", configuredExecutable] : [])], { cwd, env: this.sessionEnvironment(true) });
+    this.claudeApiKey = undefined;
     child.stdout.on("data", (data: Buffer) => this.output.append(data.toString()));
     child.stderr.on("data", (data: Buffer) => this.output.append(data.toString()));
     child.once("error", (error) => this.reportLaunchError(error));
@@ -301,7 +361,8 @@ class MultiCodeController implements vscode.Disposable {
     this.status.command = "multicode.sendPrompt";
     void vscode.commands.executeCommand("setContext", "multicode.connected", true);
 
-    const child = spawn(command.executable, [...command.prefixArgs, ...args], { cwd, env: this.sessionEnvironment() });
+    const child = spawn(command.executable, [...command.prefixArgs, ...args], { cwd, env: this.sessionEnvironment(mode === "host") });
+    this.claudeApiKey = undefined;
     this.process = child;
     child.stdout.on("data", (data: Buffer) => this.handleOutput(data.toString()));
     child.stderr.on("data", (data: Buffer) => this.handleOutput(data.toString()));
@@ -394,6 +455,7 @@ class MultiCodeController implements vscode.Disposable {
       name: connection.name,
       role: connection.role,
       mode: this.mode ?? "join",
+      provider: this.agentProvider,
       roomLabel: connection.token.slice(0, 11),
       ...(this.roomSessionId ? { roomId: this.roomSessionId } : {}),
       updatedAt: Date.now(),
@@ -427,6 +489,28 @@ class MultiCodeController implements vscode.Disposable {
     await this.context.secrets.delete(workspaceHandoffSecretKey(workspace));
   }
 
+  private async updateWorkspaceHandoffProvider(provider: AgentProvider): Promise<void> {
+    const workspace = this.roomWorkspace;
+    if (!workspace) return;
+    const id = workspaceHandoffId(workspace);
+    const existing = this.context.globalState.get<Record<string, WorkspaceHandoff>>(workspaceHandoffsKey, {});
+    const handoff = existing[id];
+    if (!handoff || handoff.provider === provider) return;
+    await this.context.globalState.update(workspaceHandoffsKey, { ...existing, [id]: { ...handoff, provider, updatedAt: Date.now() } });
+  }
+
+  private async grantHostReviewer(participantId: string): Promise<void> {
+    if (this.reviewerGrantPending) return;
+    this.reviewerGrantPending = true;
+    try {
+      await this.runCliCommand(["grant", participantId, "reviewer", ...(this.roomSessionId ? ["--session", this.roomSessionId] : [])], this.roomWorkspace ?? this.workspaceDirectory(false));
+    } catch (error) {
+      this.output.appendLine(`\nUnable to grant the host review controls: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.reviewerGrantPending = false;
+    }
+  }
+
   private cliCommand(): CliCommand {
     const configured = vscode.workspace.getConfiguration("multicode").get<string>("executable", "multicode").trim();
     if (configured !== "multicode") return { executable: configured, prefixArgs: [] };
@@ -450,8 +534,12 @@ class MultiCodeController implements vscode.Disposable {
     });
   }
 
-  private sessionEnvironment(): NodeJS.ProcessEnv {
+  private sessionEnvironment(includeClaudeKey = false): NodeJS.ProcessEnv {
     const env = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (includeClaudeKey && this.agentProvider === "claude" && this.claudeApiKey) env.ANTHROPIC_API_KEY = this.claudeApiKey;
     const configured = vscode.workspace.getConfiguration("multicode").get<string>("codexExecutable")?.trim();
     let codexDirectory = configured && path.isAbsolute(configured) && existsSync(configured)
       ? path.dirname(configured)
@@ -584,6 +672,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("multicode.openChat", () => controller.openChat()),
     vscode.commands.registerCommand("multicode.sendPrompt", () => controller.sendPrompt()),
     vscode.commands.registerCommand("multicode.doctor", () => controller.doctor()),
+    vscode.commands.registerCommand("multicode.configureClaudeApiKey", () => controller.configureClaudeApiKey()),
     vscode.commands.registerCommand("multicode.stop", () => controller.stop()),
     vscode.commands.registerCommand("multicode.openProposal", () => controller.openProposal()),
     vscode.commands.registerCommand("multicode.openPreview", () => controller.openPreview()),

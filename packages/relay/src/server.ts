@@ -66,7 +66,14 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
   "command.started",
   "command.output",
   "command.exited",
+  "tool.started",
+  "tool.output",
+  "tool.completed",
   "approval.requested",
+  "approval.resolved",
+  "input.requested",
+  "input.answered",
+  "input.cancelled",
   "agent.error",
   "agent.exited",
 ]);
@@ -189,7 +196,7 @@ class CentralRoom {
         return;
       }
       clearTimeout(timer);
-      this.join(socket, parsed.data.name, parsed.data.requestedRole ?? "editor");
+      this.join(socket, parsed.data.name, parsed.data.requestedRole ?? "editor", parsed.data.protocolCapabilities ?? []);
     };
     socket.once("message", authenticate);
     socket.once("close", () => clearTimeout(timer));
@@ -208,7 +215,7 @@ class CentralRoom {
     this.onClosed();
   }
 
-  private join(socket: WebSocket, name: string, requestedRole: "viewer" | "editor"): void {
+  private join(socket: WebSocket, name: string, requestedRole: "viewer" | "editor", protocolCapabilities: NonNullable<RoomParticipant["protocolCapabilities"]>): void {
     if (this.participants.size + 1 >= this.maxParticipants) {
       reject(socket, `Room participant limit of ${this.maxParticipants} reached`, 4004);
       return;
@@ -220,6 +227,7 @@ class CentralRoom {
       host: false,
       synced: this.latestCheckpoint === null,
       capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "editor", "prompter"],
+      protocolCapabilities,
     };
     this.participants.set(socket, participant);
     send(socket, {
@@ -314,6 +322,11 @@ class CentralRoom {
     if (participantMessage.type === "approval.resolve") {
       if (!participant.capabilities.includes("reviewer")) { send(socket, { type: "room.error", message: "Participant does not have reviewer capability" }); return; }
       send(this.hostSocket, { type: "approval.submitted", participantId: participant.id, requestId: participantMessage.requestId, decision: participantMessage.decision }); return;
+    }
+    if (participantMessage.type === "input.resolve") {
+      if (!participant.capabilities.includes("reviewer")) { send(socket, { type: "room.error", message: "Participant does not have reviewer capability" }); return; }
+      if (participantMessage.answers === undefined && participantMessage.payload === undefined) { send(socket, { type: "room.error", message: "Input response is empty" }); return; }
+      send(this.hostSocket, { type: "input.submitted", participantId: participant.id, requestId: participantMessage.requestId, ...(participantMessage.answers !== undefined ? { answers: participantMessage.answers } : {}), ...(participantMessage.payload ? { payload: participantMessage.payload } : {}) }); return;
     }
     if (participantMessage.type === "prompt.update" || participantMessage.type === "prompt.remove" || participantMessage.type === "prompt.steer") {
       if (!this.allowRate(socket, "queue", 60, 60_000)) { send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }

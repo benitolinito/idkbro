@@ -10,7 +10,7 @@ sdf
 > think
 > But
 
-> MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
+> MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex or Claude session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -20,7 +20,7 @@ The public relay defaults to `wss://multicode.luisagd.com`, so the normal workfl
 ## How it works
 
 ```text
-Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbound WSS ── Collaborator
+Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbound WSS ── Collaborator
 ```
 
 - The host session daemon is the sole authority for manifests, Yjs documents, sequencing, permissions, proposals, and workspace commits.
@@ -28,14 +28,14 @@ Host + Codex ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 - Each originating IP can host at most five active rooms.
 - Viewers, editors, prompters, and reviewers are independent capabilities controlled by the host.
 - Prompts from all participants execute through one FIFO queue.
-- Each person works directly in their clean local checkout. MultiCode leases that checkout for one room, while Codex alone runs in a temporary isolated worktree.
-- Human edits are durably committed before broadcast. Multi-file Codex results are buffered and finalized as one logical workspace transaction.
+- Each person works directly in their clean local checkout. MultiCode leases that checkout for one room, while the selected agent runs in a temporary isolated worktree.
+- Human edits are durably committed before broadcast. Multi-file agent results are buffered and finalized as one logical workspace transaction.
 - The public relay sees routing metadata and encrypted payload sizes, not source, prompts, agent output, previews, proposals, or checkpoint contents.
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 22.5 or newer (the session journal uses the built-in SQLite API in WAL mode)
-- Hosting: Git, an authenticated Codex CLI, and a repository with at least one commit
+- Hosting: Git, either an authenticated Codex CLI or a Claude CLI plus an Anthropic API key, and a repository with at least one commit
 - VS Code: version 1.96 or newer
 - Joining: a clone containing the host's base commit; Codex is not required
 
@@ -54,16 +54,19 @@ code --install-extension apps/vscode/multicode-vscode-0.4.2.vsix
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
 
-- **MultiCode: Host Room** — start Codex and collaboration in the current checkout and current VS Code window.
+- **MultiCode: Host Room** — choose Codex or experimental Claude and start collaboration in the current checkout and current VS Code window.
 - **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
-- **MultiCode: Open Chat** — open the shared Codex-style conversation sidebar.
+- **MultiCode: Open Chat** — open the shared agent conversation sidebar.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
-- **MultiCode: Check Setup** — check Node.js, Git, Codex, and the current repository.
+- **MultiCode: Check Setup** — check Node.js, Git, the configured agent, authentication, and the current repository.
+- **MultiCode: Configure Claude API Key** — store a BYOK Anthropic key in VS Code SecretStorage.
 - **MultiCode: Stop or Leave Room** — end the current host or participant session.
 
-Room activity appears in the MultiCode sidebar as a shared conversation with participants, queue state, streaming reasoning and responses, commands, and workspace diffs. The **MultiCode** output channel keeps the raw process logs, and the status bar shows the current connection. The packaged VSIX includes the MultiCode CLI; hosts still need Git and an authenticated Codex CLI installed locally.
+Room activity appears in the MultiCode sidebar as a shared conversation with participants, queue state, streaming reasoning and responses, commands, generic tools, structured questions, and workspace diffs. The **MultiCode** output channel keeps the raw process logs, and the status bar shows the current connection. The packaged VSIX includes the MultiCode CLI; hosts still need Git and the selected agent CLI installed locally.
 
-Settings are available for the participant display name, relay URL, and an optional custom MultiCode executable. See [`apps/vscode`](apps/vscode) for extension development details.
+Claude is currently an external-binary MVP. Install the Claude CLI, enable `multicode.experimentalClaude`, optionally set `multicode.claudeExecutable`, and run **MultiCode: Configure Claude API Key**. The key is passed only to the local host subprocess and is not stored in settings, handoff state, or relay messages. Claude steering is intentionally hidden until active-turn semantics are verified; queue or interrupt instead.
+
+Settings are available for the default agent, agent executable paths, participant display name, relay URL, and an optional custom MultiCode executable. See [`apps/vscode`](apps/vscode) for extension development details.
 
 ## CLI setup
 
@@ -81,10 +84,11 @@ Or run the complete installation as one command:
 npm run setup:cli
 ```
 
-Check the hosting environment from the repository you want Codex to modify:
+Check the hosting environment from the repository you want the agent to modify:
 
 ```bash
 multicode doctor
+multicode doctor --agent claude
 ```
 
 ## Everyday workflow
@@ -95,9 +99,10 @@ From the Git repository you want to work on:
 
 ```bash
 multicode host
+multicode host --agent claude
 ```
 
-MultiCode leases the clean checkout, creates one temporary Codex worktree, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
+MultiCode leases the clean checkout, creates one temporary agent worktree, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
 
 ```text
 Room token: K7MNP-4XQ2R.<room-secret>
@@ -240,7 +245,7 @@ Run `multicode --help` for operator/development commands. End users only need
 The host and each participant use their original clean checkout. MultiCode never
 moves its branch or resets its index; room files appear as ordinary local working-tree
 changes. A per-repository lease prevents two rooms from owning one checkout at once.
-Codex uses one temporary detached worktree, which is removed when the host stops.
+The selected agent uses one temporary detached worktree, which is removed when the host stops. Session credentials and journals are stored outside that worktree tree.
 Hosting or joining from a legacy v2 MultiCode `shared` or `agent` worktree force-removes
 both legacy worktrees, then redirects to the original repository in the same VS Code window.
 
@@ -292,14 +297,16 @@ the same version only produce temporary Actions artifacts.
 | `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                        |
 | `@multicode/protocol`       | Shared schemas and event types                                                                       |
 | `@multicode/session-core`   | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC    |
-| `@multicode/workspace`      | Checkout leases, Codex worktrees, bootstrap checkpoints, B/A/H merges, and transactional application |
-| `@multicode/agent-adapters` | Codex app-server integration                                                                         |
+| `@multicode/workspace`      | Checkout leases, agent worktrees, bootstrap checkpoints, B/A/H merges, and transactional application |
+| `@multicode/agent-adapters` | Provider-neutral Codex app-server and Claude Agent SDK integration                                   |
 | `@multicode/relay`          | Embedded and standalone WebSocket relays                                                             |
 | `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                            |
 
 ## Current limitations
 
-- Only the Codex adapter is available, and only one Codex turn or pending proposal is allowed at a time.
+- Claude currently requires an external Claude CLI and BYOK API key. Platform-specific Claude binaries are not bundled in the VSIX yet.
+- Claude active-turn steering remains disabled until its semantics are verified; queued prompts and interruption are supported.
+- Only one regular agent turn or pending proposal is allowed at a time.
 - The host device must remain online. A transient host relay connection can resume, but rooms do not survive the host device being offline.
 - Collaborative files must be regular UTF-8 files no larger than 96 KiB. Binary files and symlinks remain checkpoint/export-only.
 - Undo uses normal VS Code behavior; MultiCode does not promise per-user CRDT undo.

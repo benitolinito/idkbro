@@ -57,6 +57,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Verify build does not change the lockfile
+        run: git diff --exit-code -- package-lock.json
+
       - name: Package extension
         run: npm run package -w multicode-vscode
 
