@@ -1,11 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { userInfo } from "node:os";
 import path from "node:path";
 import * as vscode from "vscode";
 import { hostApprovalCliArgs } from "./approval.js";
 import { MultiCodeChatView } from "./chat-view.js";
 import { CollaborationBridge } from "./collaboration.js";
+import { parseWorkspaceFileReference } from "./file-link.js";
 import { resolveHostingDirectory } from "./host-workspace.js";
 import { roomSessionFromOutput, roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 import { workspaceHandoffId, workspaceHandoffSecretKey, type WorkspaceHandoff } from "./workspace-handoff.js";
@@ -59,6 +60,7 @@ class MultiCodeController implements vscode.Disposable {
       openOutput: () => this.openOutput(),
       reviewChanges: () => this.reviewChanges(),
       openChangedFile: (file) => this.openChangedFile(file),
+      openWorkspaceFile: (reference) => this.openWorkspaceFile(reference),
     });
     this.collaboration = new CollaborationBridge((message) => {
       if (message.type === "agent.config") {
@@ -333,6 +335,30 @@ class MultiCodeController implements vscode.Disposable {
     }
     try { await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri)); }
     catch { await this.reviewChanges(); }
+  }
+
+  async openWorkspaceFile(reference: string): Promise<void> {
+    const parsed = parseWorkspaceFileReference(reference);
+    if (!parsed) return;
+    const root = path.resolve(this.roomWorkspace ?? this.workspaceDirectory(false));
+    const target = path.resolve(root, parsed.file);
+    try {
+      const realRoot = realpathSync.native(root);
+      const realTarget = realpathSync.native(target);
+      const relative = path.relative(realRoot, realTarget);
+      if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        void vscode.window.showWarningMessage("MultiCode refused to open a link outside the room workspace.");
+        return;
+      }
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(realTarget));
+      const line = Math.min(Math.max(0, (parsed.line ?? 1) - 1), Math.max(0, document.lineCount - 1));
+      const maxColumn = document.lineAt(line).text.length;
+      const column = Math.min(Math.max(0, (parsed.column ?? 1) - 1), maxColumn);
+      const position = new vscode.Position(line, column);
+      await vscode.window.showTextDocument(document, { preview: true, selection: new vscode.Range(position, position) });
+    } catch {
+      void vscode.window.showWarningMessage(`MultiCode could not open ${parsed.file}.`);
+    }
   }
 
   openChat(): void {

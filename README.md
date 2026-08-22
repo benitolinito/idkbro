@@ -2,6 +2,8 @@
 
 > Extension prompt check: this README was updated successfully through the MultiCode extension.
 
+> Codex workspace check: **working** (verified August 22, 2026).
+
 MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex or Claude session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
@@ -41,7 +43,7 @@ build and install it from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.4.5.vsix
+code --install-extension apps/vscode/multicode-vscode-0.4.7.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:

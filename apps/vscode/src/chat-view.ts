@@ -21,6 +21,7 @@ export interface ChatActions {
   openOutput(): void | Promise<void>;
   reviewChanges(): void | Promise<void>;
   openChangedFile(file: string): void | Promise<void>;
+  openWorkspaceFile(reference: string): void | Promise<void>;
 }
 
 type WebviewMessage =
@@ -97,6 +98,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         try {
           const uri = vscode.Uri.parse(href, true);
           if (uri.scheme === "http" || uri.scheme === "https" || uri.scheme === "mailto") await vscode.env.openExternal(uri);
+          else await this.actions.openWorkspaceFile(href);
         } catch {
           // Ignore malformed or unsupported links from rendered chat content.
         }
@@ -302,7 +304,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     details.activity-card > summary { display: grid; grid-template-columns: 18px minmax(0, auto) 10px; align-items: center; gap: 6px; width: fit-content; max-width: 100%; min-height: 28px; padding: 3px 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; border-radius: 5px; }
     details.activity-card > summary:hover { background: var(--vscode-list-hoverBackground); }
     details.activity-card > summary::-webkit-details-marker, details.activity-step > summary::-webkit-details-marker { display: none; }
-    .activity-chevron { display: inline-block; grid-column: -1; flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; transition: transform 120ms ease; }
+    .activity-chevron { display: inline-block; grid-column: -1; flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; opacity: 0; visibility: hidden; transition: opacity 100ms ease, transform 120ms ease, visibility 0s linear 100ms; }
+    details.activity-card > summary:hover .activity-chevron, details.activity-card > summary:focus-visible .activity-chevron { opacity: 1; visibility: visible; transition-delay: 0s; }
     details.activity-card[open] > summary .activity-chevron, details.activity-step[open] > summary .step-chevron { transform: rotate(90deg); }
     .activity-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 12px; font-weight: 600; }
     .activity-glyph { display: grid; place-items: center; width: 17px; height: 17px; color: var(--vscode-descriptionForeground); opacity: .86; }
@@ -336,7 +339,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     details.activity-step > summary:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
     .activity-step.failed .activity-glyph, .activity-step.failed .step-label { color: var(--vscode-errorForeground); }
     .step-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-    .step-chevron { color: var(--vscode-descriptionForeground); font-size: 9px; transition: transform 120ms ease; }
+    .step-chevron { color: var(--vscode-descriptionForeground); font-size: 9px; opacity: 0; visibility: hidden; transition: opacity 100ms ease, transform 120ms ease, visibility 0s linear 100ms; }
+    details.activity-step > summary:hover .step-chevron, details.activity-step > summary:focus-visible .step-chevron { opacity: 1; visibility: visible; transition-delay: 0s; }
     details.activity-step > pre.step-output { width: 100%; margin: 0 0 4px; padding: 7px 9px; border: 0; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 5px; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 220px; overflow: auto; }
     details.activity-step > .step-markdown { width: 100%; margin: 1px 0 5px; padding: 6px 9px; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-left: 2px solid var(--vscode-panel-border); border-radius: 0 5px 5px 0; font-size: 11px; }
     @keyframes activeText { from { background-position: 100% 0; } to { background-position: -120% 0; } }
