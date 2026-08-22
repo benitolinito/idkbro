@@ -213,6 +213,8 @@ export class ChatModel {
         this.add("system", `Workspace checkpoint ${message.checkpoint.sequence} · ${message.checkpoint.commit.slice(0, 12)}`);
         break;
       case "collab.event":
+      case "collab.rate_limited":
+      case "collab.rejected":
         break;
       case "room.error":
         if (message.fatal) this.connection = "error";

@@ -338,6 +338,12 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
       partCount: z.number().int().positive().max(10_000).optional(),
     }),
   }),
+  z.object({
+    type: z.literal("relay.collab.rejected"),
+    participantId: z.string().min(1).max(128),
+    eventId: z.string().uuid(),
+    message: z.string().min(1).max(1_000),
+  }),
 ]);
 
 export interface RoomParticipant {
@@ -423,7 +429,8 @@ export type RelayHostMessage =
   | { type: "relay.prompt.steered"; promptId: string }
   | { type: "relay.prompt.steer.failed"; promptId: string; message: string }
   | { type: "relay.participant.capabilities"; participantId: string; capabilities: Capability[] }
-  | { type: "relay.collab.event"; event: CollaborationEvent };
+  | { type: "relay.collab.event"; event: CollaborationEvent }
+  | { type: "relay.collab.rejected"; participantId: string; eventId: string; message: string };
 
 export interface CollaborationEvent {
   id: string;
@@ -476,6 +483,8 @@ export type RoomServerMessage =
   | { type: "collab.submitted"; participantId: string; event: CollaborationEvent }
   | { type: "approval.submitted"; participantId: string; requestId: string | number; decision: ApprovalDecision }
   | { type: "collab.event"; event: CollaborationEvent }
+  | { type: "collab.rate_limited"; eventId: string; kind: CollaborationEvent["kind"]; retryAfterMs: number }
+  | { type: "collab.rejected"; eventId: string; message: string }
   | { type: "participant.synced"; participantId: string; sequence: number; commit: string }
   | { type: "room.error"; message: string; fatal?: boolean };
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument } from "./collaboration-runtime.js";
+import { AcknowledgedEventQueue, LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument } from "./collaboration-runtime.js";
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -65,5 +65,44 @@ describe("collaboration runtime", () => {
     vi.advanceTimersByTime(200);
 
     expect(values).toEqual(["first"]);
+  });
+
+  it("keeps durable events ordered until each one is acknowledged", () => {
+    vi.useFakeTimers();
+    const sent: string[] = [];
+    const queue = new AcknowledgedEventQueue<{ id: string }>((value) => { sent.push(value.id); return true; });
+
+    queue.enqueue({ id: "first" });
+    queue.enqueue({ id: "second" });
+    expect(sent).toEqual(["first"]);
+    expect(queue.acknowledge("second")).toBe(false);
+    expect(queue.acknowledge("first")).toBe(true);
+    expect(sent).toEqual(["first", "second"]);
+    expect(queue.size).toBe(1);
+  });
+
+  it("retries a durable event after the server-provided delay with the same ID", () => {
+    vi.useFakeTimers();
+    const sent: string[] = [];
+    const queue = new AcknowledgedEventQueue<{ id: string }>((value) => { sent.push(value.id); return true; });
+
+    queue.enqueue({ id: "durable" });
+    queue.rateLimited("durable", 250);
+    vi.advanceTimersByTime(249);
+    expect(sent).toEqual(["durable"]);
+    vi.advanceTimersByTime(1);
+    expect(sent).toEqual(["durable", "durable"]);
+    queue.acknowledge("durable");
+  });
+
+  it("resends the in-flight event after an acknowledgement timeout", () => {
+    vi.useFakeTimers();
+    const sent: string[] = [];
+    const queue = new AcknowledgedEventQueue<{ id: string }>((value) => { sent.push(value.id); return true; }, 1_000);
+
+    queue.enqueue({ id: "durable" });
+    vi.advanceTimersByTime(1_000);
+    expect(sent).toEqual(["durable", "durable"]);
+    queue.clear();
   });
 });

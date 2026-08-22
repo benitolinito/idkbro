@@ -192,7 +192,7 @@ curl https://multicode.luisagd.com/health
 Expected response:
 
 ```json
-{ "ok": true, "rooms": 0, "uptimeSeconds": 12 }
+{ "ok": true, "rooms": 0, "participants": 0, "droppedPresenceEvents": 0, "uptimeSeconds": 12 }
 ```
 
 ### Relay operations
@@ -214,6 +214,7 @@ Optional limits can be changed in `deploy/.env`:
 ```dotenv
 MULTICODE_MAX_ROOMS=100
 MULTICODE_ROOMS_PER_IP=5
+MULTICODE_MAX_PARTICIPANTS_PER_ROOM=32
 TZ=America/New_York
 MULTICODE_POSTGRES_USER=multicode
 MULTICODE_POSTGRES_PASSWORD=use-a-long-random-secret

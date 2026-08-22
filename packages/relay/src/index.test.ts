@@ -221,4 +221,52 @@ describe("RoomRelay", () => {
     viewer.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "document.update", payload: "opaque" } }));
     expect((await viewer.messages.next("room.error")).message).toMatch(/editor capability/);
   });
+
+  it("drops excess presence silently while reporting the drop metric", async () => {
+    let acceptedPresence = 0;
+    const relay = new RoomRelay({
+      roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined,
+      onCollaborationEvent: async (_participant, event) => { if (event.kind === "presence.update") acceptedPresence += 1; return event; },
+    });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const client = await connect(port, "secret-token", "Grace"); sockets.push(client.socket);
+
+    for (let index = 0; index < 30; index += 1) {
+      client.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "presence.update", payload: `cursor-${index}` } }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(acceptedPresence).toBe(20);
+    expect(relay.metrics.droppedPresenceEvents).toBe(10);
+  });
+
+  it("returns structured backpressure for durable events", async () => {
+    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const client = await connect(port, "secret-token", "Grace"); sockets.push(client.socket);
+    const eventIds = Array.from({ length: 31 }, () => randomUUID());
+
+    for (const eventId of eventIds) client.socket.send(JSON.stringify({ type: "collab.publish", event: { id: eventId, kind: "manifest.operation", payload: "opaque-operation" } }));
+
+    expect(await client.messages.next("collab.rate_limited")).toMatchObject({
+      eventId: eventIds[30],
+      kind: "manifest.operation",
+      retryAfterMs: expect.any(Number),
+    });
+  });
+
+  it("rejects participants above the configured room capacity", async () => {
+    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", maxParticipants: 2, onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
+    relays.push(relay);
+    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
+    const first = await connect(port, "secret-token", "Grace"); sockets.push(first.socket);
+    const secondSocket = new WebSocket(`ws://127.0.0.1:${port}`); sockets.push(secondSocket);
+    const secondMessages = new MessageCollector(secondSocket);
+    await new Promise<void>((resolve, reject) => { secondSocket.once("open", resolve); secondSocket.once("error", reject); });
+    secondSocket.send(JSON.stringify({ type: "room.join", token: "secret-token", name: "Linus" }));
+
+    expect(await secondMessages.next("room.error")).toMatchObject({ fatal: true, message: expect.stringMatching(/participant limit/i) });
+  });
 });

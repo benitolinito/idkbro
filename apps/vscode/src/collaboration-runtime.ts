@@ -58,3 +58,71 @@ export class LatestValueThrottle<T> {
     this.run(pending.value);
   }
 }
+
+/**
+ * Sends durable events one at a time and retains them until the authority
+ * broadcasts the matching event ID. Reusing the ID makes retries idempotent.
+ */
+export class AcknowledgedEventQueue<T extends { id: string }> {
+  private readonly values: T[] = [];
+  private timer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(
+    private readonly send: (value: T) => boolean,
+    private readonly acknowledgementTimeoutMs = 5_000,
+    private readonly disconnectedRetryMs = 500,
+  ) {}
+
+  get size(): number { return this.values.length; }
+
+  enqueue(value: T): void {
+    if (this.values.some((candidate) => candidate.id === value.id)) return;
+    this.values.push(value);
+    this.pump();
+  }
+
+  acknowledge(id: string): boolean {
+    if (this.values[0]?.id !== id) return false;
+    this.cancelTimer();
+    this.values.shift();
+    this.pump();
+    return true;
+  }
+
+  rateLimited(id: string, retryAfterMs: number): boolean {
+    if (this.values[0]?.id !== id) return false;
+    this.cancelTimer();
+    this.timer = setTimeout(() => { this.timer = undefined; this.transmit(); }, Math.max(1, retryAfterMs));
+    return true;
+  }
+
+  resume(): void {
+    if (!this.values.length) return;
+    this.cancelTimer();
+    this.transmit();
+  }
+
+  clear(): void {
+    this.cancelTimer();
+    this.values.splice(0);
+  }
+
+  private pump(): void {
+    if (!this.timer && this.values.length) this.transmit();
+  }
+
+  private transmit(): void {
+    const value = this.values[0];
+    if (!value) return;
+    const sent = this.send(value);
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.transmit();
+    }, sent ? this.acknowledgementTimeoutMs : this.disconnectedRetryMs);
+  }
+
+  private cancelTimer(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+}

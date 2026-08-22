@@ -16,6 +16,7 @@ import {
   type WorkspaceCheckpointDescriptor,
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
+import { TokenBucket, collaborationRateGroup, collaborationRatePolicy, createCollaborationBucket } from "./rate-limit.js";
 
 const maxRelayFrameBytes = 256 * 1024;
 
@@ -32,12 +33,14 @@ export interface RoomRelayOptions {
   onApproval?: (participant: RoomParticipant, requestId: string | number, decision: ApprovalDecision) => Promise<void>;
   onCheckpointRequest?: (participantId: string, sequence: number) => Promise<void> | void;
   onRoomEvent?: (message: RoomServerMessage) => void;
+  maxParticipants?: number;
 }
 
 interface ConnectionState {
   participant?: RoomParticipant;
   authenticationTimer: NodeJS.Timeout;
   rates: Map<string, { startedAt: number; count: number }>;
+  collaborationRates: Map<string, TokenBucket>;
 }
 
 function tokenMatches(expected: string, received: string): boolean {
@@ -56,8 +59,12 @@ export class RoomRelay {
   private latestCheckpoint: WorkspaceCheckpointDescriptor | null = null;
   private agentConfig: AgentConfig | undefined;
   private readonly host: RoomParticipant;
+  private readonly maxParticipants: number;
+  private readonly roomPresenceRate = new TokenBucket(collaborationRatePolicy.roomPresence);
+  private droppedPresenceEvents = 0;
 
   constructor(private readonly options: RoomRelayOptions) {
+    this.maxParticipants = Math.max(2, options.maxParticipants ?? 32);
     this.host = {
       id: "host",
       name: options.hostName,
@@ -66,6 +73,10 @@ export class RoomRelay {
       synced: true,
       capabilities: ["viewer", "editor", "prompter", "reviewer", "host"],
     };
+  }
+
+  get metrics(): { participants: number; droppedPresenceEvents: number } {
+    return { participants: this.participants().length + 1, droppedPresenceEvents: this.droppedPresenceEvents };
   }
 
   async listen(options: { host: string; port: number }): Promise<{ host: string; port: number }> {
@@ -203,7 +214,7 @@ export class RoomRelay {
       this.send(socket, { type: "room.error", message: "Join timed out", fatal: true });
       socket.close(4001, "Join timed out");
     }, 5_000);
-    this.connections.set(socket, { authenticationTimer, rates: new Map() });
+    this.connections.set(socket, { authenticationTimer, rates: new Map(), collaborationRates: new Map() });
 
     socket.on("message", (data) => this.receive(socket, data.toString()));
     socket.on("close", () => this.disconnect(socket));
@@ -275,21 +286,32 @@ export class RoomRelay {
     }
 
     if (parsed.data.type === "collab.publish") {
-      const rate = parsed.data.event.kind === "presence.update" ? ["presence", 60, 10_000] as const
-        : parsed.data.event.kind === "manifest.operation" ? ["manifest", 30, 10_000] as const
-        : ["document", 300, 10_000] as const;
-      if (!this.allowRate(state, rate[0], rate[1], rate[2])) {
-        if (this.allowRate(state, `error:${rate[0]}`, 1, rate[2])) this.send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" });
-        return;
-      }
-      if ((parsed.data.event.kind === "document.update" || parsed.data.event.kind === "manifest.operation") && !state.participant.capabilities.includes("editor")) {
+      const collaborationEvent = parsed.data.event;
+      if ((collaborationEvent.kind === "document.update" || collaborationEvent.kind === "manifest.operation") && !state.participant.capabilities.includes("editor")) {
         this.send(socket, { type: "room.error", message: "Participant does not have editor capability" });
         return;
       }
-      void this.options.onCollaborationEvent(state.participant, parsed.data.event).then((event) => {
+      const group = collaborationRateGroup(collaborationEvent.kind);
+      let bucket = state.collaborationRates.get(group);
+      if (!bucket) { bucket = createCollaborationBucket(group); state.collaborationRates.set(group, bucket); }
+      const participantRate = bucket.take();
+      if (group === "presence") {
+        if (!participantRate.allowed) { this.droppedPresenceEvents += 1; return; }
+        const roomRate = this.roomPresenceRate.take();
+        if (!roomRate.allowed) { this.droppedPresenceEvents += 1; return; }
+      } else if (!participantRate.allowed) {
+        this.send(socket, {
+          type: "collab.rate_limited",
+          eventId: collaborationEvent.id,
+          kind: collaborationEvent.kind,
+          retryAfterMs: participantRate.retryAfterMs,
+        });
+        return;
+      }
+      void this.options.onCollaborationEvent(state.participant, collaborationEvent).then((event) => {
         this.publishCollaborationEvent(event);
       }).catch((error: unknown) => {
-        this.send(socket, { type: "room.error", message: `Collaboration update rejected: ${error instanceof Error ? error.message : String(error)}` });
+        this.send(socket, { type: "collab.rejected", eventId: collaborationEvent.id, message: error instanceof Error ? error.message : String(error) });
       });
       return;
     }
@@ -360,6 +382,11 @@ export class RoomRelay {
 
   private join(socket: WebSocket, state: ConnectionState, name: string, requestedRole: "viewer" | "editor"): void {
     clearTimeout(state.authenticationTimer);
+    if (this.participants().length + 1 >= this.maxParticipants) {
+      this.send(socket, { type: "room.error", message: `Room participant limit of ${this.maxParticipants} reached`, fatal: true });
+      socket.close(4004, "Room participant limit reached");
+      return;
+    }
     const participant: RoomParticipant = {
       id: randomUUID(),
       name,

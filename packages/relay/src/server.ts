@@ -20,6 +20,7 @@ import {
 } from "@multicode/protocol";
 import WebSocket, { WebSocketServer } from "ws";
 import type { RelayRoomStore } from "./store.js";
+import { TokenBucket, collaborationRateGroup, collaborationRatePolicy, createCollaborationBucket } from "./rate-limit.js";
 
 const maxRelayFrameBytes = 256 * 1024;
 const maxSocketBufferedBytes = 1024 * 1024;
@@ -27,6 +28,7 @@ const maxSocketBufferedBytes = 1024 * 1024;
 export interface RelayServerOptions {
   maxRooms?: number;
   maxRoomsPerIp?: number;
+  maxParticipantsPerRoom?: number;
   authenticationTimeoutMs?: number;
   store?: RelayRoomStore;
 }
@@ -107,6 +109,9 @@ class CentralRoom {
   private readonly collabHistory: CollaborationEvent[] = [];
   private collabTail: Promise<void> = Promise.resolve();
   private readonly rateWindows = new WeakMap<WebSocket, Map<string, { startedAt: number; count: number }>>();
+  private readonly collaborationRates = new WeakMap<WebSocket, Map<string, TokenBucket>>();
+  private readonly roomPresenceRate = new TokenBucket(collaborationRatePolicy.roomPresence);
+  private droppedPresenceEvents = 0;
   private closed = false;
   private hostDisconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private hostSocket: WebSocket;
@@ -120,6 +125,7 @@ class CentralRoom {
     hostName: string,
     readonly ownerIp: string,
     private readonly authenticationTimeoutMs: number,
+    private readonly maxParticipants: number,
     private readonly persistEvent: (event: { id: string; kind: string; payload: string }) => Promise<void>,
     private readonly onClosed: () => void,
   ) {
@@ -136,6 +142,9 @@ class CentralRoom {
   }
 
   get code(): string { return this.participantToken; }
+  get metrics(): { participants: number; droppedPresenceEvents: number } {
+    return { participants: this.participants.size + 1, droppedPresenceEvents: this.droppedPresenceEvents };
+  }
 
   resume(socket: WebSocket): void {
     if (this.closed) { reject(socket, "Room is closed", 4004); return; }
@@ -200,6 +209,10 @@ class CentralRoom {
   }
 
   private join(socket: WebSocket, name: string, requestedRole: "viewer" | "editor"): void {
+    if (this.participants.size + 1 >= this.maxParticipants) {
+      reject(socket, `Room participant limit of ${this.maxParticipants} reached`, 4004);
+      return;
+    }
     const participant: RoomParticipant = {
       id: randomUUID(),
       name,
@@ -272,15 +285,27 @@ class CentralRoom {
       return;
     }
     if (participantMessage.type === "collab.publish") {
-      const rate = participantMessage.event.kind === "presence.update" ? ["presence", 60, 10_000] as const
-        : participantMessage.event.kind === "manifest.operation" ? ["manifest", 30, 10_000] as const
-        : ["document", 300, 10_000] as const;
-      if (!this.allowRate(socket, rate[0], rate[1], rate[2])) {
-        if (this.allowRate(socket, `error:${rate[0]}`, 1, rate[2])) send(socket, { type: "room.error", message: "Collaboration rate limit exceeded" });
-        return;
-      }
       if ((participantMessage.event.kind === "document.update" || participantMessage.event.kind === "manifest.operation") && !participant.capabilities.includes("editor")) {
         send(socket, { type: "room.error", message: "Participant does not have editor capability" });
+        return;
+      }
+      const group = collaborationRateGroup(participantMessage.event.kind);
+      let buckets = this.collaborationRates.get(socket);
+      if (!buckets) { buckets = new Map(); this.collaborationRates.set(socket, buckets); }
+      let bucket = buckets.get(group);
+      if (!bucket) { bucket = createCollaborationBucket(group); buckets.set(group, bucket); }
+      const participantRate = bucket.take();
+      if (group === "presence") {
+        if (!participantRate.allowed) { this.droppedPresenceEvents += 1; return; }
+        const roomRate = this.roomPresenceRate.take();
+        if (!roomRate.allowed) { this.droppedPresenceEvents += 1; return; }
+      } else if (!participantRate.allowed) {
+        send(socket, {
+          type: "collab.rate_limited",
+          eventId: participantMessage.event.id,
+          kind: participantMessage.event.kind,
+          retryAfterMs: participantRate.retryAfterMs,
+        });
         return;
       }
       send(this.hostSocket, { type: "collab.submitted", participantId: participant.id, event: participantMessage.event });
@@ -428,6 +453,11 @@ class CentralRoom {
         if (!participant) { send(this.hostSocket, { type: "room.error", message: "Participant is no longer connected" }); break; }
         participant.capabilities = [...new Set(message.capabilities)];
         this.broadcast({ type: "participant.capabilities", participantId: participant.id, capabilities: participant.capabilities });
+        break;
+      }
+      case "relay.collab.rejected": {
+        const target = [...this.participants.entries()].find(([, participant]) => participant.id === message.participantId);
+        if (target) send(target[0], { type: "collab.rejected", eventId: message.eventId, message: message.message });
         break;
       }
       case "relay.collab.event":
@@ -595,11 +625,13 @@ export class RelayServer {
   private readonly startedAt = Date.now();
   private readonly maxRooms: number;
   private readonly maxRoomsPerIp: number;
+  private readonly maxParticipantsPerRoom: number;
   private readonly authenticationTimeoutMs: number;
 
   constructor(private readonly options: RelayServerOptions) {
     this.maxRooms = options.maxRooms ?? 100;
     this.maxRoomsPerIp = options.maxRoomsPerIp ?? 5;
+    this.maxParticipantsPerRoom = Math.max(2, options.maxParticipantsPerRoom ?? 32);
     this.authenticationTimeoutMs = options.authenticationTimeoutMs ?? 5_000;
   }
 
@@ -614,7 +646,13 @@ export class RelayServer {
     const httpServer = createServer((request, response) => {
       if (request.method === "GET" && request.url === "/health") {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, rooms: this.rooms.size, uptimeSeconds: Math.floor((Date.now() - this.startedAt) / 1_000) }));
+        response.end(JSON.stringify({
+          ok: true,
+          rooms: this.rooms.size,
+          participants: [...this.rooms.values()].reduce((sum, room) => sum + room.metrics.participants, 0),
+          droppedPresenceEvents: [...this.rooms.values()].reduce((sum, room) => sum + room.metrics.droppedPresenceEvents, 0),
+          uptimeSeconds: Math.floor((Date.now() - this.startedAt) / 1_000),
+        }));
         return;
       }
       response.writeHead(404, { "content-type": "application/json" });
@@ -720,6 +758,7 @@ export class RelayServer {
         creation.name,
         ownerIp,
         this.authenticationTimeoutMs,
+        this.maxParticipantsPerRoom,
         (event) => this.options.store?.appendEvent(roomId, event) ?? Promise.resolve(),
         () => { this.rooms.delete(roomId); void this.options.store?.roomClosed(roomId); },
       );

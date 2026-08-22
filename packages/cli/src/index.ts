@@ -1493,7 +1493,9 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         void authority.commit(message.participantId, message.event).then((event) => {
           sendToRelay({ type: "relay.collab.event", event });
         }).catch((error: unknown) => {
-          console.error(err.error(`Collaboration update rejected: ${error instanceof Error ? error.message : String(error)}`));
+          const rejection = error instanceof Error ? error.message : String(error);
+          sendToRelay({ type: "relay.collab.rejected", participantId: message.participantId, eventId: message.event.id, message: rejection.slice(0, 1_000) });
+          console.error(err.error(`Collaboration update rejected: ${rejection}`));
         });
         return;
       }
@@ -1742,13 +1744,15 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   }
 }
 
-async function serveRelay(options: { host: string; port: string; maxRooms: string; roomsPerIp: string }): Promise<void> {
+async function serveRelay(options: { host: string; port: string; maxRooms: string; roomsPerIp: string; maxParticipantsPerRoom: string }): Promise<void> {
   const maxRooms = Number(options.maxRooms);
   if (!Number.isInteger(maxRooms) || maxRooms < 1) throw new Error(`Invalid room limit: ${options.maxRooms}`);
   const maxRoomsPerIp = Number(options.roomsPerIp);
   if (!Number.isInteger(maxRoomsPerIp) || maxRoomsPerIp < 1) throw new Error(`Invalid per-IP room limit: ${options.roomsPerIp}`);
+  const maxParticipantsPerRoom = Number(options.maxParticipantsPerRoom);
+  if (!Number.isInteger(maxParticipantsPerRoom) || maxParticipantsPerRoom < 2) throw new Error(`Invalid participant limit: ${options.maxParticipantsPerRoom}`);
   const databaseUrl = process.env.MULTICODE_DATABASE_URL;
-  const relay = new RelayServer({ maxRooms, maxRoomsPerIp, ...(databaseUrl ? { store: new PostgresRelayRoomStore(databaseUrl) } : {}) });
+  const relay = new RelayServer({ maxRooms, maxRoomsPerIp, maxParticipantsPerRoom, ...(databaseUrl ? { store: new PostgresRelayRoomStore(databaseUrl) } : {}) });
   const bound = await relay.listen({ host: options.host, port: parsePort(options.port) });
   console.log(out.success(`${out.label("MultiCode relay")} ${out.value(`http://${bound.host}:${bound.port}`)}`));
   console.log(out.success(`${out.label("Health check")} ${out.value(`http://${bound.host}:${bound.port}/health`)}`));
@@ -1960,6 +1964,7 @@ relay
   .option("--port <port>", "port to listen on", process.env.MULTICODE_RELAY_PORT ?? "7337")
   .option("--max-rooms <count>", "maximum concurrent rooms", process.env.MULTICODE_MAX_ROOMS ?? "100")
   .option("--rooms-per-ip <count>", "maximum active rooms per originating IP", process.env.MULTICODE_ROOMS_PER_IP ?? "5")
+  .option("--max-participants-per-room <count>", "maximum participants per room, including the host", process.env.MULTICODE_MAX_PARTICIPANTS_PER_ROOM ?? "32")
   .action(serveRelay);
 
 program

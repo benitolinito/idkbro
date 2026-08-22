@@ -8,12 +8,13 @@ import * as Y from "yjs";
 import { isSensitiveWorkspacePath } from "@multicode/protocol";
 import type { AgentEvent, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
 import { WorkspaceProjectionTracker } from "@multicode/workspace";
-import { LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
+import { AcknowledgedEventQueue, LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
 
 interface EncryptedUpdate { file: string; nonce: string; tag: string; ciphertext: string; }
 const maxCollaborativeTextBytes = 96 * 1024;
 const execFileAsync = promisify(execFile);
 interface CollaborationWireEvent {
+  id: string;
   kind: string;
   payload: string;
   sequence?: number | undefined;
@@ -65,9 +66,13 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly recentStructuralPaths = new Map<string, number>();
   private readonly ignoredPaths = new Map<string, boolean>();
   private readonly warnedDirtyExternalPaths = new Set<string>();
+  private readonly pendingDocumentUpdates = new Map<string, { updates: Uint8Array[]; timer: ReturnType<typeof setTimeout> }>();
+  private readonly subscriptionEvents = new Map<string, string>();
+  private readonly subscriptionRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private workspaceRootUri: vscode.Uri | undefined;
   private readonly receiveQueue = new SerialTaskQueue();
   private readonly presenceUpdates = new LatestValueThrottle<PresenceUpdate>(200, (value) => this.sendPresenceNow(value));
+  private readonly durableEvents = new AcknowledgedEventQueue<CollaborationWireEvent>((event) => this.sendCollaborationEvent(event));
   // VS Code emits one change event per keystroke, while localChange performs
   // asynchronous ignore checks and network work. Keep those events ordered so
   // a later edit is never applied to a stale Yjs document.
@@ -111,7 +116,9 @@ export class CollaborationBridge implements vscode.Disposable {
       const file = this.file(document);
       return file ? [[file, document.getText()] as const] : [];
     });
-    this.disconnect();
+    const resuming = this.relayUrl === relayUrl && this.inviteToken === inviteToken;
+    if (resuming) this.flushPendingDocumentUpdates();
+    this.disconnect(resuming);
     for (const [file, contents] of localBuffers) this.pendingLocalText.set(file, contents);
     this.relayUrl = relayUrl; this.inviteToken = inviteToken; this.displayName = name; this.requestedRole = requestedRole; this.workspaceDiskOwner = workspaceDiskOwner; this.canEdit = requestedRole === "editor";
     this.latestPreviewRevision = 0; this.latestPreviewTurn = ""; this.welcomed = false;
@@ -151,7 +158,7 @@ export class CollaborationBridge implements vscode.Disposable {
     this.projections.clear();
   }
 
-  disconnect(): void {
+  disconnect(preserveDurableEvents = false): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     const socket = this.socket; this.socket = undefined; this.key = undefined; this.promptKey = undefined; this.inviteToken = ""; this.welcomed = false;
@@ -162,6 +169,9 @@ export class CollaborationBridge implements vscode.Disposable {
     this.participantNames.clear();
     for (const transaction of this.workspaceTransactions.values()) clearTimeout(transaction.timer); this.workspaceTransactions.clear();
     for (const timer of this.externalChangeTimers.values()) clearTimeout(timer); this.externalChangeTimers.clear();
+    this.clearPendingDocumentUpdates();
+    for (const timer of this.subscriptionRetryTimers.values()) clearTimeout(timer); this.subscriptionRetryTimers.clear(); this.subscriptionEvents.clear();
+    if (!preserveDurableEvents) this.durableEvents.clear();
     this.presenceUpdates.clear(); this.warnedDirtyExternalPaths.clear();
     this.selfId = "";
     this.statusChanged.fire("disconnected");
@@ -255,17 +265,34 @@ export class CollaborationBridge implements vscode.Disposable {
     if (message.type === "room.welcome") {
       this.selfId = message.selfId ?? "";
       for (const participant of message.participants ?? []) this.participantNames.set(participant.id, participant.name);
-      if (Array.isArray((message as any).collabHistory)) for (const event of (message as any).collabHistory) await this.applyEvent(event);
+      if (Array.isArray((message as any).collabHistory)) for (const event of (message as any).collabHistory) {
+        await this.applyEvent(event);
+        this.durableEvents.acknowledge(event.id);
+      }
       this.welcomed = true;
+      this.durableEvents.resume();
       for (const document of vscode.workspace.textDocuments) this.subscribe(document);
       return;
     }
     if (message.type === "participant.joined" && message.participant) { this.participantNames.set(message.participant.id, message.participant.name); return; }
     if (message.type === "participant.capabilities" && message.participantId === this.selfId) { this.canEdit = message.capabilities?.includes("editor") ?? false; if (!this.canEdit) this.resynchronizeOpenDocuments(); return; }
     if (message.type === "participant.left" && message.participantId) { this.clearPresence(message.participantId); this.participantNames.delete(message.participantId); return; }
-    if (message.type === "room.error" && message.message?.startsWith("Collaboration update rejected:")) { this.resynchronizeOpenDocuments(); return; }
+    if (message.type === "collab.rate_limited") {
+      if (this.durableEvents.rateLimited(message.eventId, message.retryAfterMs)) return;
+      const file = this.subscriptionEvents.get(message.eventId);
+      if (file) {
+        this.subscriptionEvents.delete(message.eventId);
+        this.subscribedDocuments.delete(file);
+        const existing = this.subscriptionRetryTimers.get(file); if (existing) clearTimeout(existing);
+        this.subscriptionRetryTimers.set(file, setTimeout(() => { this.subscriptionRetryTimers.delete(file); this.subscribeFile(file); }, message.retryAfterMs));
+      }
+      return;
+    }
+    if (message.type === "collab.rejected") { this.durableEvents.clear(); this.resynchronizeOpenDocuments(); return; }
+    if (message.type === "room.error" && message.message?.startsWith("Collaboration update rejected:")) { this.durableEvents.clear(); this.resynchronizeOpenDocuments(); return; }
     if (message.type !== "collab.event" || !message.event || !this.key) return;
     await this.applyEvent(message.event);
+    this.durableEvents.acknowledge(message.event.id);
   }
   private notifyRoomMessage(message: RoomServerMessage): void {
     if (!this.onRoomMessage) return;
@@ -358,13 +385,17 @@ export class CollaborationBridge implements vscode.Disposable {
     if (!this.welcomed || this.subscribedDocuments.has(file) || !this.key || this.socket?.readyState !== WebSocket.OPEN) return;
     this.subscribedDocuments.add(file);
     const payload = Buffer.from(JSON.stringify(this.encrypt("__control__", new TextEncoder().encode(JSON.stringify({ file }))))).toString("base64url");
-    this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "document.subscribe", payload } }));
+    const event = { id: crypto.randomUUID(), kind: "document.subscribe", payload };
+    this.subscriptionEvents.set(event.id, file);
+    this.socket.send(JSON.stringify({ type: "collab.publish", event }));
   }
   private async applyDocumentSnapshot(event: CollaborationWireEvent): Promise<void> {
     const encrypted = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as EncryptedUpdate;
     if (encrypted.file !== "__snapshot__") throw new Error("Invalid document snapshot");
     const snapshot = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { file?: unknown; fileId?: unknown; documentEpoch?: unknown; update?: unknown };
     if (typeof snapshot.file !== "string" || typeof snapshot.fileId !== "string" || typeof snapshot.documentEpoch !== "number" || typeof snapshot.update !== "string") throw new Error("Invalid document snapshot");
+    for (const [eventId, file] of this.subscriptionEvents) if (file === snapshot.file) this.subscriptionEvents.delete(eventId);
+    const subscriptionRetry = this.subscriptionRetryTimers.get(snapshot.file); if (subscriptionRetry) clearTimeout(subscriptionRetry); this.subscriptionRetryTimers.delete(snapshot.file);
     const old = this.docs.get(snapshot.file); old?.destroy();
     const doc = new Y.Doc();
     Y.applyUpdate(doc, Buffer.from(snapshot.update, "base64url"), "snapshot");
@@ -389,12 +420,13 @@ export class CollaborationBridge implements vscode.Disposable {
     if (pending === undefined) await this.renderDocument(snapshot.file, canonical, event.sequence);
   }
   private sendDocumentUpdate(file: string, update: Uint8Array): void {
-    if (!this.key || this.socket?.readyState !== WebSocket.OPEN) return;
+    if (!this.key) return;
     const identity = this.documentIdentity.get(file);
     if (!identity) { this.readyDocuments.delete(file); this.subscribedDocuments.delete(file); this.subscribeFile(file); return; }
-    const plaintext = new TextEncoder().encode(JSON.stringify({ file, ...identity, update: Buffer.from(update).toString("base64url") }));
-    const payload = Buffer.from(JSON.stringify(this.encrypt("__document__", plaintext))).toString("base64url");
-    this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "document.update", payload } }));
+    const pending = this.pendingDocumentUpdates.get(file);
+    if (pending) { pending.updates.push(update); return; }
+    const timer = setTimeout(() => this.flushDocumentUpdate(file), 40);
+    this.pendingDocumentUpdates.set(file, { updates: [update], timer });
   }
   private async renderDocument(file: string, contents: string, authoritySequence?: number): Promise<void> {
     const root = this.workspaceRoot(); if (!root) return;
@@ -428,6 +460,8 @@ export class CollaborationBridge implements vscode.Disposable {
     }
   }
   private resynchronizeOpenDocuments(): void {
+    this.clearPendingDocumentUpdates();
+    for (const timer of this.subscriptionRetryTimers.values()) clearTimeout(timer); this.subscriptionRetryTimers.clear(); this.subscriptionEvents.clear();
     for (const document of vscode.workspace.textDocuments) {
       const file = this.file(document);
       if (file) this.pendingLocalText.set(file, document.getText());
@@ -583,9 +617,10 @@ export class CollaborationBridge implements vscode.Disposable {
     }
   }
   private publishManifestOperation(operation: { type: "create"; path: string; content: string } | { type: "rename"; sourcePath: string; destinationPath: string } | { type: "delete"; path: string }): void {
-    if (!this.canEdit || !this.key || this.socket?.readyState !== WebSocket.OPEN) return;
+    if (!this.canEdit || !this.key) return;
+    this.flushPendingDocumentUpdates();
     const payload = Buffer.from(JSON.stringify(this.encrypt("__manifest__", new TextEncoder().encode(JSON.stringify(operation))))).toString("base64url");
-    this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "manifest.operation", payload } }));
+    this.durableEvents.enqueue({ id: crypto.randomUUID(), kind: "manifest.operation", payload });
   }
   private publishPresence(document: vscode.TextDocument, selections: readonly vscode.Selection[]): void {
     const file = this.file(document); if (!file) return;
@@ -596,6 +631,28 @@ export class CollaborationBridge implements vscode.Disposable {
     const update = Buffer.from(JSON.stringify(value));
     const payload = Buffer.from(JSON.stringify(this.encrypt("__presence__", update))).toString("base64url");
     this.socket.send(JSON.stringify({ type: "collab.publish", event: { id: crypto.randomUUID(), kind: "presence.update", payload } }));
+  }
+  private flushDocumentUpdate(file: string): void {
+    const pending = this.pendingDocumentUpdates.get(file); if (!pending || !this.key) return;
+    clearTimeout(pending.timer); this.pendingDocumentUpdates.delete(file);
+    const identity = this.documentIdentity.get(file);
+    if (!identity) { this.readyDocuments.delete(file); this.subscribedDocuments.delete(file); this.subscribeFile(file); return; }
+    const update = Y.mergeUpdates(pending.updates);
+    const plaintext = new TextEncoder().encode(JSON.stringify({ file, ...identity, update: Buffer.from(update).toString("base64url") }));
+    const payload = Buffer.from(JSON.stringify(this.encrypt("__document__", plaintext))).toString("base64url");
+    this.durableEvents.enqueue({ id: crypto.randomUUID(), kind: "document.update", payload });
+  }
+  private flushPendingDocumentUpdates(): void {
+    for (const file of [...this.pendingDocumentUpdates.keys()]) this.flushDocumentUpdate(file);
+  }
+  private clearPendingDocumentUpdates(): void {
+    for (const pending of this.pendingDocumentUpdates.values()) clearTimeout(pending.timer);
+    this.pendingDocumentUpdates.clear();
+  }
+  private sendCollaborationEvent(event: CollaborationWireEvent): boolean {
+    if (!this.welcomed || this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ type: "collab.publish", event }));
+    return true;
   }
   private async applyPresence(actorId: string, payload: string): Promise<void> {
     try {
