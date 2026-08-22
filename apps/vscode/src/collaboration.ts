@@ -5,8 +5,8 @@ import { promisify } from "node:util";
 import * as vscode from "vscode";
 import WebSocket from "ws";
 import * as Y from "yjs";
-import { isSensitiveWorkspacePath } from "@multicode/protocol";
-import type { AgentEvent, AgentInputAnswers, ApprovalDecision, QueuedPrompt, RoomServerMessage } from "@multicode/protocol";
+import { isSensitiveWorkspacePath, workspaceDiffSchema } from "@multicode/protocol";
+import type { AgentEvent, AgentInputAnswers, ApprovalDecision, QueuedPrompt, RoomServerMessage, WorkspaceDiff } from "@multicode/protocol";
 import { WorkspaceProjectionTracker } from "@multicode/workspace";
 import { AcknowledgedEventQueue, LatestValueThrottle, SerialTaskQueue, shouldSaveRenderedDocument, type WorkspaceDiskOwner } from "./collaboration-runtime.js";
 
@@ -78,7 +78,10 @@ export class CollaborationBridge implements vscode.Disposable {
   // a later edit is never applied to a stale Yjs document.
   private readonly localChangeQueue = new SerialTaskQueue();
 
-  constructor(private readonly onRoomMessage?: (message: RoomServerMessage) => void) {
+  constructor(
+    private readonly onRoomMessage?: (message: RoomServerMessage) => void,
+    private readonly onAgentPreview?: (turnId: string, revision: number, diff: WorkspaceDiff) => void,
+  ) {
     const diskWatcher = vscode.workspace.createFileSystemWatcher("**/*");
     this.disposables = [
       diskWatcher,
@@ -275,7 +278,7 @@ export class CollaborationBridge implements vscode.Disposable {
       this.selfId = message.selfId ?? "";
       for (const participant of message.participants ?? []) this.participantNames.set(participant.id, participant.name);
       if (Array.isArray((message as any).collabHistory)) for (const event of (message as any).collabHistory) {
-        await this.applyEvent(event);
+        await this.applyEvent(event, false);
         this.durableEvents.acknowledge(event.id);
       }
       this.welcomed = true;
@@ -341,7 +344,7 @@ export class CollaborationBridge implements vscode.Disposable {
     decipher.setAuthTag(Buffer.from(value.tag, "base64url"));
     return new Uint8Array(Buffer.concat([decipher.update(Buffer.from(value.ciphertext, "base64url")), decipher.final()]));
   }
-  private async applyEvent(event: CollaborationWireEvent): Promise<void> {
+  private async applyEvent(event: CollaborationWireEvent, notifyAgentPreview = true): Promise<void> {
     if (!this.key) return;
     if (event.kind === "workspace.commit.prepare") { this.prepareWorkspaceTransaction(event); return; }
     if (event.kind === "workspace.commit.finalize") { await this.finalizeWorkspaceTransaction(event); return; }
@@ -355,12 +358,30 @@ export class CollaborationBridge implements vscode.Disposable {
     if (event.kind === "agent.preview") {
       const encrypted = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as EncryptedUpdate;
       if (encrypted.file !== "__preview__") throw new Error("Invalid agent preview");
-      const preview = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { turnId: string; revision: number; diff: { text: string } };
+      const preview = JSON.parse(Buffer.from(this.decrypt(encrypted)).toString()) as { turnId?: unknown; revision?: unknown; diff?: unknown };
+      if (typeof preview.turnId !== "string" || typeof preview.revision !== "number" || !Number.isInteger(preview.revision)) throw new Error("Invalid agent preview metadata");
+      const parsedDiff = workspaceDiffSchema.parse(preview.diff);
+      const diff: WorkspaceDiff = {
+        revision: parsedDiff.revision,
+        text: parsedDiff.text,
+        truncated: parsedDiff.truncated,
+        createdAt: parsedDiff.createdAt,
+        ...(parsedDiff.additions !== undefined ? { additions: parsedDiff.additions } : {}),
+        ...(parsedDiff.deletions !== undefined ? { deletions: parsedDiff.deletions } : {}),
+        ...(parsedDiff.files !== undefined ? { files: parsedDiff.files.map((file) => ({
+          path: file.path,
+          additions: file.additions,
+          deletions: file.deletions,
+          ...(file.binary !== undefined ? { binary: file.binary } : {}),
+        })) } : {}),
+      };
       if (preview.turnId === this.latestPreviewTurn && preview.revision <= this.latestPreviewRevision) return;
       this.latestPreviewTurn = preview.turnId; this.latestPreviewRevision = preview.revision;
-      this.previewText = `# Preview — not merged\n# Turn ${preview.turnId} · revision ${preview.revision}\n\n${preview.diff.text || "No changed files."}`;
+      this.previewText = `# Preview — not merged\n# Turn ${preview.turnId} · revision ${preview.revision}\n\n${diff.text || "No changed files."}`;
       this.previewChanged.fire(this.previewUri); void vscode.commands.executeCommand("setContext", "multicode.hasPreview", true);
-      this.previewOutput.clear(); this.previewOutput.append(preview.diff.text); return;
+      this.previewOutput.clear(); this.previewOutput.append(diff.text);
+      if (notifyAgentPreview) this.onAgentPreview?.(preview.turnId, preview.revision, diff);
+      return;
     }
     if (event.kind === "agent.proposal") {
       const encrypted = JSON.parse(Buffer.from(event.payload, "base64url").toString()) as EncryptedUpdate;

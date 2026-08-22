@@ -2,7 +2,7 @@
   "name": "multicode-vscode",
   "displayName": "MultiCode",
   "description": "Host and join collaborative Codex or Claude sessions from VS Code.",
-  "version": "0.4.2",
+  "version": "0.4.5",
   "private": true,
   "publisher": "multicode",
   "license": "UNLICENSED",

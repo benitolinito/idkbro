@@ -1,16 +1,8 @@
-ss\\
-sdf
-
 # MultiCode
 
 > Extension prompt check: this README was updated successfully through the MultiCode extension.
-> brog Ilove you.
-> But
-> I
-> think
-> But
 
-> MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex or Claude session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
+MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex or Claude session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -49,7 +41,7 @@ build and install it from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.4.2.vsix
+code --install-extension apps/vscode/multicode-vscode-0.4.5.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
@@ -249,7 +241,7 @@ Run `multicode --help` for operator/development commands. End users only need
 The host and each participant use their original clean checkout. MultiCode never
 moves its branch or resets its index; room files appear as ordinary local working-tree
 changes. A per-repository lease prevents two rooms from owning one checkout at once.
-The selected agent uses one temporary detached worktree, which is removed when the host stops. Session credentials and journals are stored outside that worktree tree.
+The selected agent uses one temporary detached worktree, which is removed when the host stops. Session credentials and journals are stored outside that worktree.
 Hosting or joining from a legacy v2 MultiCode `shared` or `agent` worktree force-removes
 both legacy worktrees, then redirects to the original repository in the same VS Code window.
 

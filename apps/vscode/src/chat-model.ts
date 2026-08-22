@@ -15,6 +15,7 @@ export interface TimelineItem {
   turnId?: string;
   command?: string;
   durationMs?: number;
+  authorId?: string;
   approval?: {
     requestId: string | number;
     approvalKind: string;
@@ -30,7 +31,7 @@ export interface TimelineItem {
   };
 }
 
-type TimelineMetadata = Partial<Pick<TimelineItem, "timestamp" | "startedAt" | "finishedAt" | "turnId" | "command" | "durationMs" | "changes">>;
+type TimelineMetadata = Partial<Pick<TimelineItem, "timestamp" | "startedAt" | "finishedAt" | "turnId" | "command" | "durationMs" | "authorId" | "changes">>;
 
 export interface ParticipantView {
   name: string;
@@ -143,6 +144,10 @@ export class ChatModel {
 
   submitted(name: string, text: string): void {
     this.add("user", text, name);
+  }
+
+  previewWorkspaceDiff(turnId: string, revision: number, diff: WorkspaceDiff): void {
+    this.handleWorkspaceDiff({ ...diff, revision: `${turnId}:${revision}` }, turnId);
   }
 
   handle(message: RoomServerMessage): void {
@@ -272,23 +277,43 @@ export class ChatModel {
     this.add("error", message);
   }
 
-  private handleWorkspaceDiff(diff: WorkspaceDiff): void {
+  private handleWorkspaceDiff(diff: WorkspaceDiff, explicitTurnId?: string): void {
+    const turnId = explicitTurnId ?? [...this.turnStartedAt.keys()].find((candidate) => diff.revision === candidate || diff.revision.startsWith(`${candidate}:`));
     const files = diff.files?.map((file) => ({ ...file })) ?? [];
+    const id = `diff:${turnId ?? diff.revision}`;
+    const existed = Boolean(this.find(id));
     this.upsert(
-      `diff:${diff.revision}`,
+      id,
       "diff",
       diff.text || "No tracked workspace changes.",
       "Workspace changes",
       diff.truncated ? "truncated" : undefined,
       undefined,
-      files.length ? {
-        changes: {
+      {
+        timestamp: diff.createdAt,
+        ...(turnId ? { turnId } : {}),
+        ...(files.length ? { changes: {
           additions: diff.additions ?? files.reduce((total, file) => total + file.additions, 0),
           deletions: diff.deletions ?? files.reduce((total, file) => total + file.deletions, 0),
           files,
-        },
-      } : undefined,
+        } } : {}),
+      },
     );
+    if (!turnId || existed) return;
+    const diffIndex = this.timeline.findIndex((item) => item.id === id);
+    let lastActivityIndex = -1;
+    for (let index = this.timeline.length - 1; index >= 0; index -= 1) {
+      const item = this.timeline[index];
+      if (item && item.id !== id && item.turnId === turnId && (item.kind === "reasoning" || item.kind === "command")) {
+        lastActivityIndex = index;
+        break;
+      }
+    }
+    if (diffIndex < 0 || lastActivityIndex < 0 || diffIndex === lastActivityIndex + 1) return;
+    const [item] = this.timeline.splice(diffIndex, 1);
+    if (!item) return;
+    const insertionIndex = diffIndex < lastActivityIndex ? lastActivityIndex : lastActivityIndex + 1;
+    this.timeline.splice(insertionIndex, 0, item);
   }
 
   approvalSubmitting(requestId: string | number): void {
@@ -412,7 +437,7 @@ export class ChatModel {
 
   private addPrompt(prompt: QueuedPrompt): void {
     const id = `prompt:${prompt.promptId}`;
-    if (!this.find(id)) this.upsert(id, "user", prompt.text, prompt.participantName, undefined, undefined, { timestamp: prompt.submittedAt });
+    if (!this.find(id)) this.upsert(id, "user", prompt.text, prompt.participantName, undefined, undefined, { timestamp: prompt.submittedAt, authorId: prompt.participantId });
   }
 
   private updateReasoning(turnId: string, itemId: string, text: string, completed: boolean): void {

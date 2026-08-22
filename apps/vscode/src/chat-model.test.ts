@@ -49,7 +49,7 @@ describe("ChatModel", () => {
     expect(state.queue).toEqual([]);
     expect(state.activePrompt).toEqual({ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop", owned: false });
     expect(state.timeline.filter((item) => item.kind === "user")).toEqual([
-      expect.objectContaining({ timestamp: prompt.submittedAt }),
+      expect.objectContaining({ timestamp: prompt.submittedAt, authorId: "host" }),
     ]);
   });
 
@@ -165,6 +165,43 @@ describe("ChatModel", () => {
         },
       }),
     ]));
+  });
+
+  it("keeps live and final agent diffs inside their turn activity", () => {
+    const model = new ChatModel();
+    model.handle(welcome());
+    model.handle({ type: "agent.event", event: { type: "turn.started", threadId: "t", turnId: "turn" } });
+    model.handle({ type: "agent.event", event: { type: "command.started", threadId: "t", turnId: "turn", itemId: "c", command: "npm test" } });
+    model.handle({ type: "agent.event", event: { type: "command.exited", threadId: "t", turnId: "turn", itemId: "c", exitCode: 0, output: "passed" } });
+    model.previewWorkspaceDiff("turn", 1, {
+      revision: "ignored",
+      text: "preview diff",
+      truncated: false,
+      createdAt: new Date(1).toISOString(),
+      files: [{ path: "src/view.ts", additions: 1, deletions: 0 }],
+    });
+    model.handle({ type: "agent.event", event: { type: "agent.message.completed", threadId: "t", turnId: "turn", itemId: "m", text: "Done" } });
+    model.handle({
+      type: "workspace.diff",
+      diff: {
+        revision: "turn",
+        text: "final diff",
+        truncated: false,
+        createdAt: new Date(2).toISOString(),
+        files: [{ path: "src/view.ts", additions: 2, deletions: 1 }],
+      },
+    });
+
+    const timeline = model.snapshot().timeline;
+    const commandIndex = timeline.findIndex((item) => item.id === "command:c");
+    const diffIndex = timeline.findIndex((item) => item.id === "diff:turn");
+    const messageIndex = timeline.findIndex((item) => item.id === "message:m");
+    expect(commandIndex).toBeGreaterThanOrEqual(0);
+    expect(diffIndex).toBe(commandIndex + 1);
+    expect(messageIndex).toBe(diffIndex + 1);
+    expect(timeline.filter((item) => item.id === "diff:turn")).toEqual([
+      expect.objectContaining({ kind: "diff", turnId: "turn", text: "final diff", changes: expect.objectContaining({ additions: 2, deletions: 1 }) }),
+    ]);
   });
 
   it("exposes pending approvals to the host and records their resolution", () => {
