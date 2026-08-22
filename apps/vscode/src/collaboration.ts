@@ -65,6 +65,10 @@ export class CollaborationBridge implements vscode.Disposable {
   private readonly ignoredPaths = new Map<string, boolean>();
   private workspaceRootUri: vscode.Uri | undefined;
   private readonly receiveQueue = new SerialTaskQueue();
+  // VS Code emits one change event per keystroke, while localChange performs
+  // asynchronous ignore checks and network work. Keep those events ordered so
+  // a later edit is never applied to a stale Yjs document.
+  private readonly localChangeQueue = new SerialTaskQueue();
 
   constructor(private readonly onRoomMessage?: (message: RoomServerMessage) => void) {
     const diskWatcher = vscode.workspace.createFileSystemWatcher("**/*");
@@ -77,7 +81,7 @@ export class CollaborationBridge implements vscode.Disposable {
       diskWatcher.onDidChange((uri) => this.scheduleExternalChange(uri)),
       diskWatcher.onDidCreate((uri) => this.scheduleExternalStructure("create", uri)),
       diskWatcher.onDidDelete((uri) => this.scheduleExternalStructure("delete", uri)),
-      vscode.workspace.onDidChangeTextDocument((event) => void this.localChange(event)),
+      vscode.workspace.onDidChangeTextDocument((event) => void this.localChangeQueue.enqueue(() => this.localChange(event))),
       vscode.workspace.onDidOpenTextDocument((document) => this.subscribe(document)),
       vscode.workspace.onDidCloseTextDocument((document) => {
         const file = this.file(document);
