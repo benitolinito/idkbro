@@ -37,7 +37,9 @@
     "onCommand:multicode.openChat",
     "onCommand:multicode.sendPrompt",
     "onCommand:multicode.doctor",
+    "onCommand:multicode.selectClaudeAuthentication",
     "onCommand:multicode.configureClaudeApiKey",
+    "onCommand:multicode.forgetClaudeApiKey",
     "onCommand:multicode.stop",
     "onCommand:multicode.openPreview",
     "onCommand:multicode.openProposal",
@@ -88,8 +90,16 @@
         "title": "MultiCode: Check Setup"
       },
       {
+        "command": "multicode.selectClaudeAuthentication",
+        "title": "MultiCode: Select Claude Authentication"
+      },
+      {
         "command": "multicode.configureClaudeApiKey",
         "title": "MultiCode: Configure Claude API Key"
+      },
+      {
+        "command": "multicode.forgetClaudeApiKey",
+        "title": "MultiCode: Forget Claude API Key"
       },
       {
         "command": "multicode.stop",
@@ -153,6 +163,16 @@
           "type": "boolean",
           "default": false,
           "description": "Show experimental Claude support when hosting rooms. Setting defaultAgent to claude also enables it."
+        },
+        "multicode.claudeAuthentication": {
+          "type": "string",
+          "enum": ["subscription", "apiKey"],
+          "enumDescriptions": [
+            "Use the account signed in through the local Claude CLI.",
+            "Use an Anthropic API key stored in VS Code SecretStorage."
+          ],
+          "default": "subscription",
+          "description": "Authentication used by the local Claude host process. Subscription mode never exports or copies Claude's saved credentials."
         },
         "multicode.claudeExecutable": {
           "type": "string",

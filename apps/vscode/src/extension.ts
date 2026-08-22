@@ -13,6 +13,7 @@ import type { AgentInputAnswers, AgentProvider, ApprovalDecision } from "@multic
 import { inspectManagedRoomWorktree } from "@multicode/workspace";
 
 type SessionMode = "host" | "join";
+type ClaudeAuthentication = "subscription" | "apiKey";
 
 interface CliCommand {
   executable: string;
@@ -21,6 +22,7 @@ interface CliCommand {
 
 const workspaceHandoffsKey = "multicode.workspace-handoffs.v1";
 const claudeApiKeySecret = "multicode.claude-api-key";
+const claudeAuthenticationMigrationKey = "multicode.claude-authentication-migrated.v1";
 
 class MultiCodeController implements vscode.Disposable {
   private readonly output = vscode.window.createOutputChannel("MultiCode");
@@ -33,6 +35,7 @@ class MultiCodeController implements vscode.Disposable {
   private stopping = false;
   private agentProvider: AgentProvider = "codex";
   private claudeApiKey: string | undefined;
+  private claudeAuthentication: ClaudeAuthentication | undefined;
   private reviewerGrantPending = false;
   private recentOutput = "";
   readonly chat: MultiCodeChatView;
@@ -83,6 +86,7 @@ class MultiCodeController implements vscode.Disposable {
 
   async host(): Promise<void> {
     if (!this.ensureIdle()) return;
+    await this.migrateClaudeAuthentication();
     const workspaceDirectory = this.workspaceDirectory();
     if (!workspaceDirectory) return;
     const cwd = await this.ensureDirectWorkspace(workspaceDirectory);
@@ -99,17 +103,24 @@ class MultiCodeController implements vscode.Disposable {
     const selection = await vscode.window.showQuickPick(providers, { placeHolder: "Choose the coding agent for this room", ignoreFocusOut: true });
     if (!selection) return;
     this.agentProvider = selection.provider;
+    if (selection.provider !== "claude") this.claudeAuthentication = undefined;
+    const providerExecutable = config.get<string>(selection.provider === "claude" ? "claudeExecutable" : "codexExecutable")?.trim();
     if (selection.provider === "claude") {
-      this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
-      if (!this.claudeApiKey) {
-        if (!await this.configureClaudeApiKey()) return;
+      this.claudeAuthentication = config.get<ClaudeAuthentication>("claudeAuthentication", "subscription");
+      if (this.claudeAuthentication === "apiKey") {
         this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+        if (!this.claudeApiKey) {
+          if (!await this.configureClaudeApiKey()) return;
+          this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+        }
+      } else if (!await this.prepareClaudeSubscription(providerExecutable || "claude")) {
+        return;
       }
     }
     const name = config.get<string>("displayName")?.trim() || this.defaultName();
     const relay = config.get<string>("relayUrl")?.trim();
     const args = ["host", "--agent", selection.provider, "--name", name];
-    const providerExecutable = config.get<string>(selection.provider === "claude" ? "claudeExecutable" : "codexExecutable")?.trim();
+    if (selection.provider === "claude") args.push("--claude-auth", this.claudeAuthentication === "apiKey" ? "api-key" : "subscription");
     if (providerExecutable) args.push("--agent-executable", providerExecutable);
     if (relay) args.push("--relay", relay);
     this.startSession("host", args, cwd);
@@ -249,8 +260,46 @@ class MultiCodeController implements vscode.Disposable {
     });
     if (!value?.trim()) return false;
     await this.context.secrets.store(claudeApiKeySecret, value.trim());
+    await vscode.workspace.getConfiguration("multicode").update("claudeAuthentication", "apiKey", vscode.ConfigurationTarget.Global);
+    this.claudeAuthentication = "apiKey";
     void vscode.window.showInformationMessage("Claude API key stored securely for local MultiCode hosting.");
     return true;
+  }
+
+  async selectClaudeAuthentication(): Promise<void> {
+    const current = vscode.workspace.getConfiguration("multicode").get<ClaudeAuthentication>("claudeAuthentication", "subscription");
+    const options = [
+      { label: "Claude subscription", description: "Use the account signed in through the local Claude CLI", value: "subscription" as const },
+      { label: "Anthropic API key", description: "Use an API key stored in VS Code SecretStorage", value: "apiKey" as const },
+    ];
+    options.sort((left, right) => Number(right.value === current) - Number(left.value === current));
+    const selected = await vscode.window.showQuickPick(options, { placeHolder: "Choose how MultiCode authenticates Claude", ignoreFocusOut: true });
+    if (!selected) return;
+    if (selected.value === "apiKey" && !await this.context.secrets.get(claudeApiKeySecret)) {
+      await this.configureClaudeApiKey();
+      return;
+    }
+    await vscode.workspace.getConfiguration("multicode").update("claudeAuthentication", selected.value, vscode.ConfigurationTarget.Global);
+    this.claudeAuthentication = selected.value;
+    void vscode.window.showInformationMessage(selected.value === "subscription" ? "MultiCode will use your local Claude subscription login." : "MultiCode will use your stored Anthropic API key.");
+  }
+
+  async forgetClaudeApiKey(): Promise<void> {
+    await this.context.secrets.delete(claudeApiKeySecret);
+    this.claudeApiKey = undefined;
+    void vscode.window.showInformationMessage("MultiCode's stored Anthropic API key was removed.");
+  }
+
+  async migrateClaudeAuthentication(): Promise<void> {
+    if (this.context.globalState.get<boolean>(claudeAuthenticationMigrationKey)) return;
+    const config = vscode.workspace.getConfiguration("multicode");
+    const inspected = config.inspect<ClaudeAuthentication>("claudeAuthentication");
+    const explicitlyConfigured = inspected?.workspaceFolderValue ?? inspected?.workspaceValue ?? inspected?.globalValue;
+    if (!explicitlyConfigured && await this.context.secrets.get(claudeApiKeySecret)) {
+      await config.update("claudeAuthentication", "apiKey", vscode.ConfigurationTarget.Global);
+      void vscode.window.showInformationMessage("MultiCode preserved your existing Claude API-key authentication. You can switch to your local Claude subscription with “MultiCode: Select Claude Authentication”.");
+    }
+    await this.context.globalState.update(claudeAuthenticationMigrationKey, true);
   }
 
   async copyInvite(): Promise<void> {
@@ -296,11 +345,14 @@ class MultiCodeController implements vscode.Disposable {
     this.output.show(true);
     const provider = vscode.workspace.getConfiguration("multicode").get<AgentProvider>("defaultAgent", "codex");
     this.agentProvider = provider;
-    if (provider === "claude") this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+    if (provider === "claude") {
+      this.claudeAuthentication = vscode.workspace.getConfiguration("multicode").get<ClaudeAuthentication>("claudeAuthentication", "subscription");
+      if (this.claudeAuthentication === "apiKey") this.claudeApiKey = await this.context.secrets.get(claudeApiKeySecret);
+    }
     this.output.appendLine(`$ multicode doctor --agent ${provider}\n`);
     const command = this.cliCommand();
     const configuredExecutable = vscode.workspace.getConfiguration("multicode").get<string>(provider === "claude" ? "claudeExecutable" : "codexExecutable")?.trim();
-    const child = spawn(command.executable, [...command.prefixArgs, "doctor", "--agent", provider, ...(configuredExecutable ? ["--agent-executable", configuredExecutable] : [])], { cwd, env: this.sessionEnvironment(true) });
+    const child = spawn(command.executable, [...command.prefixArgs, "doctor", "--agent", provider, ...(provider === "claude" ? ["--claude-auth", this.claudeAuthentication === "apiKey" ? "api-key" : "subscription"] : []), ...(configuredExecutable ? ["--agent-executable", configuredExecutable] : [])], { cwd, env: this.sessionEnvironment(true) });
     this.claudeApiKey = undefined;
     child.stdout.on("data", (data: Buffer) => this.output.append(data.toString()));
     child.stderr.on("data", (data: Buffer) => this.output.append(data.toString()));
@@ -357,7 +409,7 @@ class MultiCodeController implements vscode.Disposable {
     this.chat.start(mode, mode === "join" ? this.roomCode?.slice(0, 11) : undefined);
     this.openChat();
     this.status.text = `$(sync~spin) MultiCode: ${mode === "host" ? "hosting" : "joining"}`;
-    this.status.tooltip = "Open MultiCode output";
+    this.status.tooltip = this.agentProvider === "claude" ? `Open MultiCode output\nClaude authentication: ${this.claudeAuthentication === "apiKey" ? "Anthropic API key" : "local subscription"}` : "Open MultiCode output";
     this.status.command = "multicode.sendPrompt";
     void vscode.commands.executeCommand("setContext", "multicode.connected", true);
 
@@ -567,6 +619,71 @@ class MultiCodeController implements vscode.Disposable {
     return env;
   }
 
+  private async prepareClaudeSubscription(executable: string): Promise<boolean> {
+    let status: { loggedIn?: boolean; authMethod?: string } | undefined;
+    try {
+      status = await this.readClaudeAuthStatus(executable);
+    } catch (error) {
+      const selection = await vscode.window.showWarningMessage(
+        `MultiCode could not verify the local Claude login: ${error instanceof Error ? error.message : String(error)}`,
+        { modal: true, detail: "You can continue and let the Agent SDK validate the login, or open a terminal to sign in first." },
+        "Continue",
+        "Open Sign-In Terminal",
+      );
+      if (selection === "Open Sign-In Terminal") this.openClaudeSignInTerminal(executable);
+      if (selection !== "Continue") return false;
+    }
+
+    if (status && status.loggedIn !== true) {
+      const selection = await vscode.window.showErrorMessage("Claude is not signed in on this machine. Sign in before hosting with your subscription.", "Open Sign-In Terminal");
+      if (selection === "Open Sign-In Terminal") this.openClaudeSignInTerminal(executable);
+      return false;
+    }
+    if (status?.authMethod === "api_key") {
+      const selection = await vscode.window.showErrorMessage("Claude resolved an API key instead of a subscription login. Sign in with your Claude account, or select API-key authentication explicitly.", "Open Sign-In Terminal", "Select Authentication");
+      if (selection === "Open Sign-In Terminal") this.openClaudeSignInTerminal(executable);
+      if (selection === "Select Authentication") await this.selectClaudeAuthentication();
+      return false;
+    }
+
+    const accepted = await vscode.window.showWarningMessage(
+      "This room will use your locally signed-in Claude account. Prompts submitted by allowed collaborators will count against that account's limits.",
+      { modal: true, detail: "Room prompts and shared workspace content are sent to Anthropic under the host account's data settings. Claude tool actions still require the configured approvals." },
+      "Host Room",
+    );
+    return accepted === "Host Room";
+  }
+
+  private readClaudeAuthStatus(executable: string): Promise<{ loggedIn?: boolean; authMethod?: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(executable, ["auth", "status", "--json"], { env: this.sessionEnvironment() });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const finish = (callback: () => void): void => { if (settled) return; settled = true; clearTimeout(timer); callback(); };
+      const timer = setTimeout(() => { child.kill("SIGTERM"); finish(() => reject(new Error("authentication check timed out"))); }, 5_000);
+      child.stdout.on("data", (data: Buffer) => { if (stdout.length < 64 * 1024) stdout += data.toString(); });
+      child.stderr.on("data", (data: Buffer) => { if (stderr.length < 4 * 1024) stderr += data.toString(); });
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("close", (code) => finish(() => {
+        try {
+          const parsed = JSON.parse(stdout) as Record<string, unknown>;
+          resolve({
+            ...(typeof parsed.loggedIn === "boolean" ? { loggedIn: parsed.loggedIn } : {}),
+            ...(typeof parsed.authMethod === "string" ? { authMethod: parsed.authMethod } : {}),
+          });
+        } catch {
+          reject(new Error(code !== 0 ? (stderr || `Claude exited with code ${code ?? "unknown"}`).trim() : "Claude returned an unreadable authentication status"));
+        }
+      }));
+    });
+  }
+
+  private openClaudeSignInTerminal(executable: string): void {
+    const terminal = vscode.window.createTerminal({ name: "Claude Sign In", shellPath: executable, shellArgs: ["auth", "login"], env: this.sessionEnvironment() });
+    terminal.show();
+  }
+
   private workspaceDirectory(required = true): string {
     const directory = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (directory) return directory;
@@ -661,6 +778,9 @@ class MultiCodeController implements vscode.Disposable {
 
 export function activate(context: vscode.ExtensionContext): void {
   const controller = new MultiCodeController(context);
+  void controller.migrateClaudeAuthentication().catch((error: unknown) => {
+    void vscode.window.showWarningMessage(`MultiCode could not migrate Claude authentication settings: ${error instanceof Error ? error.message : String(error)}`);
+  });
   void controller.restoreWorkspaceSession().catch((error: unknown) => {
     void vscode.window.showWarningMessage(`MultiCode could not restore this room connection: ${error instanceof Error ? error.message : String(error)}`);
   });
@@ -672,7 +792,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("multicode.openChat", () => controller.openChat()),
     vscode.commands.registerCommand("multicode.sendPrompt", () => controller.sendPrompt()),
     vscode.commands.registerCommand("multicode.doctor", () => controller.doctor()),
+    vscode.commands.registerCommand("multicode.selectClaudeAuthentication", () => controller.selectClaudeAuthentication()),
     vscode.commands.registerCommand("multicode.configureClaudeApiKey", () => controller.configureClaudeApiKey()),
+    vscode.commands.registerCommand("multicode.forgetClaudeApiKey", () => controller.forgetClaudeApiKey()),
     vscode.commands.registerCommand("multicode.stop", () => controller.stop()),
     vscode.commands.registerCommand("multicode.openProposal", () => controller.openProposal()),
     vscode.commands.registerCommand("multicode.openPreview", () => controller.openPreview()),

@@ -104,6 +104,26 @@ describe("ClaudeAgentAdapter", () => {
     await adapter.stop();
   });
 
+  it("does not restore credentials omitted from an explicitly supplied environment", async () => {
+    const query = new FakeQuery();
+    let sdkEnvironment: NodeJS.ProcessEnv | undefined;
+    const previous = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "sk-ant-ambient-secret";
+    try {
+      const adapter = new ClaudeAgentAdapter({
+        queryFactory: (({ options }) => { sdkEnvironment = options.env as NodeJS.ProcessEnv; return query as unknown as Query; }),
+        environment: { PATH: process.env.PATH },
+      });
+      const cwd = await mkdtemp(path.join(tmpdir(), "multicode-claude-environment-"));
+      await adapter.start({ cwd });
+      expect(sdkEnvironment?.ANTHROPIC_API_KEY).toBeUndefined();
+      await adapter.stop();
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previous;
+    }
+  });
+
   it("closes the SDK transport and redacts initialization failures", async () => {
     const query = new FakeQuery();
     query.supportedModels = async () => { throw new Error("Unable to authenticate sk-ant-startup-secret"); };
@@ -155,6 +175,17 @@ describe("ClaudeAgentAdapter", () => {
     await expect(events.next()).resolves.toMatchObject({ value: { type: "turn.completed", status: "interrupted" } });
     expect(query.interrupts).toBe(1);
     await adapter.stop();
+  });
+
+  it("redacts bearer and Claude OAuth credentials from failures", async () => {
+    const query = new FakeQuery();
+    query.supportedModels = async () => { throw new Error("Tokens auth-token-secret and oauth-token-secret must stay private"); };
+    const adapter = new ClaudeAgentAdapter({
+      queryFactory: (() => query as unknown as Query),
+      environment: { ANTHROPIC_AUTH_TOKEN: "auth-token-secret", CLAUDE_CODE_OAUTH_TOKEN: "oauth-token-secret" },
+    });
+    const cwd = await mkdtemp(path.join(tmpdir(), "multicode-claude-token-redaction-"));
+    await expect(adapter.start({ cwd })).rejects.toThrow("Tokens [REDACTED] and [REDACTED] must stay private");
   });
 
   it("maps structured question answers back to AskUserQuestion", async () => {

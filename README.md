@@ -35,7 +35,7 @@ Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 22.5 or newer (the session journal uses the built-in SQLite API in WAL mode)
-- Hosting: Git, either an authenticated Codex CLI or a Claude CLI plus an Anthropic API key, and a repository with at least one commit
+- Hosting: Git, either an authenticated Codex CLI or a Claude CLI signed in with a Claude subscription or configured with an Anthropic API key, and a repository with at least one commit
 - VS Code: version 1.96 or newer
 - Joining: a clone containing the host's base commit; Codex is not required
 
@@ -59,12 +59,14 @@ Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>
 - **MultiCode: Open Chat** — open the shared agent conversation sidebar.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
 - **MultiCode: Check Setup** — check Node.js, Git, the configured agent, authentication, and the current repository.
+- **MultiCode: Select Claude Authentication** — choose the host's local Claude subscription or explicit API-key billing.
 - **MultiCode: Configure Claude API Key** — store a BYOK Anthropic key in VS Code SecretStorage.
+- **MultiCode: Forget Claude API Key** — remove the BYOK key from VS Code SecretStorage.
 - **MultiCode: Stop or Leave Room** — end the current host or participant session.
 
 Room activity appears in the MultiCode sidebar as a shared conversation with participants, queue state, streaming reasoning and responses, commands, generic tools, structured questions, and workspace diffs. The **MultiCode** output channel keeps the raw process logs, and the status bar shows the current connection. The packaged VSIX includes the MultiCode CLI; hosts still need Git and the selected agent CLI installed locally.
 
-Claude is currently an external-binary MVP. Install the Claude CLI, enable `multicode.experimentalClaude`, optionally set `multicode.claudeExecutable`, and run **MultiCode: Configure Claude API Key**. The key is passed only to the local host subprocess and is not stored in settings, handoff state, or relay messages. Claude steering is intentionally hidden until active-turn semantics are verified; queue or interrupt instead.
+Claude is currently an external-binary MVP. Install the Claude CLI, enable `multicode.experimentalClaude`, optionally set `multicode.claudeExecutable`, and run `claude auth login`. MultiCode uses that local login by default without reading, copying, or relaying its credentials. Hosts can instead select API-key authentication; the key is passed only to the local host subprocess and is not stored in settings, handoff state, or relay messages. Existing stored-key users remain on API-key authentication until they switch explicitly. Claude steering is intentionally hidden until active-turn semantics are verified; queue or interrupt instead.
 
 Settings are available for the default agent, agent executable paths, participant display name, relay URL, and an optional custom MultiCode executable. See [`apps/vscode`](apps/vscode) for extension development details.
 
@@ -88,7 +90,7 @@ Check the hosting environment from the repository you want the agent to modify:
 
 ```bash
 multicode doctor
-multicode doctor --agent claude
+multicode doctor --agent claude --claude-auth subscription
 ```
 
 ## Everyday workflow
@@ -99,8 +101,10 @@ From the Git repository you want to work on:
 
 ```bash
 multicode host
-multicode host --agent claude
+multicode host --agent claude --claude-auth subscription
 ```
+
+For explicit pay-as-you-go API billing, set `ANTHROPIC_API_KEY` and use `--claude-auth api-key`. Direct CLI invocations retain `--claude-auth auto` as the compatibility default, so use an explicit mode when the billing source matters.
 
 MultiCode leases the clean checkout, creates one temporary agent worktree, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
 
@@ -304,7 +308,8 @@ the same version only produce temporary Actions artifacts.
 
 ## Current limitations
 
-- Claude currently requires an external Claude CLI and BYOK API key. Platform-specific Claude binaries are not bundled in the VSIX yet.
+- Claude requires an external Claude CLI. Subscription login and explicit BYOK API-key authentication are supported; platform-specific Claude binaries are not bundled in the VSIX yet.
+- Anthropic's treatment of third-party Agent SDK subscription usage may change. API-key authentication remains the predictable pay-as-you-go fallback.
 - Claude active-turn steering remains disabled until its semantics are verified; queued prompts and interruption are supported.
 - Only one regular agent turn or pending proposal is allowed at a time.
 - The host device must remain online. A transient host relay connection can resume, but rooms do not survive the host device being offline.

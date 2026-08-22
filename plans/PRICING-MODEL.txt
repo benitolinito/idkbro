@@ -1,0 +1,68 @@
+MULTICODE PRICING MODEL
+
+Positioning
+-----------
+
+Multiplayer coding is free. Upgrade when your team needs history and control.
+
+MultiCode does not resell AI usage. Hosts connect their existing Codex or
+Claude subscription, and guests join without paying.
+
+
+FREE
+----
+
+Price: $0 forever
+
+For developers trying MultiCode, occasional pairing, and ephemeral team
+sessions.
+
+Includes:
+
+- One active room per host
+- Unlimited guests
+- Local VS Code workspace synchronization
+- One shared agent session and FIFO prompt queue
+- End-to-end encrypted relay
+- Isolated agent worktree
+- Transactional application of agent changes
+- Bring your own Codex or Claude subscription
+- Local-only session history
+- Community support
+
+
+PRO
+---
+
+Price: $10 per month per host
+Annual price: $100 per year per host
+
+For developers and teams that need persistent, governed collaboration without
+moving development out of VS Code or paying for every collaborator.
+
+Includes everything in Free, plus:
+
+- Unlimited active rooms
+- Persistent encrypted session history
+- Session resume
+- Context attachments
+- Checkpoints and turn-level undo
+- Granular diff review
+- Participant roles and controls
+- Approval policies
+- Audit log
+- Configurable retention
+- Priority relay service
+- Priority support
+
+
+BILLING PRINCIPLES
+------------------
+
+- Guests never pay.
+- Only users who host Pro rooms require a subscription.
+- AI model usage is not included in the subscription price.
+- Users bring their existing Codex or Claude subscription.
+- No per-guest, per-prompt, or relay-usage pricing at launch.
+- Paid value comes from persistence, recovery, governance, and reliability—not
+  access to the core multiplayer experience.

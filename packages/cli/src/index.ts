@@ -53,6 +53,7 @@ import {
 } from "@multicode/workspace";
 import WebSocket from "ws";
 import { discoverLiveSessionForWorkspace } from "./live-session.js";
+import { claudeAuthMode, claudeEnvironment, preflightClaudeAuthentication, readClaudeAuthStatus, type ClaudeAuthMode } from "./claude-auth.js";
 import { renderTerminalMarkdown } from "./markdown.js";
 import { parseWorkspaceNumstat } from "./workspace-diff.js";
 
@@ -71,10 +72,28 @@ function agentExecutable(provider: AgentProvider, configured?: string): string {
   return configured?.trim() || (provider === "claude" ? process.env.MULTICODE_CLAUDE_EXECUTABLE?.trim() : process.env.MULTICODE_CODEX_EXECUTABLE?.trim()) || provider;
 }
 
-function adapterFor(providerValue: string, executablePath?: string) {
+function adapterFor(providerValue: string, executablePath?: string, authModeValue?: string) {
   const provider = agentProvider(providerValue);
   const executable = agentExecutable(provider, executablePath);
-  return createAgentAdapter({ provider, executablePath: executable, environment: process.env });
+  const environment = provider === "claude" ? claudeEnvironment(claudeAuthMode(authModeValue), process.env) : { ...process.env };
+  return createAgentAdapter({ provider, executablePath: executable, environment });
+}
+
+function claudeAuthDetail(source: string, subscriptionType?: string): string {
+  if (source === "subscription") return subscriptionType ? `Claude subscription (${subscriptionType})` : "Claude subscription";
+  if (source === "api-key") return "Anthropic API key";
+  if (source === "oauth") return "OAuth credential (billing source unverified)";
+  if (source === "signed-out") return "not signed in";
+  return "credential source could not be verified";
+}
+
+async function preflightAgentAuthentication(provider: AgentProvider, executablePath: string | undefined, authModeValue: string | undefined): Promise<ClaudeAuthMode | undefined> {
+  if (provider !== "claude") return undefined;
+  const mode = claudeAuthMode(authModeValue);
+  const executable = agentExecutable(provider, executablePath);
+  const status = await preflightClaudeAuthentication(executable, mode, process.env);
+  if (status) console.log(out.success(`${out.label("Claude authentication")} ${out.muted(claudeAuthDetail(status.source, status.subscriptionType))}`));
+  return mode;
 }
 
 function localInviteCode(): string { const bytes = randomBytes(10); const value = [...bytes].map((byte) => inviteAlphabet[byte % inviteAlphabet.length]).join(""); return `${value.slice(0, 5)}-${value.slice(5)}`; }
@@ -156,7 +175,7 @@ async function versionOf(command: string, args: string[]): Promise<string | null
   }
 }
 
-async function doctor(options: { agent?: string; agentExecutable?: string } = {}): Promise<void> {
+async function doctor(options: { agent?: string; agentExecutable?: string; claudeAuth?: string } = {}): Promise<void> {
   const provider = agentProvider(options.agent ?? "codex");
   const executable = agentExecutable(provider, options.agentExecutable);
   const [gitVersion, agentVersion] = await Promise.all([
@@ -165,11 +184,32 @@ async function doctor(options: { agent?: string; agentExecutable?: string } = {}
   ]);
 
   const [nodeMajor = 0, nodeMinor = 0] = process.versions.node.split(".").map(Number);
+  let claudeCheck: { name: string; ok: boolean; detail: string } | undefined;
+  if (provider === "claude") {
+    try {
+      const mode = claudeAuthMode(options.claudeAuth);
+      const environment = claudeEnvironment(mode, process.env);
+      if (mode === "api-key") {
+        claudeCheck = { name: "Claude authentication", ok: true, detail: "Anthropic API key configured" };
+      } else {
+        const status = await readClaudeAuthStatus(executable, environment);
+        const wrongSource = mode === "subscription" && status.source === "api-key";
+        claudeCheck = {
+          name: "Claude authentication",
+          ok: status.loggedIn && !wrongSource,
+          detail: wrongSource ? "API key detected; subscription mode requires `claude auth login`" : claudeAuthDetail(status.source, status.subscriptionType),
+        };
+      }
+    } catch (error) {
+      claudeCheck = { name: "Claude authentication", ok: false, detail: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   const checks = [
     { name: "Node.js", ok: nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 5), detail: process.version },
     { name: "Git", ok: Boolean(gitVersion), detail: gitVersion ?? "not found" },
     { name: `${provider === "claude" ? "Claude" : "Codex"} CLI`, ok: Boolean(agentVersion), detail: agentVersion ?? `not found (${executable})` },
-    ...(provider === "claude" ? [{ name: "Anthropic API key", ok: Boolean(process.env.ANTHROPIC_API_KEY), detail: process.env.ANTHROPIC_API_KEY ? "configured in environment" : "ANTHROPIC_API_KEY is not set" }] : []),
+    ...(claudeCheck ? [claudeCheck] : []),
   ];
 
   for (const check of checks) {
@@ -971,13 +1011,14 @@ async function prepareHostedWorkspace(roomId: string): Promise<DirectHostedWorks
   return room;
 }
 
-async function createRoom(options: { agent: string; agentExecutable?: string; prompt?: string; model?: string; effort?: string; dryRun?: boolean; includeSensitive?: boolean }): Promise<void> {
+async function createRoom(options: { agent: string; agentExecutable?: string; claudeAuth?: string; prompt?: string; model?: string; effort?: string; dryRun?: boolean; includeSensitive?: boolean }): Promise<void> {
   const provider = agentProvider(options.agent);
+  if (!options.dryRun) await preflightAgentAuthentication(provider, options.agentExecutable, options.claudeAuth);
   const room = await prepareRoom(options.dryRun, options.includeSensitive);
   if (options.dryRun || !room.workspacePath) return;
   const hosted = await prepareHostedWorkspace(room.roomId);
 
-  const adapter = adapterFor(provider, options.agentExecutable);
+  const adapter = adapterFor(provider, options.agentExecutable, options.claudeAuth);
   try {
     const stop = installStopHandlers(async () => {
       console.error(`\n${err.info("■", "Stopping local room…")}`);
@@ -1065,6 +1106,7 @@ function installStopHandlers(stop: () => Promise<void>): () => void {
 interface HostRoomOptions {
   agent: string;
   agentExecutable?: string;
+  claudeAuth?: string;
   prompt?: string;
   model?: string;
   effort?: string;
@@ -1079,12 +1121,13 @@ interface HostRoomOptions {
 
 async function hostRoom(options: HostRoomOptions): Promise<void> {
   if (options.local && options.relay) throw new Error("Use either --local or --relay, not both");
+  const provider = agentProvider(options.agent);
+  await preflightAgentAuthentication(provider, options.agentExecutable, options.claudeAuth);
   const configuredRelay = options.relay ?? defaultRelayUrl;
   if (!options.local) {
     await hostRemoteRoom({ ...options, relay: configuredRelay });
     return;
   }
-  const provider = agentProvider(options.agent);
   const prepared = await prepareRoom(false, options.includeSensitive);
   if (!prepared.workspacePath || !prepared.baseCommit) return;
   const hosted = await prepareHostedWorkspace(prepared.roomId);
@@ -1114,7 +1157,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   let turnSequence = 0;
   let activeTurnBase: AgentTurnSnapshot | undefined;
   let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
-  const adapter = adapterFor(provider, options.agentExecutable);
+  const adapter = adapterFor(provider, options.agentExecutable, options.claudeAuth);
   const roomParticipants = new Map<string, RoomParticipant>();
   let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
   const token = participantCode;
@@ -1400,7 +1443,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   const provider = agentProvider(options.agent);
   const relayUrl = options.relay ?? defaultRelayUrl;
 
-  const adapter = adapterFor(provider, options.agentExecutable);
+  const adapter = adapterFor(provider, options.agentExecutable, options.claudeAuth);
   let socket: WebSocket | undefined;
   let input: Interface | undefined;
   let cleanupSignals: () => void = () => undefined;
@@ -1984,6 +2027,7 @@ const program = new Command()
 program.command("doctor").description("Check local prerequisites")
   .option("--agent <agent>", "agent provider: codex or claude", "codex")
   .option("--agent-executable <path>", "override the selected agent executable")
+  .option("--claude-auth <mode>", "Claude authentication: subscription, api-key, or auto", "auto")
   .action(doctor);
 
 const room = program.command("room", { hidden: true }).description("Internal room commands");
@@ -1992,6 +2036,7 @@ room
   .description("Create a local agent room in the current workspace")
   .option("--agent <agent>", "agent adapter", "codex")
   .option("--agent-executable <path>", "override the selected agent executable")
+  .option("--claude-auth <mode>", "Claude authentication: subscription, api-key, or auto", "auto")
   .option("--prompt <prompt>", "send an initial prompt")
   .option("--model <model>", "override the configured agent model")
   .option("--effort <effort>", "override the configured reasoning effort")
@@ -2004,6 +2049,7 @@ room
   .description("Host an interactive room that other people can join")
   .option("--agent <agent>", "agent adapter", "codex")
   .option("--agent-executable <path>", "override the selected agent executable")
+  .option("--claude-auth <mode>", "Claude authentication: subscription, api-key, or auto", "auto")
   .option("--prompt <prompt>", "queue an initial prompt")
   .option("--model <model>", "override the configured agent model")
   .option("--effort <effort>", "override the configured reasoning effort")
@@ -2031,6 +2077,7 @@ program
   .description(`Start a shared agent room through ${defaultRelayUrl}`)
   .option("--agent <agent>", "agent adapter", "codex")
   .option("--agent-executable <path>", "override the selected agent executable")
+  .option("--claude-auth <mode>", "Claude authentication: subscription, api-key, or auto", "auto")
   .option("--prompt <prompt>", "queue an initial prompt")
   .option("--model <model>", "override the configured agent model")
   .option("--effort <effort>", "override the configured reasoning effort")

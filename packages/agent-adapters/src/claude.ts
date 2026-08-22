@@ -291,8 +291,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const queryFactory = this.options.queryFactory ?? (await import("@anthropic-ai/claude-agent-sdk")).query as ClaudeQueryFactory;
     const canUseTool: CanUseTool = (toolName, input, permissionOptions) => this.requestToolPermission(toolName, input, permissionOptions);
     const environment = {
-      ...process.env,
-      ...this.options.environment,
+      ...(this.options.environment ? { ...this.options.environment } : { ...process.env }),
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
       CLAUDE_AGENT_SDK_CLIENT_APP: "multicode",
     };
@@ -522,8 +521,11 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
   private redact(message: string): string {
     let redacted = message.replace(/sk-ant-[A-Za-z0-9_-]+/g, "[REDACTED]");
-    const key = this.options.environment?.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_API_KEY;
-    if (key) redacted = redacted.split(key).join("[REDACTED]");
+    const environment = this.options.environment ?? process.env;
+    const credentials = [environment.ANTHROPIC_API_KEY, environment.ANTHROPIC_AUTH_TOKEN, environment.CLAUDE_CODE_OAUTH_TOKEN]
+      .filter((credential): credential is string => Boolean(credential))
+      .sort((left, right) => right.length - left.length);
+    for (const credential of credentials) redacted = redacted.split(credential).join("[REDACTED]");
     return redacted;
   }
 }

@@ -1,0 +1,62 @@
+Yes—file context and agent modes should be next. The agent can already create, rename, and delete text files through the workspace synchronization layer; what’s missing is the polished UX around attaching context, reviewing those files, and controlling autonomy.
+The official Codex extension emphasizes editor context, in-place review, and local/cloud delegation. Claude Code adds file/folder mentions, editable plans, permission modes, checkpoints, session history, and multiple conversations. Codex IDE docs, Claude Code VS Code docs.
+Recommended priorities
+Priority	Feature	What MultiCode should add
+P0	File/context attachments	+ Add context, @file, folders, selected lines, Problems, terminal output, git diff, screenshots
+P0	Agent modes	Plan, Ask Before Changes, Auto-Edit, and host-only Full Auto
+P0	Checkpoints and undo	Revert a turn, file, or hunk without resetting unrelated human edits
+P0	Granular change review	Accept/reject individual files or hunks directly in chat
+P0	Participant controls	Let hosts manage viewer/editor/prompter/reviewer roles from the sidebar
+P1	Session history	Named sessions, reopen, resume, fork conversation, searchable history
+P1	Plan review	Editable plan card with approve, request changes, and start implementation
+P1	Diagnostics feedback	Automatically show new TypeScript/compiler/linter errors after edits
+P1	Skills/MCP support	Discover project skills, MCP tools, hooks, and AGENTS.md/CLAUDE.md
+P1	Context management	Context usage meter, automatic compaction, pinned context
+P2	Parallel agents	Multiple tasks in isolated worktrees with separate progress cards
+P2	Background/remote work	Detach a task, notify when approval or review is needed
+P2	GitHub workflow	Create branch/commit/PR, review PR, generate description
+
+
+1. File adding and context
+There are really three separate features:
+- Workspace file creation: already supported. The file watcher and manifest synchronize create/rename/delete operations in [collaboration.ts (line 82)](/Users/benlin/Documents/idk-bro/apps/vscode/src/collaboration.ts:82).
+- Prompt attachments: missing. Prompts currently carry only text, model, and effort in [protocol/index.ts (line 201)](/Users/benlin/Documents/idk-bro/packages/protocol/src/index.ts:201).
+- Binary/image files: currently intentionally unsupported by the collaborative workspace.
+The composer should support:
+- @filename autocomplete
+- Attach current file or selection with exact line ranges
+- Attach a folder as searchable scope
+- “Add open editors”
+- Problems-panel diagnostics
+- Selected terminal output
+- Images/screenshots
+- Context chips showing exactly what every collaborator sent
+For collaboration, attachments should include a content hash or snapshot—not merely a path—so everyone knows precisely which version the agent received.
+2. Agent modes
+I would expose these beside the model selector:
+- Plan — inspect and propose, no workspace changes.
+- Ask — require approval for edits and commands.
+- Auto-edit — allow file edits, ask before risky commands/network access.
+- Auto — continue within the sandbox; host-only and explicitly enabled.
+Claude currently offers comparable plan and permission modes. Claude permission modes.
+Important: these modes must be enforced by the host authority and adapters. They should not be implemented by adding “please don’t edit” to the prompt. Participants also shouldn’t be able to select a mode exceeding the host’s room policy.
+3. Checkpoints and granular review
+This is probably the most important safety feature after modes. Claude automatically checkpoints edits and supports rewinding files and conversations. Claude checkpointing docs.
+For MultiCode:
+- Create a checkpoint before every prompt.
+- Record each agent result as a reversible transaction.
+- Add Undo turn, Revert file, and Reject hunk.
+- Only apply an inverse patch when current hashes still match.
+- If a collaborator changed the same lines, open a conflict proposal instead of overwriting them.
+MultiCode already has bootstrap checkpoints, but those are synchronization infrastructure—not user-facing agent undo.
+Best next milestone
+I’d build these together as one “controlled agent workflow” release:
+1. @ file/selection context and attachment chips.
+2. Plan / Ask / Auto-edit mode selector.
+3. Editable plan approval card.
+4. Per-file accept/revert and Undo turn.
+5. Host participant-permission popover.
+That set would close the largest experience gap with Claude Code and Codex while strengthening MultiCode’s actual differentiator: several people safely directing and reviewing one shared agent.
+
+
+11:39 PM

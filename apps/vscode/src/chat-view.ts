@@ -162,11 +162,13 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
   private html(webview: vscode.Webview): string {
     const nonce = randomBytes(18).toString("base64");
+    const squareLogoUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "media", "multicode-square.svg"));
     const csp = [
       "default-src 'none'",
       `style-src ${webview.cspSource} 'unsafe-inline'`,
       `script-src 'nonce-${nonce}'`,
       `font-src ${webview.cspSource}`,
+      `img-src ${webview.cspSource}`,
     ].join("; ");
     return `<!doctype html>
 <html lang="en">
@@ -176,12 +178,20 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
   <meta http-equiv="Content-Security-Policy" content="${csp}">
   <title>MultiCode</title>
   <style>
-    :root { color-scheme: light dark; }
+    :root {
+      color-scheme: light dark;
+      --motion-fast: 120ms;
+      --motion-medium: 200ms;
+      --motion-slow: 280ms;
+      --motion-ease: cubic-bezier(.2, .8, .2, 1);
+      --motion-ease-out: cubic-bezier(.16, 1, .3, 1);
+    }
     * { box-sizing: border-box; }
     body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); font: 13px/1.45 var(--vscode-font-family); overflow: hidden; }
     button, textarea, input, select { font: inherit; }
-    button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 5px; padding: 7px 11px; cursor: pointer; }
+    button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 5px; padding: 7px 11px; cursor: pointer; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease, border-color var(--motion-fast) ease, opacity var(--motion-fast) ease, transform var(--motion-fast) var(--motion-ease); }
     button:hover { background: var(--vscode-button-hoverBackground); }
+    button:active:not(:disabled) { transform: scale(.97); }
     button.secondary { color: var(--vscode-foreground); background: var(--vscode-button-secondaryBackground); }
     button.icon { padding: 5px 8px; background: transparent; color: var(--vscode-foreground); }
     button.icon:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -190,7 +200,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     header { padding: 10px 12px 8px; border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-panel-border)); }
     .topline { display: flex; align-items: center; gap: 8px; }
     .brand { font-weight: 700; letter-spacing: .2px; flex: 1; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-disabledForeground); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--vscode-disabledForeground); transition: background-color var(--motion-medium) ease, box-shadow var(--motion-medium) ease, opacity var(--motion-medium) ease; }
     .dot.connected { background: var(--vscode-testing-iconPassed); box-shadow: 0 0 0 3px color-mix(in srgb, var(--vscode-testing-iconPassed) 18%, transparent); }
     .dot.starting, .dot.stopping { background: var(--vscode-debugIcon-startForeground); animation: pulse 1.2s infinite; }
     .dot.error { background: var(--vscode-testing-iconFailed); }
@@ -198,18 +208,20 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .room { margin-top: 5px; color: var(--vscode-descriptionForeground); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #people { display: flex; align-items: center; gap: 5px; padding: 8px 12px; min-height: 40px; overflow-x: auto; border-bottom: 1px solid var(--vscode-panel-border); }
     .person { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px 3px 3px; border-radius: 999px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); white-space: nowrap; font-size: 11px; }
+    .person.entering { animation: chipEnter var(--motion-medium) var(--motion-ease-out) both; }
     .avatar { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-weight: 700; }
     .host { color: var(--vscode-charts-yellow); margin-left: 1px; }
     #conversation { overflow-y: auto; padding: 12px 10px 22px; scroll-behavior: auto; overflow-anchor: none; }
-    .empty { height: 100%; display: grid; place-content: center; text-align: center; color: var(--vscode-descriptionForeground); padding: 24px; }
-    .empty-logo { margin: 0 auto 12px; width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: var(--vscode-button-background); color: var(--vscode-button-foreground); font-size: 20px; font-weight: 800; }
+    .empty { height: 100%; display: grid; place-content: center; text-align: center; color: var(--vscode-descriptionForeground); padding: 24px; animation: emptyEnter var(--motion-slow) var(--motion-ease-out) both; }
+    .empty-logo { display: block; margin: 0 auto 12px; width: 44px; height: 44px; }
     .empty h2 { color: var(--vscode-foreground); font-size: 15px; margin: 0 0 6px; }
     .empty p { margin: 0 0 14px; }
     .actions { display: flex; justify-content: center; gap: 8px; }
     .join-form { display: none; margin-top: 10px; gap: 6px; }
-    .join-form.visible { display: flex; }
+    .join-form.visible { display: flex; animation: revealDown var(--motion-medium) var(--motion-ease-out) both; }
     .join-form input { min-width: 0; flex: 1; }
     .item { margin: 0 0 12px; }
+    .item.entering { animation: itemEnter var(--motion-slow) var(--motion-ease-out) both; will-change: opacity, transform; }
     .item.user, .item.assistant { position: relative; margin-bottom: 28px; }
     .meta { display: flex; align-items: center; gap: 6px; color: var(--vscode-descriptionForeground); font-size: 11px; margin: 0 3px 4px; }
     .meta strong { color: var(--vscode-foreground); }
@@ -248,7 +260,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     details.card { border: 1px solid var(--vscode-panel-border); border-radius: 7px; background: var(--vscode-editor-background); }
     details.card summary { padding: 7px 9px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; }
     details.card pre { margin: 0; padding: 8px 9px; border-top: 1px solid var(--vscode-panel-border); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.45 var(--vscode-editor-font-family); max-height: 280px; overflow: auto; }
-    details.change-card { overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 10px; background: var(--vscode-editor-background); }
+    details.change-card { overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 10px; background: var(--vscode-editor-background); transition: border-color var(--motion-fast) ease, background-color var(--motion-fast) ease; }
     details.change-card > summary { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 54px; padding: 8px 9px; cursor: pointer; user-select: none; }
     details.change-card > summary::-webkit-details-marker { display: none; }
     .change-icon { display: grid; place-items: center; width: 25px; height: 25px; border: 1px solid var(--vscode-descriptionForeground); border-radius: 6px; color: var(--vscode-descriptionForeground); font: 700 14px/1 var(--vscode-editor-font-family); }
@@ -301,11 +313,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       background-clip: text;
       -webkit-background-clip: text;
       animation: activeText 1.8s linear infinite;
+      animation-delay: var(--active-text-delay, 0ms);
     }
-    .activity-card.running > summary .activity-glyph, .activity-step.running .activity-glyph { animation: activeGlyph 1.6s ease-in-out infinite; }
+    .activity-card.running > summary .activity-glyph, .activity-step.running .activity-glyph { animation: activeGlyph 1.6s ease-in-out infinite; animation-delay: var(--active-glyph-delay, 0ms); }
     .activity-steps { margin: 1px 0 0; padding: 0; }
     details.activity-step { border: 0; background: transparent; }
-    details.activity-step.entering { animation: activityEnter 220ms cubic-bezier(.2,.8,.2,1) both; }
+    details.activity-step.entering { animation: activityEnter var(--motion-medium) var(--motion-ease-out) both; }
     details.activity-step > summary { display: grid; grid-template-columns: 18px minmax(0, 1fr) 10px; align-items: center; gap: 6px; min-height: 28px; padding: 3px 4px; cursor: pointer; color: var(--vscode-descriptionForeground); user-select: none; border-radius: 5px; }
     details.activity-step > summary:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
     .activity-step.failed .activity-glyph, .activity-step.failed .step-label { color: var(--vscode-errorForeground); }
@@ -316,9 +329,10 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     @keyframes activeText { from { background-position: 100% 0; } to { background-position: -120% 0; } }
     @keyframes activeGlyph { 0%, 100% { opacity: .46; } 50% { opacity: 1; } }
     @keyframes activityEnter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-    @media (prefers-reduced-motion: reduce) {
-      .activity-card.running > summary .activity-label, .activity-step.running .step-label, .activity-card.running > summary .activity-glyph, .activity-step.running .activity-glyph, details.activity-step.entering { animation: none; }
-    }
+    @keyframes itemEnter { from { opacity: 0; transform: translateY(7px) scale(.995); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    @keyframes chipEnter { from { opacity: 0; transform: translateX(-5px) scale(.96); } to { opacity: 1; transform: translateX(0) scale(1); } }
+    @keyframes emptyEnter { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes revealDown { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
     .system, .error { display: flex; gap: 7px; align-items: flex-start; color: var(--vscode-descriptionForeground); font-size: 11px; padding: 3px 4px; }
     .error { color: var(--vscode-errorForeground); }
     .approval { overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 10px; background: var(--vscode-editor-background); font-size: 12px; }
@@ -351,11 +365,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .input-freeform { width: 100%; min-height: 58px; resize: vertical; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 5px; padding: 6px; }
     .input-actions { display: flex; justify-content: flex-end; gap: 7px; padding: 0 13px 12px; }
     #queue { display: none; margin: 8px 10px 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
-    #queue.visible { display: block; }
+    #queue.visible { display: block; animation: revealDown var(--motion-medium) var(--motion-ease-out) both; }
     .queue-head { display: flex; align-items: center; gap: 6px; padding: 0 4px 6px; }
     .queue-head strong { color: var(--vscode-foreground); font-weight: 600; }
     .queue-list { display: grid; gap: 6px; }
     .queue-card { min-width: 0; overflow: hidden; border: 1px solid var(--vscode-panel-border); border-radius: 9px; background: color-mix(in srgb, var(--vscode-sideBar-background) 82%, var(--vscode-editor-background)); }
+    .queue-card.entering { animation: itemEnter var(--motion-medium) var(--motion-ease-out) both; }
     .queue-row { display: flex; min-width: 0; align-items: center; gap: 8px; padding: 8px 9px; }
     .queue-index { flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; }
     .queue-copy { min-width: 0; flex: 1; }
@@ -370,8 +385,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .queue-editor-actions { display: flex; justify-content: flex-end; gap: 5px; }
     .queue-editor-actions button { padding: 4px 8px; font-size: 11px; }
     footer { padding: 8px 10px 10px; background: var(--vscode-sideBar-background); border-top: 1px solid var(--vscode-panel-border); }
-    .composer { position: relative; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 9px; background: var(--vscode-input-background); padding: 8px 8px 7px; }
-    .composer:focus-within { border-color: var(--vscode-focusBorder); }
+    .composer { position: relative; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 9px; background: var(--vscode-input-background); padding: 8px 8px 7px; transition: border-color var(--motion-fast) ease, box-shadow var(--motion-medium) ease; }
+    .composer:focus-within { border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder) 22%, transparent); }
     textarea, input { color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 5px; padding: 7px 8px; outline: none; }
     textarea { display: block; width: 100%; min-height: 48px; max-height: 150px; resize: none; border: 0; padding: 1px; }
     textarea:focus, input:focus { border-color: var(--vscode-focusBorder); }
@@ -383,6 +398,9 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     .picker:disabled { opacity: .5; cursor: default; }
     #effort { max-width: 105px; }
     .send { min-width: 34px; border-radius: 7px; font-weight: 700; }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+    }
   </style>
 </head>
 <body>
@@ -423,23 +441,115 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     const expandedDiffFiles = new Set();
     const collapsedSteps = new Set();
     const seenActivitySteps = new Set();
+    const seenTimelineItems = new Set();
+    const seenQueueItems = new Set();
+    const seenParticipants = new Set();
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
     let liveTimerTimeout;
     let conversationRenderVersion = 0;
+    let scrollAnimationFrame;
 
     const post = (type, extra = {}) => vscode.postMessage({ type, ...extra });
     const node = (tag, className, text) => { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined) value.textContent = text; return value; };
     const markdownNode = (className, html) => { const value = node('div', className); value.innerHTML = html || ''; return value; };
+    const enterOnce = (element, seen, key) => {
+      if (seen.has(key)) return;
+      seen.add(key);
+      element.classList.add('entering');
+    };
+    const restoreSummaryAnchor = (summary, anchorTop) => {
+      const shift = summary.getBoundingClientRect().top - anchorTop;
+      if (Math.abs(shift) > 0.5) elements.conversation.scrollTop += shift;
+    };
     const toggleDetailsInPlace = (event, details, summary) => {
       event.preventDefault();
+      const opening = details.dataset.motionOpen === undefined
+        ? !details.open
+        : details.dataset.motionOpen !== 'true';
+      details.dataset.motionOpen = String(opening);
       const anchorTop = summary.getBoundingClientRect().top;
-      details.open = !details.open;
       summary.focus({ preventScroll: true });
-      const restoreAnchor = () => {
-        const shift = summary.getBoundingClientRect().top - anchorTop;
-        if (Math.abs(shift) > 0.5) elements.conversation.scrollTop += shift;
+      const startHeight = details.getBoundingClientRect().height;
+      details.getAnimations().forEach(animation => animation.cancel());
+      if (opening) details.open = true;
+      const endHeight = opening ? details.scrollHeight : summary.getBoundingClientRect().height;
+      if (reducedMotion.matches || Math.abs(endHeight - startHeight) < 1) {
+        details.open = opening;
+        delete details.dataset.motionOpen;
+        restoreSummaryAnchor(summary, anchorTop);
+        return opening;
+      }
+      details.style.overflow = 'hidden';
+      details.style.height = startHeight + 'px';
+      const animation = details.animate(
+        [{ height: startHeight + 'px' }, { height: endHeight + 'px' }],
+        { duration: opening ? 210 : 170, easing: 'cubic-bezier(.2, .8, .2, 1)' },
+      );
+      const cleanup = () => {
+        if (!opening) details.open = false;
+        if (details.dataset.motionOpen === String(opening)) delete details.dataset.motionOpen;
+        details.style.removeProperty('height');
+        details.style.removeProperty('overflow');
+        restoreSummaryAnchor(summary, anchorTop);
       };
-      restoreAnchor();
-      requestAnimationFrame(restoreAnchor);
+      animation.addEventListener('finish', cleanup, { once: true });
+      animation.addEventListener('cancel', () => {
+        details.style.removeProperty('height');
+        details.style.removeProperty('overflow');
+      }, { once: true });
+      return opening;
+    };
+    const togglePreviewInPlace = (preview, row) => {
+      const opening = preview.dataset.motionOpen === undefined
+        ? preview.hidden
+        : preview.dataset.motionOpen !== 'true';
+      preview.dataset.motionOpen = String(opening);
+      const startHeight = preview.getBoundingClientRect().height;
+      preview.getAnimations().forEach(animation => animation.cancel());
+      if (opening) preview.hidden = false;
+      const endHeight = opening ? Math.min(preview.scrollHeight, 390) : 0;
+      row.setAttribute('aria-expanded', String(opening));
+      if (reducedMotion.matches) {
+        preview.hidden = !opening;
+        delete preview.dataset.motionOpen;
+        return opening;
+      }
+      preview.style.overflow = 'hidden';
+      const animation = preview.animate(
+        [
+          { height: startHeight + 'px', opacity: opening ? 0 : 1 },
+          { height: endHeight + 'px', opacity: opening ? 1 : 0 },
+        ],
+        { duration: opening ? 210 : 160, easing: 'cubic-bezier(.2, .8, .2, 1)' },
+      );
+      animation.addEventListener('finish', () => {
+        preview.hidden = !opening;
+        if (preview.dataset.motionOpen === String(opening)) delete preview.dataset.motionOpen;
+        preview.style.removeProperty('overflow');
+      }, { once: true });
+      animation.addEventListener('cancel', () => preview.style.removeProperty('overflow'), { once: true });
+      return opening;
+    };
+    const smoothScrollToBottom = box => {
+      if (scrollAnimationFrame !== undefined) cancelAnimationFrame(scrollAnimationFrame);
+      if (reducedMotion.matches) {
+        box.scrollTop = box.scrollHeight;
+        return;
+      }
+      const start = box.scrollTop;
+      const target = Math.max(0, box.scrollHeight - box.clientHeight);
+      const distance = target - start;
+      if (Math.abs(distance) < 1) return;
+      const startedAt = performance.now();
+      const duration = Math.min(240, Math.max(140, Math.abs(distance) * 0.45));
+      const tick = now => {
+        const progress = Math.min(1, (now - startedAt) / duration);
+        const eased = 1 - Math.pow(1 - progress, 3);
+        box.scrollTop = start + distance * eased;
+        if (progress < 1) scrollAnimationFrame = requestAnimationFrame(tick);
+        else scrollAnimationFrame = undefined;
+      };
+      scrollAnimationFrame = requestAnimationFrame(tick);
     };
     const initials = name => name.split(/\\s+/).filter(Boolean).slice(0, 2).map(part => part[0]?.toUpperCase()).join('') || '?';
     const isActivity = item => item.kind === 'reasoning' || item.kind === 'command';
@@ -563,6 +673,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       elements.people.style.display = 'flex';
       for (const person of state.participants) {
         const chip = node('span', 'person');
+        enterOnce(chip, seenParticipants, person.name);
         chip.append(node('span', 'avatar', initials(person.name)), node('span', '', person.name));
         if (person.host) chip.append(node('span', 'host', '◆'));
         chip.title = person.host ? 'Host' : (person.synced ? 'Synchronized' : 'Synchronizing');
@@ -582,6 +693,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const list = node('div', 'queue-list');
       state.queue.forEach((item, index) => {
         const card = node('div', 'queue-card');
+        enterOnce(card, seenQueueItems, item.id);
         const row = node('div', 'queue-row');
         row.append(node('span', 'queue-index', String(index + 1)));
         const copy = node('div', 'queue-copy');
@@ -650,6 +762,11 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const activityId = 'activity:' + (items[0]?.turnId || items[0]?.id || 'unknown');
       const details = node('details', 'activity-card ' + (running ? 'running' : 'completed') + (failed ? ' failed' : ''));
       details.dataset.activityId = activityId;
+      if (running && Number.isFinite(startedAt)) {
+        const runningFor = Math.max(0, Date.now() - startedAt);
+        details.style.setProperty('--active-text-delay', '-' + (runningFor % 1800) + 'ms');
+        details.style.setProperty('--active-glyph-delay', '-' + (runningFor % 1600) + 'ms');
+      }
       if ((running && !collapsedActivities.has(activityId)) || (!running && expandedActivities.has(activityId))) details.setAttribute('open', '');
 
       let label = running ? 'Working' : (duration ? 'Worked for ' + duration : 'Worked');
@@ -674,8 +791,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         }
       };
       summary.addEventListener('click', event => {
-        const opening = !details.open;
-        toggleDetailsInPlace(event, details, summary);
+        const opening = toggleDetailsInPlace(event, details, summary);
         rememberActivityOpen(opening);
       });
       details.addEventListener('toggle', () => {
@@ -690,6 +806,14 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         const entering = !seenActivitySteps.has(item.id);
         const step = node('details', 'activity-step' + (stepFailed ? ' failed' : '') + (stepRunning ? ' running' : '') + (entering ? ' entering' : ''));
         seenActivitySteps.add(item.id);
+        if (stepRunning) {
+          const stepStartedAt = Date.parse(item.startedAt || item.timestamp);
+          if (Number.isFinite(stepStartedAt)) {
+            const runningFor = Math.max(0, Date.now() - stepStartedAt);
+            step.style.setProperty('--active-text-delay', '-' + (runningFor % 1800) + 'ms');
+            step.style.setProperty('--active-glyph-delay', '-' + (runningFor % 1600) + 'ms');
+          }
+        }
         if ((stepFailed && !collapsedSteps.has(item.id)) || expandedSteps.has(item.id)) step.setAttribute('open', '');
 
         const stepPresentation = activityPresentation(item, stepRunning);
@@ -713,8 +837,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
           }
         };
         stepSummary.addEventListener('click', event => {
-          const opening = !step.open;
-          toggleDetailsInPlace(event, step, stepSummary);
+          const opening = toggleDetailsInPlace(event, step, stepSummary);
           rememberStepOpen(opening);
         });
         step.addEventListener('toggle', () => rememberStepOpen(step.open));
@@ -731,6 +854,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     function renderItem(item) {
       const wrap = node('article', 'item ' + item.kind);
       wrap.dataset.timelineKey = item.id;
+      enterOnce(wrap, seenTimelineItems, item.id);
       if (item.kind === 'input') {
         const request = item.input;
         const main = node('div', 'input-main');
@@ -851,8 +975,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
           review.onclick = event => { event.preventDefault(); event.stopPropagation(); post('reviewChanges'); };
           summary.append(node('span', 'change-icon', '±'), overview, review);
           summary.addEventListener('click', event => {
-            const opening = !details.open;
-            toggleDetailsInPlace(event, details, summary);
+            const opening = toggleDetailsInPlace(event, details, summary);
             if (opening) collapsedChangeCards.delete(item.id);
             else collapsedChangeCards.add(item.id);
           });
@@ -889,7 +1012,8 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
               row.onclick = event => {
                 event.preventDefault(); event.stopPropagation();
                 const anchorTop = row.getBoundingClientRect().top;
-                setPreviewOpen(preview.hidden);
+                const opening = togglePreviewInPlace(preview, row);
+                if (opening) expandedDiffFiles.add(previewKey); else expandedDiffFiles.delete(previewKey);
                 row.focus({ preventScroll: true });
                 const restoreAnchor = () => { elements.conversation.scrollTop += row.getBoundingClientRect().top - anchorTop; };
                 restoreAnchor(); requestAnimationFrame(restoreAnchor);
@@ -923,7 +1047,11 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 
     function renderEmpty() {
       const empty = node('section', 'empty');
-      empty.append(node('div', 'empty-logo', 'M'), node('h2', '', 'Code together with an agent'), node('p', '', 'Host a Codex or Claude room, or join a teammate’s session.'));
+      const logo = node('img', 'empty-logo');
+      logo.src = '${squareLogoUri}';
+      logo.alt = '';
+      logo.setAttribute('aria-hidden', 'true');
+      empty.append(logo, node('h2', '', 'Code together with an agent'), node('p', '', 'Host a Codex or Claude room, or join a teammate’s session.'));
       const actions = node('div', 'actions');
       const host = node('button', '', 'Host room'); host.onclick = () => post('host');
       const join = node('button', 'secondary', 'Join room'); join.onclick = () => { joinVisible = !joinVisible; renderConversation(); };
@@ -941,6 +1069,9 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       const renderVersion = ++conversationRenderVersion;
       const previousScrollTop = box.scrollTop;
       const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+      const previousRects = new Map([...box.children]
+        .filter(child => child.dataset.timelineKey)
+        .map(child => [child.dataset.timelineKey, child.getBoundingClientRect()]));
       const anchor = [...box.children].find(child => child.offsetTop + child.offsetHeight > previousScrollTop);
       const anchorKey = anchor?.dataset.timelineKey;
       const anchorOffset = anchor ? anchor.offsetTop - previousScrollTop : 0;
@@ -961,7 +1092,9 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
             next += 1;
           }
           const wrap = node('article', 'item activity');
-          wrap.dataset.timelineKey = 'activity:' + (activity[0]?.turnId || activity[0]?.id || 'unknown');
+          const activityKey = 'activity:' + (activity[0]?.turnId || activity[0]?.id || 'unknown');
+          wrap.dataset.timelineKey = activityKey;
+          enterOnce(wrap, seenTimelineItems, activityKey);
           wrap.append(renderActivity(activity));
           box.append(wrap);
           index = next;
@@ -969,15 +1102,31 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       }
       const restoreScroll = () => {
         if (renderVersion !== conversationRenderVersion) return;
-        if (nearBottom) {
-          box.scrollTop = box.scrollHeight;
-          return;
-        }
+        if (nearBottom) return;
         const restoredAnchor = anchorKey ? [...box.children].find(child => child.dataset.timelineKey === anchorKey) : undefined;
         box.scrollTop = restoredAnchor ? restoredAnchor.offsetTop - anchorOffset : previousScrollTop;
       };
       restoreScroll();
-      requestAnimationFrame(restoreScroll);
+      requestAnimationFrame(() => {
+        if (renderVersion !== conversationRenderVersion) return;
+        if (nearBottom) {
+          smoothScrollToBottom(box);
+          return;
+        }
+        restoreScroll();
+        if (reducedMotion.matches) return;
+        for (const child of box.children) {
+          const previousRect = previousRects.get(child.dataset.timelineKey);
+          if (!previousRect || child.classList.contains('entering')) continue;
+          const nextRect = child.getBoundingClientRect();
+          const deltaY = previousRect.top - nextRect.top;
+          if (Math.abs(deltaY) < 1 || Math.abs(deltaY) > box.clientHeight) continue;
+          child.animate(
+            [{ transform: 'translateY(' + deltaY + 'px)' }, { transform: 'translateY(0)' }],
+            { duration: 180, easing: 'cubic-bezier(.2, .8, .2, 1)' },
+          );
+        }
+      });
     }
 
     function render() {
@@ -1022,7 +1171,18 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       event.preventDefault();
       post('openLink', { href });
     });
-    window.addEventListener('message', event => { if (event.data?.type === 'state') { state = event.data.state; render(); } });
+    window.addEventListener('message', event => {
+      if (event.data?.type !== 'state') return;
+      const nextState = event.data.state;
+      if (state.timeline.length && !nextState.timeline.length) {
+        seenTimelineItems.clear();
+        seenActivitySteps.clear();
+        seenQueueItems.clear();
+        seenParticipants.clear();
+      }
+      state = nextState;
+      render();
+    });
     post('ready'); render();
   </script>
 </body>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title description">
+  <title id="title">MultiCode</title>
+  <desc id="description">Two interlocking code brackets on a square background.</desc>
+  <rect width="64" height="64" rx="15" fill="#0B1220"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="7.5">
+    <path stroke="#2970FF" d="M26 13 10.5 28.5a5 5 0 0 0 0 7L26 51l10-10"/>
+    <path stroke="#F8FAFC" d="m38 13 15.5 15.5a5 5 0 0 1 0 7L38 51"/>
+  </g>
+</svg>
