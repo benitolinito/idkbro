@@ -174,15 +174,15 @@ describe("RoomRelay", () => {
     expect(error).toMatchObject({ message: "Invalid room token", fatal: true });
   });
 
-  it("broadcasts collaboration updates without checkpoint gating", async () => {
+  it("rejects participant workspace collaboration", async () => {
     const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
     const first = await connect(port, "secret-token", "Grace");
-    const second = await connect(port, "secret-token", "Linus");
-    sockets.push(first.socket, second.socket);
+    sockets.push(first.socket);
+    expect(first.welcome.participants.find((participant) => participant.id === first.welcome.selfId)?.capabilities).toEqual(["viewer", "prompter"]);
     first.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "document.update", payload: "opaque-update" } }));
-    expect((await second.messages.next("collab.event")).event).toMatchObject({ kind: "document.update", payload: "opaque-update" });
+    expect((await first.messages.next("room.error")).message).toMatch(/workspace editing is disabled/i);
   });
 
   it("does not let a slow workspace checkpoint acknowledgement block prompts", async () => {
@@ -212,7 +212,7 @@ describe("RoomRelay", () => {
     expect(dispatched).toEqual(["Continue"]);
   });
 
-  it("enforces independent viewer and editor capabilities", async () => {
+  it("keeps observers read-only and without prompt permissions", async () => {
     const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
@@ -222,7 +222,7 @@ describe("RoomRelay", () => {
     viewer.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "not allowed" }));
     expect((await viewer.messages.next("room.error")).message).toMatch(/prompter capability/);
     viewer.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "document.update", payload: "opaque" } }));
-    expect((await viewer.messages.next("room.error")).message).toMatch(/editor capability/);
+    expect((await viewer.messages.next("room.error")).message).toMatch(/workspace editing is disabled/i);
   });
 
   it("negotiates structured-input support and routes answers only from reviewers", async () => {
@@ -241,45 +241,10 @@ describe("RoomRelay", () => {
     client.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", answers: { choice: "Simple" } }));
     expect((await client.messages.next("room.error")).message).toMatch(/reviewer capability/);
     relay.setParticipantCapabilities(client.welcome.selfId, ["viewer", "editor", "prompter", "reviewer"]);
-    await client.messages.next("participant.capabilities");
+    expect((await client.messages.next("participant.capabilities")).capabilities).toEqual(["viewer", "prompter", "reviewer"]);
     client.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", answers: { choice: "Simple" } }));
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(answers).toEqual([{ requestId: "question-1", value: { choice: "Simple" } }]);
-  });
-
-  it("drops excess presence silently while reporting the drop metric", async () => {
-    let acceptedPresence = 0;
-    const relay = new RoomRelay({
-      roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined,
-      onCollaborationEvent: async (_participant, event) => { if (event.kind === "presence.update") acceptedPresence += 1; return event; },
-    });
-    relays.push(relay);
-    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
-    const client = await connect(port, "secret-token", "Grace"); sockets.push(client.socket);
-
-    for (let index = 0; index < 30; index += 1) {
-      client.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "presence.update", payload: `cursor-${index}` } }));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    expect(acceptedPresence).toBe(20);
-    expect(relay.metrics.droppedPresenceEvents).toBe(10);
-  });
-
-  it("returns structured backpressure for durable events", async () => {
-    const relay = new RoomRelay({ roomId: "room-1", token: "secret-token", hostName: "Ada", onPrompt: async () => undefined, onCollaborationEvent: async (_participant, event) => event });
-    relays.push(relay);
-    const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
-    const client = await connect(port, "secret-token", "Grace"); sockets.push(client.socket);
-    const eventIds = Array.from({ length: 31 }, () => randomUUID());
-
-    for (const eventId of eventIds) client.socket.send(JSON.stringify({ type: "collab.publish", event: { id: eventId, kind: "manifest.operation", payload: "opaque-operation" } }));
-
-    expect(await client.messages.next("collab.rate_limited")).toMatchObject({
-      eventId: eventIds[30],
-      kind: "manifest.operation",
-      retryAfterMs: expect.any(Number),
-    });
   });
 
   it("rejects participants above the configured room capacity", async () => {

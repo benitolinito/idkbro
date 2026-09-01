@@ -30,7 +30,8 @@ export interface RoomRelayOptions {
   hostName: string;
   onPrompt: (prompt: QueuedPrompt) => Promise<void>;
   onSteer?: (prompt: QueuedPrompt) => Promise<void>;
-  onCollaborationEvent: (participant: RoomParticipant, event: CollaborationEvent) => Promise<CollaborationEvent>;
+  /** @deprecated Shared workspace editing is disabled; retained for source compatibility. */
+  onCollaborationEvent?: (participant: RoomParticipant, event: CollaborationEvent) => Promise<CollaborationEvent>;
   onApproval?: (participant: RoomParticipant, requestId: string | number, decision: ApprovalDecision) => Promise<void>;
   onInput?: (participant: RoomParticipant, requestId: string, answers: AgentInputAnswers | null | undefined, payload?: string) => Promise<void>;
   onCheckpointRequest?: (participantId: string, sequence: number) => Promise<void> | void;
@@ -73,7 +74,7 @@ export class RoomRelay {
       joinedAt: new Date().toISOString(),
       host: true,
       synced: true,
-      capabilities: ["viewer", "editor", "prompter", "reviewer", "host"],
+      capabilities: ["viewer", "prompter", "reviewer", "host"],
     };
   }
 
@@ -194,7 +195,7 @@ export class RoomRelay {
   setParticipantCapabilities(participantId: string, capabilities: RoomParticipant["capabilities"]): void {
     const participant = this.participants().find((candidate) => candidate.id === participantId);
     if (!participant) throw new Error("Participant is no longer connected");
-    participant.capabilities = [...new Set(capabilities.filter((capability) => capability !== "host"))];
+    participant.capabilities = [...new Set(capabilities.filter((capability) => capability !== "editor" && capability !== "host"))];
     this.broadcast({ type: "participant.capabilities", participantId, capabilities: participant.capabilities });
   }
 
@@ -288,33 +289,7 @@ export class RoomRelay {
     }
 
     if (parsed.data.type === "collab.publish") {
-      const collaborationEvent = parsed.data.event;
-      if ((collaborationEvent.kind === "document.update" || collaborationEvent.kind === "manifest.operation") && !state.participant.capabilities.includes("editor")) {
-        this.send(socket, { type: "room.error", message: "Participant does not have editor capability" });
-        return;
-      }
-      const group = collaborationRateGroup(collaborationEvent.kind);
-      let bucket = state.collaborationRates.get(group);
-      if (!bucket) { bucket = createCollaborationBucket(group); state.collaborationRates.set(group, bucket); }
-      const participantRate = bucket.take();
-      if (group === "presence") {
-        if (!participantRate.allowed) { this.droppedPresenceEvents += 1; return; }
-        const roomRate = this.roomPresenceRate.take();
-        if (!roomRate.allowed) { this.droppedPresenceEvents += 1; return; }
-      } else if (!participantRate.allowed) {
-        this.send(socket, {
-          type: "collab.rate_limited",
-          eventId: collaborationEvent.id,
-          kind: collaborationEvent.kind,
-          retryAfterMs: participantRate.retryAfterMs,
-        });
-        return;
-      }
-      void this.options.onCollaborationEvent(state.participant, collaborationEvent).then((event) => {
-        this.publishCollaborationEvent(event);
-      }).catch((error: unknown) => {
-        this.send(socket, { type: "collab.rejected", eventId: collaborationEvent.id, message: error instanceof Error ? error.message : String(error) });
-      });
+      this.send(socket, { type: "room.error", message: "Shared workspace editing is disabled for this room" });
       return;
     }
 
@@ -400,8 +375,8 @@ export class RoomRelay {
       name,
       joinedAt: new Date().toISOString(),
       host: false,
-      synced: this.latestCheckpoint === null,
-      capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "editor", "prompter"],
+      synced: true,
+      capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "prompter"],
       protocolCapabilities,
     };
     state.participant = participant;

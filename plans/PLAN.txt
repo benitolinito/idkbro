@@ -1,3 +1,9 @@
+STATUS: Superseded by the co-prompting-only product direction.
+
+MultiCode now shares one host-owned coding-agent session. Participants share prompts, streamed agent activity, approvals, questions, and read-only agent previews. Participant workspaces, Yjs text collaboration, cursor presence, manifest synchronization, and workspace checkpoints are no longer product features.
+
+The material below is retained only as historical design context and must not be treated as the current implementation plan.
+
 Full MultiCode real-time collaboration plan
 This is the implementation plan I would use against the current 3008a83 baseline.
 The final product will use:

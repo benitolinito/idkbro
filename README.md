@@ -1,15 +1,12 @@
 # MultiCode
 
-> Extension prompt check: this README was updated successfully through the MultiCode extension.
-
 > Codex workspace check: **working** (verified August 22, 2026).
 
-MultiCode lets multiple people edit a real VS Code workspace while sharing one isolated Codex or Claude session. Human text edits synchronize through authoritative Yjs documents; Git checkpoints are used only for bootstrap, recovery, compaction, and export.
+MultiCode lets a team co-prompt one Codex or Claude session running against the host's local repository. Participants share the prompt queue, streamed agent activity, approvals, structured questions, and read-only change previews; MultiCode does not synchronize or co-edit participant workspaces.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
-> [!IMPORTANT]
-> MultiCode currently supports regular UTF-8 text files up to 96 KiB. Binary collaboration, symlinks, offline editing, and browser clients are intentionally outside the first release.
+Only the host needs the repository, Git, and the selected coding-agent CLI. Participants can join from VS Code or the MultiCode CLI without cloning the project.
 
 ## How it works
 
@@ -17,21 +14,20 @@ The public relay defaults to `wss://multicode.luisagd.com`, so the normal workfl
 Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbound WSS ── Collaborator
 ```
 
-- The host session daemon is the sole authority for manifests, Yjs documents, sequencing, permissions, proposals, and workspace commits.
+- The host owns the repository, agent worktree, proposals, and workspace commits.
 - The relay generates a random `XXXXX-XXXXX` locator; a separate high-entropy invitation secret encrypts application payloads end to end.
 - Each originating IP can host at most five active rooms.
-- Viewers, editors, prompters, and reviewers are independent capabilities controlled by the host.
+- Observer, prompter, and reviewer capabilities are controlled by the host.
 - Prompts from all participants execute through one FIFO queue.
-- Each person works directly in their clean local checkout. MultiCode leases that checkout for one room, while the selected agent runs in a temporary isolated worktree.
-- Human edits are durably committed before broadcast. Multi-file agent results are buffered and finalized as one logical workspace transaction.
-- The public relay sees routing metadata and encrypted payload sizes, not source, prompts, agent output, previews, proposals, or checkpoint contents.
+- The selected agent runs in a temporary isolated worktree; accepted results are applied only to the host checkout.
+- The public relay sees routing metadata and encrypted payload sizes, not prompts, agent output, previews, or proposals.
 
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 22.5 or newer (the session journal uses the built-in SQLite API in WAL mode)
 - Hosting: Git, either an authenticated Codex CLI or a Claude CLI signed in with a Claude subscription or configured with an Anthropic API key, and a repository with at least one commit
 - VS Code: version 1.96 or newer
-- Joining: a clone containing the host's base commit; Codex is not required
+- Joining: VS Code or Node.js; no repository clone or agent installation is required
 
 ## VS Code extension
 
@@ -48,7 +44,7 @@ code --install-extension apps/vscode/multicode-vscode-0.4.7.vsix
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
 
-- **MultiCode: Host Room** — choose Codex or experimental Claude and start collaboration in the current checkout and current VS Code window.
+- **MultiCode: Host Room** — choose Codex or experimental Claude and share its session from the current checkout.
 - **MultiCode: Join Room** — connect with a shared `XXXXX-XXXXX` room code.
 - **MultiCode: Open Chat** — open the shared agent conversation sidebar.
 - **MultiCode: Send Prompt** — add a prompt to the room's shared FIFO queue.
@@ -116,7 +112,7 @@ The other person pastes the complete token:
 multicode join K7MNP-4XQ2R.<room-secret>
 ```
 
-Both people can now edit normal VS Code buffers, submit prompts, see participant presence, and follow encrypted agent activity. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
+Participants can submit prompts and follow encrypted agent activity. Their open folders and files remain entirely local and are never synchronized with the host. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
 
 Use names when desired:
 
@@ -240,25 +236,9 @@ Run `multicode --help` for operator/development commands. End users only need
 
 ## Git safety model
 
-The host and each participant use their original clean checkout. MultiCode never
-moves its branch or resets its index; room files appear as ordinary local working-tree
-changes. A per-repository lease prevents two rooms from owning one checkout at once.
-The selected agent uses one temporary detached worktree, which is removed when the host stops. Session credentials and journals are stored outside that worktree.
-Hosting or joining from a legacy v2 MultiCode `shared` or `agent` worktree force-removes
-both legacy worktrees, then redirects to the original repository in the same VS Code window.
+The host keeps using the original checkout. MultiCode never moves its branch or resets its index, and a per-repository lease prevents two hosted rooms from owning the checkout at once. The selected agent uses one temporary detached worktree, which is removed when the host stops. Accepted agent changes appear as ordinary changes in the host working tree.
 
-Bootstrap checkpoints are streamed from
-the host in bounded 128 KiB chunks and verified by byte count, SHA-256 hash, Git
-bundle verification, and expected commit before application. The relay retains
-only checkpoint metadata, so a late joiner explicitly requests the current
-bundle from the host.
-
-A checkpoint is applied only when the checkout still exactly matches its last
-synchronized room state. It never resets `HEAD`, the index, or unrelated local
-changes. Leaving releases the lease and retains the synchronized files locally;
-participants do not need to wait for the host to push or pull during a room.
-
-Ignored files are neither synchronized nor removed. Room creation and joining are rejected during a merge, rebase, cherry-pick, or revert.
+Participants never receive a workspace checkpoint, lease a checkout, or modify host files. Room creation is rejected while the host repository is in the middle of a merge, rebase, cherry-pick, or revert.
 
 ## Development
 
@@ -294,8 +274,8 @@ the same version only produce temporary Actions artifacts.
 | --------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                        |
 | `@multicode/protocol`       | Shared schemas and event types                                                                       |
-| `@multicode/session-core`   | SQLite WAL journal, encrypted recovery snapshots, manifests, Yjs documents, and authenticated IPC    |
-| `@multicode/workspace`      | Checkout leases, agent worktrees, bootstrap checkpoints, B/A/H merges, and transactional application |
+| `@multicode/session-core`   | Host-local transaction journal, recovery state, and authenticated IPC                                 |
+| `@multicode/workspace`      | Host checkout leases, agent worktrees, B/A/H merges, and transactional application                    |
 | `@multicode/agent-adapters` | Provider-neutral Codex app-server and Claude Agent SDK integration                                   |
 | `@multicode/relay`          | Embedded and standalone WebSocket relays                                                             |
 | `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                            |
@@ -307,7 +287,6 @@ the same version only produce temporary Actions artifacts.
 - Claude active-turn steering remains disabled until its semantics are verified; queued prompts and interruption are supported.
 - Only one regular agent turn or pending proposal is allowed at a time.
 - The host device must remain online. A transient host relay connection can resume, but rooms do not survive the host device being offline.
-- Collaborative files must be regular UTF-8 files no larger than 96 KiB. Binary files and symlinks remain checkpoint/export-only.
-- Undo uses normal VS Code behavior; MultiCode does not promise per-user CRDT undo.
-- Conflict resolution is host-driven: reviewers inspect the encrypted proposal, manually resolve the shared files, then retry against the newest human state.
+- Participants cannot directly edit or synchronize the host workspace.
+- Conflict resolution is host-driven: reviewers inspect the encrypted proposal, and the host resolves the local files before retrying.
 - Relay process restarts are not persisted as live WebSocket rooms; host-local authoritative state and acknowledged edits remain recoverable from SQLite.

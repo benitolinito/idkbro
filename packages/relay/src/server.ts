@@ -143,7 +143,7 @@ class CentralRoom {
       joinedAt: new Date().toISOString(),
       host: true,
       synced: true,
-      capabilities: ["viewer", "editor", "prompter", "reviewer", "host"],
+      capabilities: ["viewer", "prompter", "reviewer", "host"],
     };
     this.attachHost(hostSocket);
   }
@@ -225,8 +225,8 @@ class CentralRoom {
       name,
       joinedAt: new Date().toISOString(),
       host: false,
-      synced: this.latestCheckpoint === null,
-      capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "editor", "prompter"],
+      synced: true,
+      capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "prompter"],
       protocolCapabilities,
     };
     this.participants.set(socket, participant);
@@ -293,30 +293,7 @@ class CentralRoom {
       return;
     }
     if (participantMessage.type === "collab.publish") {
-      if ((participantMessage.event.kind === "document.update" || participantMessage.event.kind === "manifest.operation") && !participant.capabilities.includes("editor")) {
-        send(socket, { type: "room.error", message: "Participant does not have editor capability" });
-        return;
-      }
-      const group = collaborationRateGroup(participantMessage.event.kind);
-      let buckets = this.collaborationRates.get(socket);
-      if (!buckets) { buckets = new Map(); this.collaborationRates.set(socket, buckets); }
-      let bucket = buckets.get(group);
-      if (!bucket) { bucket = createCollaborationBucket(group); buckets.set(group, bucket); }
-      const participantRate = bucket.take();
-      if (group === "presence") {
-        if (!participantRate.allowed) { this.droppedPresenceEvents += 1; return; }
-        const roomRate = this.roomPresenceRate.take();
-        if (!roomRate.allowed) { this.droppedPresenceEvents += 1; return; }
-      } else if (!participantRate.allowed) {
-        send(socket, {
-          type: "collab.rate_limited",
-          eventId: participantMessage.event.id,
-          kind: participantMessage.event.kind,
-          retryAfterMs: participantRate.retryAfterMs,
-        });
-        return;
-      }
-      send(this.hostSocket, { type: "collab.submitted", participantId: participant.id, event: participantMessage.event });
+      send(socket, { type: "room.error", message: "Shared workspace editing is disabled for this room" });
       return;
     }
     if (participantMessage.type === "approval.resolve") {
@@ -464,7 +441,7 @@ class CentralRoom {
       case "relay.participant.capabilities": {
         const participant = [...this.participants.values()].find((candidate) => candidate.id === message.participantId);
         if (!participant) { send(this.hostSocket, { type: "room.error", message: "Participant is no longer connected" }); break; }
-        participant.capabilities = [...new Set(message.capabilities)];
+        participant.capabilities = [...new Set(message.capabilities.filter((capability) => capability !== "editor" && capability !== "host"))];
         this.broadcast({ type: "participant.capabilities", participantId: participant.id, capabilities: participant.capabilities });
         break;
       }

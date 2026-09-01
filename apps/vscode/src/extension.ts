@@ -157,8 +157,7 @@ class MultiCodeController implements vscode.Disposable {
 
   async join(providedToken?: string): Promise<void> {
     if (!this.ensureIdle()) return;
-    const cwd = await this.ensureDirectWorkspace(this.workspaceDirectory(false));
-    if (!cwd) return;
+    const cwd = this.workspaceDirectory(false);
     const code = providedToken ?? await vscode.window.showInputBox({
         title: "Join a MultiCode room",
         prompt: "Paste the room token shared by the host",
@@ -172,8 +171,8 @@ class MultiCodeController implements vscode.Disposable {
       return;
     }
     const role = await vscode.window.showQuickPick([
-      { label: "Editor", description: "Edit files and submit prompts", role: "editor" as const },
-      { label: "Viewer", description: "Observe files, presence, and agent activity", role: "viewer" as const },
+      { label: "Participant", description: "Submit prompts and follow the shared agent", role: "editor" as const },
+      { label: "Observer", description: "Follow the shared agent without submitting prompts", role: "viewer" as const },
     ], { title: "Choose room access", ignoreFocusOut: true });
     if (!role) return;
 
@@ -390,9 +389,6 @@ class MultiCodeController implements vscode.Disposable {
 
   async stop(): Promise<void> {
     if (!this.process) {
-      const roomId = this.mode === "join" ? this.roomSessionId : undefined;
-      const workspace = this.roomWorkspace;
-      if (roomId && workspace) await this.releaseParticipantRoom(roomId, workspace);
       await this.forgetWorkspaceHandoff();
       this.collaboration.disconnect(); this.roomWorkspaceReady = false; this.roomSessionId = undefined; this.mode = undefined; this.roomCode = undefined; this.roomWorkspace = undefined; this.chat.stopped(); this.setIdle(); void vscode.commands.executeCommand("setContext", "multicode.connected", false); return;
     }
@@ -455,11 +451,8 @@ class MultiCodeController implements vscode.Disposable {
       if (continueParticipantSession) {
         this.chat.ready(this.roomCode?.slice(0, 11) ?? "connected");
         this.status.text = `$(people) MultiCode: ${this.roomCode?.slice(0, 11) ?? "connected"}`;
-        this.status.tooltip = "Live collaboration continues through the room workspace";
+        this.status.tooltip = "Open the shared agent room";
       } else {
-        const participantRoomId = mode === "join" ? this.roomSessionId : undefined;
-        const participantWorkspace = this.roomWorkspace;
-        if (participantRoomId && participantWorkspace) void this.releaseParticipantRoom(participantRoomId, participantWorkspace);
         void this.forgetWorkspaceHandoff();
         this.mode = undefined;
         this.roomCode = undefined;
@@ -492,9 +485,6 @@ class MultiCodeController implements vscode.Disposable {
         this.connectCollaborationWhenSafe();
       }
     }
-    if (this.mode === "join" && /Workspace synchronized/i.test(this.recentOutput) && this.roomWorkspace) {
-      this.roomWorkspaceReady = true; this.connectCollaborationWhenSafe();
-    }
     if (this.mode === "host") {
       const token = roomTokenFromOutput(this.recentOutput);
       if (token && token !== this.roomCode) {
@@ -511,6 +501,9 @@ class MultiCodeController implements vscode.Disposable {
         this.connectCollaborationWhenSafe();
       }
     } else if (this.recentOutput.includes("Joined room")) {
+      this.roomWorkspace ??= this.workspaceDirectory(false);
+      this.roomWorkspaceReady = true;
+      this.connectCollaborationWhenSafe();
       this.status.text = `$(people) MultiCode: ${this.roomCode ?? "joined"}`;
     }
   }
@@ -772,16 +765,6 @@ class MultiCodeController implements vscode.Disposable {
     }
     await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(original), { forceNewWindow: false });
     return undefined;
-  }
-
-  private async releaseParticipantRoom(roomId: string, workspace: string): Promise<void> {
-    try {
-      await this.runCliCommand(["leave", roomId], workspace);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.output.appendLine(`\nUnable to release participant room state: ${message}`);
-      void vscode.window.showWarningMessage("MultiCode stopped, but its checkout lease could not be released. Run multicode leave with the room ID shown in the output.");
-    }
   }
 
   private reportLaunchError(error: Error): void {

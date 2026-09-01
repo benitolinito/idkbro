@@ -1,4 +1,4 @@
-Yes—file context and agent modes should be next. The agent can already create, rename, and delete text files through the workspace synchronization layer; what’s missing is the polished UX around attaching context, reviewing those files, and controlling autonomy.
+File context and agent modes should be next. The host-owned agent can create, rename, and delete files; participants co-prompt and review the agent but do not synchronize or directly edit the host workspace.
 The official Codex extension emphasizes editor context, in-place review, and local/cloud delegation. Claude Code adds file/folder mentions, editable plans, permission modes, checkpoints, session history, and multiple conversations. Codex IDE docs, Claude Code VS Code docs.
 Recommended priorities
 Priority	Feature	What MultiCode should add
@@ -6,7 +6,7 @@ P0	File/context attachments	+ Add context, @file, folders, selected lines, Probl
 P0	Agent modes	Plan, Ask Before Changes, Auto-Edit, and host-only Full Auto
 P0	Checkpoints and undo	Revert a turn, file, or hunk without resetting unrelated human edits
 P0	Granular change review	Accept/reject individual files or hunks directly in chat
-P0	Participant controls	Let hosts manage viewer/editor/prompter/reviewer roles from the sidebar
+P0	Participant controls	Let hosts manage observer/prompter/reviewer roles from the sidebar
 P1	Session history	Named sessions, reopen, resume, fork conversation, searchable history
 P1	Plan review	Editable plan card with approve, request changes, and start implementation
 P1	Diagnostics feedback	Automatically show new TypeScript/compiler/linter errors after edits
@@ -19,9 +19,9 @@ P2	GitHub workflow	Create branch/commit/PR, review PR, generate description
 
 1. File adding and context
 There are really three separate features:
-- Workspace file creation: already supported. The file watcher and manifest synchronize create/rename/delete operations in [collaboration.ts (line 82)](/Users/benlin/Documents/idk-bro/apps/vscode/src/collaboration.ts:82).
+- Workspace file creation: already supported for the host-owned agent workspace.
 - Prompt attachments: missing. Prompts currently carry only text, model, and effort in [protocol/index.ts (line 201)](/Users/benlin/Documents/idk-bro/packages/protocol/src/index.ts:201).
-- Binary/image files: currently intentionally unsupported by the collaborative workspace.
+- Binary/image prompt attachments: currently unsupported.
 The composer should support:
 - @filename autocomplete
 - Attach current file or selection with exact line ranges
@@ -47,8 +47,8 @@ For MultiCode:
 - Record each agent result as a reversible transaction.
 - Add Undo turn, Revert file, and Reject hunk.
 - Only apply an inverse patch when current hashes still match.
-- If a collaborator changed the same lines, open a conflict proposal instead of overwriting them.
-MultiCode already has bootstrap checkpoints, but those are synchronization infrastructure—not user-facing agent undo.
+- If the host changed the same lines, open a conflict proposal instead of overwriting them.
+MultiCode already snapshots the host workspace around agent turns, but those snapshots are not yet exposed as user-facing undo.
 Best next milestone
 I’d build these together as one “controlled agent workflow” release:
 1. @ file/selection context and attachment chips.

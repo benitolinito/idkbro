@@ -77,7 +77,7 @@ describe("RelayServer", () => {
     }));
     expect(await participant.messages.next("agent.config")).toMatchObject({ config: { model: "gpt-5.6-sol", effort: "medium" } });
     host.socket.send(JSON.stringify({ type: "relay.participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "editor", "prompter", "reviewer"] }));
-    expect(await participant.messages.next("participant.capabilities")).toMatchObject({ participantId: joined.participant.id, capabilities: expect.arrayContaining(["reviewer"]) });
+    expect(await participant.messages.next("participant.capabilities")).toEqual({ type: "participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "prompter", "reviewer"] });
 
     participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Fix the test", model: "gpt-5.6-terra", effort: "high" }));
     await participant.messages.next("prompt.queued");
@@ -120,33 +120,11 @@ describe("RelayServer", () => {
 
     const collaboration = { id: randomUUID(), kind: "document.update", payload: "encrypted-update" } as const;
     participant.socket.send(JSON.stringify({ type: "collab.publish", event: collaboration }));
-    const submitted = await host.messages.next("collab.submitted");
-    expect(submitted).toMatchObject({ participantId: expect.any(String), event: collaboration });
-    const committed = { ...collaboration, sequence: 1, committedAt: new Date().toISOString() };
-    host.socket.send(JSON.stringify({ type: "relay.collab.event", event: committed }));
-    expect((await participant.messages.next("collab.event")).event).toEqual(committed);
+    expect((await participant.messages.next("room.error")).message).toMatch(/workspace editing is disabled/i);
 
-    const rejected = { id: randomUUID(), kind: "document.update", payload: "invalid-update" } as const;
-    participant.socket.send(JSON.stringify({ type: "collab.publish", event: rejected }));
-    const rejectedSubmission = await host.messages.next("collab.submitted");
-    host.socket.send(JSON.stringify({ type: "relay.collab.rejected", participantId: rejectedSubmission.participantId, eventId: rejected.id, message: "stale document epoch" }));
-    expect(await participant.messages.next("collab.rejected")).toEqual({ type: "collab.rejected", eventId: rejected.id, message: "stale document epoch" });
-  });
-
-  it("limits durable bursts and silently drops excess presence", async () => {
-    const server = new RelayServer({}); servers.push(server); const { port } = await server.listen({ host: "127.0.0.1", port: 0 });
-    const host = await open(`ws://127.0.0.1:${port}/host`); sockets.push(host.socket); host.socket.send(JSON.stringify({ type: "relay.room.create", name: "Ada" }));
-    const created = await host.messages.next("relay.room.created");
-    const participant = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`); sockets.push(participant.socket); participant.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" })); await participant.messages.next("room.welcome");
-
-    const manifestIds = Array.from({ length: 31 }, () => randomUUID());
-    for (const eventId of manifestIds) participant.socket.send(JSON.stringify({ type: "collab.publish", event: { id: eventId, kind: "manifest.operation", payload: "opaque-operation" } }));
-    expect(await participant.messages.next("collab.rate_limited")).toMatchObject({ eventId: manifestIds[30], kind: "manifest.operation", retryAfterMs: expect.any(Number) });
-
-    for (let index = 0; index < 30; index += 1) participant.socket.send(JSON.stringify({ type: "collab.publish", event: { id: randomUUID(), kind: "presence.update", payload: `cursor-${index}` } }));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const health = await fetch(`http://127.0.0.1:${port}/health`);
-    expect(await health.json()).toMatchObject({ participants: 2, droppedPresenceEvents: 10 });
+    const preview = { id: randomUUID(), kind: "agent.preview", payload: "encrypted-preview" } as const;
+    host.socket.send(JSON.stringify({ type: "relay.collab.event", event: preview }));
+    expect((await participant.messages.next("collab.event")).event).toEqual(preview);
   });
 
   it("enforces the configured participant capacity", async () => {

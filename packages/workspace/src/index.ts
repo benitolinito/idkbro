@@ -903,7 +903,7 @@ export interface WorkspaceChange {
   path: string;
   sourcePath?: string;
   content?: string;
-  /** False when Git should project the change but live Yjs collaboration cannot safely carry it. */
+  /** False when a change should remain outside participant-facing agent previews. */
   collaborative?: boolean;
 }
 export interface PendingWorkspaceProposal { version: 1; sequence: number; roomId: string; baseCommit: string; agentCommit: string; humanCommit: string; patchPath: string; createdAt: string; status: "pending" }

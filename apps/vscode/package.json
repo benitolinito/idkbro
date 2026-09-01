@@ -27,8 +27,7 @@
     "@multicode/protocol": "0.0.0",
     "@multicode/workspace": "0.0.0",
     "markdown-it": "^14.3.0",
-    "ws": "^8.18.0",
-    "yjs": "^13.6.27"
+    "ws": "^8.18.0"
   },
   "activationEvents": [
     "onStartupFinished",
