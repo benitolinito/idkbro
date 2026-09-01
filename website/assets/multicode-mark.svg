@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title description">
+  <title id="title">MultiCode mark</title>
+  <desc id="description">Two interlocking code brackets representing collaborative coding.</desc>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" stroke-width="15">
+    <path stroke="#155EEF" d="M52 23 17 58a8 8 0 0 0 0 12l35 35 25-25"/>
+    <path stroke="#111827" d="m76 23 35 35a8 8 0 0 1 0 12l-35 35"/>
+  </g>
+</svg>

@@ -166,13 +166,19 @@ export class ChatModel {
         if (message.latestDiff) this.handleWorkspaceDiff(message.latestDiff);
         this.add("system", `Connected to room ${message.roomId}`);
         break;
-      case "participant.joined":
+      case "participant.joined": {
+        const alreadyPresent = [...this.participants.values()].some((participant) => this.sameParticipantName(participant.name, message.participant.name));
         this.participants.set(message.participant.id, message.participant);
-        this.add("system", `${message.participant.name} joined`);
+        if (!alreadyPresent && !this.removeTrailingLeftMessage(message.participant.name)) {
+          this.add("system", `${message.participant.name} joined`);
+        }
         break;
+      }
       case "participant.left":
         this.participants.delete(message.participantId);
-        this.add("system", `${message.name} left`);
+        if (![...this.participants.values()].some((participant) => this.sameParticipantName(participant.name, message.name))) {
+          this.add("system", `${message.name} left`);
+        }
         break;
       case "participant.capabilities": {
         const participant = this.participants.get(message.participantId);
@@ -275,6 +281,18 @@ export class ChatModel {
     const last = this.timeline.at(-1);
     if (last?.kind === "error" && last.text === message) return;
     this.add("error", message);
+  }
+
+  private sameParticipantName(left: string, right: string): boolean {
+    return left.localeCompare(right, undefined, { sensitivity: "accent" }) === 0;
+  }
+
+  private removeTrailingLeftMessage(name: string): boolean {
+    const last = this.timeline.at(-1);
+    const suffix = " left";
+    if (last?.kind !== "system" || !last.text.endsWith(suffix) || !this.sameParticipantName(last.text.slice(0, -suffix.length), name)) return false;
+    this.timeline.pop();
+    return true;
   }
 
   private handleWorkspaceDiff(diff: WorkspaceDiff, explicitTurnId?: string): void {

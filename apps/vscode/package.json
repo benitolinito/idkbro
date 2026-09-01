@@ -5,7 +5,7 @@
   "version": "0.4.7",
   "private": true,
   "publisher": "multicode",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/benitolinito/idkbro.git"
