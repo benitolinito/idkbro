@@ -51,6 +51,7 @@ export interface ChatSnapshot {
   activeTurnIds: string[];
   timeline: TimelineItem[];
   canApprove: boolean;
+  canManageQueue: boolean;
   canReturnToStart: boolean;
 }
 
@@ -274,6 +275,7 @@ export class ChatModel {
         ...(item.changes ? { changes: { ...item.changes, files: item.changes.files.map((file) => ({ ...file })) } } : {}),
       })),
       canApprove: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("reviewer")),
+      canManageQueue: this.mode === "host" || Boolean(this.selfId && this.participants.get(this.selfId)?.capabilities.includes("prompter")),
       canReturnToStart: this.connection === "idle" && this.timeline.length > 0,
     };
   }

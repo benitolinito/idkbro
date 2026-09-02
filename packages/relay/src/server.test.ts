@@ -87,6 +87,20 @@ describe("RelayServer", () => {
     const prompt = await host.messages.next("prompt.started");
     expect(prompt.prompt).toMatchObject({ participantName: "Grace", text: "Fix the test", model: "gpt-5.6-terra", effort: "high" });
 
+    host.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "host-owned-edit", text: "Host draft" }));
+    await participant.messages.next("prompt.queued");
+    participant.socket.send(JSON.stringify({ type: "prompt.update", promptId: "host-owned-edit", text: "Shared draft" }));
+    expect((await participant.messages.next("prompt.updated")).prompt).toMatchObject({ participantName: "Ada", text: "Shared draft" });
+    participant.socket.send(JSON.stringify({ type: "prompt.remove", promptId: "host-owned-edit" }));
+    expect((await participant.messages.next("prompt.removed")).promptId).toBe("host-owned-edit");
+
+    host.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "host-owned-steer", text: "Host follow-up" }));
+    await participant.messages.next("prompt.queued");
+    participant.socket.send(JSON.stringify({ type: "prompt.steer", promptId: "host-owned-steer" }));
+    expect((await host.messages.next("prompt.steer")).prompt).toMatchObject({ participantName: "Ada", text: "Host follow-up" });
+    host.socket.send(JSON.stringify({ type: "relay.prompt.steered", promptId: "host-owned-steer" }));
+    expect((await participant.messages.next("prompt.steered")).prompt.promptId).toBe("host-owned-steer");
+
     participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "queued-steer", text: "Original follow-up" }));
     await participant.messages.next("prompt.queued");
     participant.socket.send(JSON.stringify({ type: "prompt.update", promptId: "queued-steer", text: "Use the focused fix" }));

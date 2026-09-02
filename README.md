@@ -18,7 +18,7 @@ Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 - The relay generates a random `XXXXX-XXXXX` locator; a separate high-entropy invitation secret encrypts application payloads end to end.
 - Each originating IP can host at most five active rooms.
 - Observer, prompter, and reviewer capabilities are controlled by the host.
-- Prompts from all participants execute through one FIFO queue.
+- Prompts from all participants execute through one FIFO queue. Any participant with prompter access can edit, remove, or steer any queued prompt, including one submitted by the host.
 - The selected agent runs in a temporary isolated worktree; accepted results are applied only to the host checkout.
 - VS Code participants receive the host's published file tree in a separate MultiCode-managed mirror; their existing folders are never overwritten.
 - The public relay sees routing metadata and encrypted payload sizes, not prompts, agent output, previews, proposals, or workspace contents.

@@ -818,7 +818,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         copy.append(node('div', 'queue-meta', settings));
         row.append(copy);
 
-        if (item.owned) {
+        if (state.canManageQueue) {
           const actions = node('div', 'queue-actions');
           const edit = node('button', 'queue-action', 'Edit');
           edit.title = 'Edit queued prompt';
@@ -839,7 +839,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         }
         card.append(row);
 
-        if (item.owned && editingQueuePromptId === item.id) {
+        if (state.canManageQueue && editingQueuePromptId === item.id) {
           const editor = node('div', 'queue-editor');
           const textarea = node('textarea');
           textarea.value = queuedPromptDraft;

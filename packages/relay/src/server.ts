@@ -332,10 +332,10 @@ class CentralRoom {
     }
     if (participantMessage.type === "prompt.update" || participantMessage.type === "prompt.remove" || participantMessage.type === "prompt.steer") {
       if (!this.allowRate(socket, "queue", 60, 60_000)) { send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }
+      if (!participant.capabilities.includes("prompter")) { send(socket, { type: "room.error", message: "Participant does not have prompter capability" }); return; }
       const index = this.queue.findIndex((prompt) => prompt.promptId === participantMessage.promptId);
       const queued = this.queue[index];
       if (!queued) { send(socket, { type: "room.error", message: "Queued prompt was not found" }); return; }
-      if (queued.participantId !== participant.id) { send(socket, { type: "room.error", message: "Only the prompt owner can change it" }); return; }
       if (this.steeringPromptIds.has(queued.promptId)) { send(socket, { type: "room.error", message: "That prompt is already steering the active turn" }); return; }
       if (participantMessage.type === "prompt.update") {
         const updated: QueuedPrompt = {

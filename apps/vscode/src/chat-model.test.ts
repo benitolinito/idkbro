@@ -76,7 +76,10 @@ describe("ChatModel", () => {
     const model = new ChatModel();
     model.handle(welcome());
     model.handle({ type: "prompt.queued", prompt, position: 1 });
-    expect(model.snapshot().queue).toEqual([{ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop", owned: false }]);
+    expect(model.snapshot()).toMatchObject({
+      canManageQueue: true,
+      queue: [{ id: "prompt-1", name: "Ada", text: "Fix the reconnect loop", owned: false }],
+    });
 
     model.handle({ type: "prompt.started", prompt });
     model.handle({ type: "prompt.started", prompt });

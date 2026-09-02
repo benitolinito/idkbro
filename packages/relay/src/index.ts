@@ -342,10 +342,10 @@ export class RoomRelay {
     if (parsed.data.type === "prompt.update" || parsed.data.type === "prompt.remove" || parsed.data.type === "prompt.steer") {
       const queueAction = parsed.data;
       if (!this.allowRate(state, "queue", 60, 60_000)) { this.send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }
+      if (!state.participant.capabilities.includes("prompter")) { this.send(socket, { type: "room.error", message: "Participant does not have prompter capability" }); return; }
       const index = this.queue.findIndex((prompt) => prompt.promptId === queueAction.promptId);
       const queued = this.queue[index];
       if (!queued) { this.send(socket, { type: "room.error", message: "Queued prompt was not found" }); return; }
-      if (queued.participantId !== state.participant.id) { this.send(socket, { type: "room.error", message: "Only the prompt owner can change it" }); return; }
       if (this.steeringPromptIds.has(queued.promptId)) { this.send(socket, { type: "room.error", message: "That prompt is already steering the active turn" }); return; }
       if (queueAction.type === "prompt.update") {
         const updated: QueuedPrompt = {

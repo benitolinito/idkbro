@@ -118,7 +118,7 @@ describe("RoomRelay", () => {
     expect(lateClient.welcome.participants.map((participant) => participant.name)).toEqual(["Ada", "Grace", "Linus"]);
   });
 
-  it("lets a prompt owner edit, steer, and remove queued prompts", async () => {
+  it("lets a prompter edit, steer, and remove prompts queued by the host", async () => {
     const steered: string[] = [];
     const relay = new RoomRelay({
       roomId: "room-queue",
@@ -136,19 +136,21 @@ describe("RoomRelay", () => {
     client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "active", text: "First" }));
     await client.messages.next("prompt.queued");
     await client.messages.next("prompt.started");
-    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "queued", text: "Original" }));
+    const queuedPromptId = randomUUID();
+    relay.submitHostPrompt("Original", queuedPromptId);
     await client.messages.next("prompt.queued");
 
-    client.socket.send(JSON.stringify({ type: "prompt.update", promptId: "queued", text: "Steer with this" }));
+    client.socket.send(JSON.stringify({ type: "prompt.update", promptId: queuedPromptId, text: "Steer with this" }));
     expect((await client.messages.next("prompt.updated")).prompt.text).toBe("Steer with this");
-    client.socket.send(JSON.stringify({ type: "prompt.steer", promptId: "queued" }));
-    expect((await client.messages.next("prompt.steered")).prompt.promptId).toBe("queued");
+    client.socket.send(JSON.stringify({ type: "prompt.steer", promptId: queuedPromptId }));
+    expect((await client.messages.next("prompt.steered")).prompt.promptId).toBe(queuedPromptId);
     expect(steered).toEqual(["Steer with this"]);
 
-    client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: "remove-me", text: "Remove me" }));
+    const removedPromptId = randomUUID();
+    relay.submitHostPrompt("Remove me", removedPromptId);
     await client.messages.next("prompt.queued");
-    client.socket.send(JSON.stringify({ type: "prompt.remove", promptId: "remove-me" }));
-    expect((await client.messages.next("prompt.removed")).promptId).toBe("remove-me");
+    client.socket.send(JSON.stringify({ type: "prompt.remove", promptId: removedPromptId }));
+    expect((await client.messages.next("prompt.removed")).promptId).toBe(removedPromptId);
   });
 
   it("rejects an invalid invite token", async () => {
