@@ -17,6 +17,7 @@
   --mono: "DM Mono", "SFMono-Regular", Consolas, monospace;
   --sans: "Manrope", Inter, ui-sans-serif, system-ui, sans-serif;
 }
+
 :root[data-theme="dark"] {
   color-scheme: dark;
   --ink: #f2f4f8;
@@ -69,15 +70,21 @@ p { margin: 0; }
 .nav-links > a:not(.button)::after { position: absolute; bottom: -5px; left: 0; width: 100%; height: 1px; content: ""; transform: scaleX(0); transform-origin: right; background: currentColor; transition: transform .25s ease; }
 .nav-links > a:not(.button):hover::after { transform: scaleX(1); transform-origin: left; }
 .nav-github { padding-left: 27px; border-left: 1px solid var(--line); }
-.theme-toggle { display: inline-flex; width: 37px; height: 37px; flex: 0 0 auto; align-items: center; justify-content: center; padding: 0; border: 1px solid var(--line); border-radius: 50%; color: var(--ink); background: rgba(255,255,255,.32); cursor: pointer; transition: color .2s ease, background .2s ease, border-color .2s ease, transform .2s ease; }
-.theme-toggle:hover { border-color: rgba(17,19,24,.3); background: rgba(255,255,255,.65); transform: translateY(-1px); }
-.theme-toggle:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
-.theme-toggle span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
-.theme-icon { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-.theme-icon-moon { fill: currentColor; stroke: none; }
-.theme-icon-sun { display: none; }
-:root[data-theme="dark"] .theme-icon-moon { display: none; }
-:root[data-theme="dark"] .theme-icon-sun { display: block; }
+.theme-toggle { display: inline-flex; flex: 0 0 auto; align-items: center; padding: 0; border: 0; color: var(--ink); background: transparent; cursor: pointer; }
+.theme-toggle-track { position: relative; display: grid; width: 64px; height: 34px; grid-template-columns: 1fr 1fr; align-items: center; padding: 3px; border: 1px solid rgba(17,19,24,.14); border-radius: 999px; background: rgba(255,255,255,.48); box-shadow: inset 0 1px 2px rgba(17,19,24,.06), 0 1px 0 rgba(255,255,255,.45); transition: border-color .25s ease, background .25s ease, box-shadow .25s ease; }
+.theme-toggle-thumb { position: absolute; z-index: 1; top: 3px; left: 3px; width: 26px; height: 26px; border-radius: 50%; background: #fff; box-shadow: 0 2px 7px rgba(17,19,24,.2), 0 0 0 1px rgba(17,19,24,.04); transition: transform .3s cubic-bezier(.2,.8,.2,1), background .25s ease, box-shadow .25s ease; }
+.theme-toggle-icon { position: relative; z-index: 2; display: grid; height: 26px; place-items: center; color: #737985; font: 18px/1 Georgia, serif; transition: color .25s ease, opacity .25s ease, transform .3s ease; }
+.theme-toggle-sun { color: #d38514; transform: rotate(0); }
+.theme-toggle-moon { opacity: .55; }
+.theme-toggle-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+.theme-toggle:hover .theme-toggle-track { border-color: rgba(17,19,24,.27); background: rgba(255,255,255,.72); box-shadow: inset 0 1px 2px rgba(17,19,24,.07), 0 4px 12px rgba(17,19,24,.08); }
+.theme-toggle:hover .theme-toggle-sun { transform: rotate(18deg); }
+.theme-toggle:active .theme-toggle-thumb { width: 29px; }
+.theme-toggle:focus-visible { outline: none; }
+.theme-toggle:focus-visible .theme-toggle-track { outline: 2px solid var(--blue); outline-offset: 3px; }
+:root[data-theme="dark"] .theme-toggle-thumb { background: #edf2ff; box-shadow: 0 2px 9px rgba(0,0,0,.45); transform: translateX(30px); }
+:root[data-theme="dark"] .theme-toggle-sun { color: #777f8e; opacity: .55; }
+:root[data-theme="dark"] .theme-toggle-moon { color: #365fbd; opacity: 1; transform: rotate(-10deg); }
 .menu-button { display: none; width: 42px; height: 42px; border: 0; border-radius: 50%; background: var(--ink); }
 .menu-button span:not(.sr-only) { display: block; width: 17px; height: 1px; margin: 5px auto; background: white; transition: transform .2s ease; }
 
@@ -393,8 +400,8 @@ p { margin: 0; }
 :root[data-theme="dark"] .site-header.scrolled { background: rgba(14,16,21,.9); }
 :root[data-theme="dark"] .site-header .brand img { padding: 2px; border-radius: 7px; background: #f8f8f5; }
 :root[data-theme="dark"] .nav-links > a:not(.button) { color: #c9ced7; }
-:root[data-theme="dark"] .theme-toggle { background: rgba(255,255,255,.04); }
-:root[data-theme="dark"] .theme-toggle:hover { border-color: rgba(255,255,255,.3); background: rgba(255,255,255,.1); }
+:root[data-theme="dark"] .theme-toggle-track { border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.065); box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 1px 0 rgba(255,255,255,.04); }
+:root[data-theme="dark"] .theme-toggle:hover .theme-toggle-track { border-color: rgba(255,255,255,.28); background: rgba(255,255,255,.1); box-shadow: inset 0 1px 2px rgba(0,0,0,.3), 0 5px 16px rgba(0,0,0,.24); }
 :root[data-theme="dark"] .menu-button { color: #0e1015; background: var(--ink); }
 :root[data-theme="dark"] .menu-button span:not(.sr-only) { background: #0e1015; }
 :root[data-theme="dark"] .button-dark { color: #0e1015; background: var(--ink); }
@@ -470,11 +477,9 @@ p { margin: 0; }
   .nav-links { position: fixed; inset: 65px 0 0; display: flex; visibility: hidden; flex-direction: column; align-items: flex-start; gap: 0; padding: 30px 24px; opacity: 0; background: var(--paper); transition: opacity .2s ease, visibility .2s ease; }
   .nav-links.open { visibility: visible; opacity: 1; }
   .nav-links > a { width: 100%; padding: 16px 0; border-bottom: 1px solid var(--line); font-size: 18px; }
-  .theme-toggle { width: 100%; height: auto; justify-content: flex-start; gap: 12px; padding: 16px 0; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; font-size: 18px; font-weight: 600; }
-  .theme-toggle:hover { border-color: var(--line); background: transparent; transform: none; }
-  .theme-toggle span { position: static; width: auto; height: auto; overflow: visible; clip: auto; }
-  :root[data-theme="dark"] .theme-toggle,
-  :root[data-theme="dark"] .theme-toggle:hover { background: transparent; }
+  .theme-toggle { width: 100%; min-height: 61px; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 18px; font-weight: 600; }
+  .theme-toggle-track { order: 2; }
+  .theme-toggle-label { position: static; width: auto; height: auto; overflow: visible; clip: auto; }
   .nav-links > a.button { margin-top: 25px; padding: 0 20px; font-size: 13px; }
   .nav-github { padding-left: 0; border-left: 0; }
   .hero { min-height: 0; padding-top: 130px; padding-bottom: 80px; }

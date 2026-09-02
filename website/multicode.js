@@ -15,15 +15,17 @@ const getSavedTheme = () => {
 };
 
 const applyTheme = (theme, persist = false) => {
+  if (theme !== "light" && theme !== "dark") return;
   document.documentElement.dataset.theme = theme;
   document.documentElement.style.colorScheme = theme;
   if (themeColor) themeColor.content = theme === "dark" ? "#0e1015" : "#f5f2ea";
 
   const nextTheme = theme === "dark" ? "light" : "dark";
+  themeButton?.setAttribute("aria-pressed", String(theme === "dark"));
   themeButton?.setAttribute("aria-label", `Switch to ${nextTheme} mode`);
   themeButton?.setAttribute("title", `Switch to ${nextTheme} mode`);
   const label = themeButton?.querySelector("[data-theme-label]");
-  if (label) label.textContent = `Use ${nextTheme} mode`;
+  if (label) label.textContent = `${nextTheme[0].toUpperCase()}${nextTheme.slice(1)} mode`;
 
   if (persist) {
     try {
@@ -38,9 +40,16 @@ themeButton?.addEventListener("click", () => {
   const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   applyTheme(theme, true);
 });
-colorSchemeQuery.addEventListener("change", (event) => {
+
+const handleSystemThemeChange = (event) => {
   if (!getSavedTheme()) applyTheme(event.matches ? "dark" : "light");
-});
+};
+
+if (typeof colorSchemeQuery.addEventListener === "function") {
+  colorSchemeQuery.addEventListener("change", handleSystemThemeChange);
+} else {
+  colorSchemeQuery.addListener(handleSystemThemeChange);
+}
 
 window.addEventListener("storage", (event) => {
   if (event.key !== "multicode-theme") return;
