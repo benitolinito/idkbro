@@ -79,7 +79,8 @@ class MultiCodeController implements vscode.Disposable {
         void vscode.commands.executeCommand("git.refresh");
       }
     }, (turnId, revision, diff) => this.chat.previewWorkspaceDiff(turnId, revision, diff),
-    (workspace) => this.workspaceSynchronized(workspace), context.globalStorageUri.fsPath);
+    (workspace) => this.workspaceSynchronized(workspace), context.globalStorageUri.fsPath,
+    (event, details) => this.output.appendLine(`[${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`));
     this.status.name = "MultiCode";
     this.status.command = "multicode.host";
     this.setIdle();

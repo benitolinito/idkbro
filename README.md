@@ -211,6 +211,14 @@ docker compose -f deploy/compose.yaml up -d --build
 docker compose -f deploy/compose.yaml down
 ```
 
+Relay diagnostics are emitted as one structured JSON object per line. They cover relay and room lifecycle, participant joins and disconnects, queue mutations, synchronized agent settings, turn boundaries, and workspace checkpoint transfers. Inspect them with:
+
+```bash
+docker compose -f deploy/compose.yaml logs -f relay
+```
+
+The VS Code **MultiCode** output channel records corresponding client connection, queue-action, settings, and workspace synchronization metadata. Diagnostic logs intentionally omit prompt contents, invite secrets, credentials, and encrypted payloads.
+
 Optional limits can be changed in `deploy/.env`:
 
 ```dotenv

@@ -31,7 +31,18 @@ export interface RelayServerOptions {
   maxParticipantsPerRoom?: number;
   authenticationTimeoutMs?: number;
   store?: RelayRoomStore;
+  logger?: RelayLogger;
 }
+
+export type RelayLogLevel = "info" | "warn" | "error";
+export type RelayLogger = (level: RelayLogLevel, event: string, details: Record<string, unknown>) => void;
+
+const defaultLogger: RelayLogger = (level, event, details) => {
+  const entry = JSON.stringify({ timestamp: new Date().toISOString(), level, component: "relay", event, ...details });
+  if (level === "error") console.error(entry);
+  else if (level === "warn") console.warn(entry);
+  else console.log(entry);
+};
 
 const roomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -135,6 +146,7 @@ class CentralRoom {
     private readonly maxParticipants: number,
     private readonly persistEvent: (event: { id: string; kind: string; payload: string }) => Promise<void>,
     private readonly onClosed: () => void,
+    private readonly log: RelayLogger,
   ) {
     this.hostSocket = hostSocket;
     this.host = {
@@ -158,6 +170,7 @@ class CentralRoom {
     if (this.hostSocket.readyState === WebSocket.OPEN) this.hostSocket.close(4000, "Host connection replaced");
     this.checkpointTransfers.clear();
     this.hostSocket = socket; this.attachHost(socket);
+    this.log("info", "room.host_resumed", { roomId: this.roomId, participants: this.participants.size + 1, queuedPrompts: this.queue.length, activePromptId: this.activePrompt?.promptId });
     send(socket, { type: "room.welcome", roomId: this.roomId, selfId: this.host.id, participants: [this.host, ...this.participants.values()], activePrompt: this.activePrompt, queue: [...this.queue], latestDiff: this.latestDiff, latestCheckpoint: this.latestCheckpoint, collabHistory: [...this.collabHistory], ...(this.agentConfig ? { agentConfig: this.agentConfig } : {}) });
     if (this.latestCheckpoint) this.broadcast({ type: "workspace.checkpoint.available", checkpoint: this.latestCheckpoint }, socket);
   }
@@ -167,7 +180,8 @@ class CentralRoom {
     socket.on("message", (data) => { if (this.hostSocket === socket) this.receiveHost(data.toString()); });
     const disconnected = (code?: number) => {
       if (this.hostSocket !== socket || this.closed) return;
-      if (code === 1000) { this.close("Host stopped room"); return; }
+      if (code === 1000) { this.log("info", "room.host_disconnected", { roomId: this.roomId, code, graceful: true }); this.close("Host stopped room"); return; }
+      this.log("warn", "room.host_disconnected", { roomId: this.roomId, code, graceful: false, resumeWindowMs: 30_000 });
       this.broadcast({ type: "room.error", message: "Host connection interrupted; waiting for it to resume" }, socket);
       this.hostDisconnectTimer = setTimeout(() => this.close("Host did not reconnect"), 30_000); this.hostDisconnectTimer.unref();
     };
@@ -207,6 +221,7 @@ class CentralRoom {
   close(reason = "Room closed"): void {
     if (this.closed) return;
     this.closed = true;
+    this.log("info", "room.closed", { roomId: this.roomId, reason, participants: this.participants.size + 1, queuedPrompts: this.queue.length, hadActivePrompt: Boolean(this.activePrompt) });
     if (this.hostDisconnectTimer) clearTimeout(this.hostDisconnectTimer); this.hostDisconnectTimer = undefined;
     for (const socket of this.participants.keys()) {
       send(socket, { type: "room.error", message: reason, fatal: true });
@@ -232,6 +247,7 @@ class CentralRoom {
       protocolCapabilities,
     };
     this.participants.set(socket, participant);
+    this.log("info", "participant.joined", { roomId: this.roomId, participantId: participant.id, role: requestedRole, capabilities: participant.capabilities, protocolCapabilities, participants: this.participants.size + 1 });
     send(socket, {
       type: "room.welcome",
       roomId: this.roomId,
@@ -287,6 +303,7 @@ class CentralRoom {
         return;
       }
       this.agentConfig = { ...this.agentConfig, model: participantMessage.model, effort: participantMessage.effort };
+      this.log("info", "agent.settings_updated", { roomId: this.roomId, participantId: participant.id, model: participantMessage.model, effort: participantMessage.effort });
       this.broadcast({ type: "agent.config", config: this.agentConfig });
       return;
     }
@@ -345,16 +362,19 @@ class CentralRoom {
           ...(participantMessage.effort ? { effort: participantMessage.effort } : {}),
         };
         this.queue[index] = updated;
+        this.log("info", "queue.prompt_updated", { roomId: this.roomId, promptId: queued.promptId, actorParticipantId: participant.id, ownerParticipantId: queued.participantId, model: updated.model, effort: updated.effort, queuePosition: index + 1 });
         this.broadcast({ type: "prompt.updated", prompt: updated });
         return;
       }
       if (participantMessage.type === "prompt.remove") {
         this.queue.splice(index, 1);
+        this.log("info", "queue.prompt_removed", { roomId: this.roomId, promptId: queued.promptId, actorParticipantId: participant.id, ownerParticipantId: queued.participantId, queuePosition: index + 1 });
         this.broadcast({ type: "prompt.removed", promptId: queued.promptId });
         return;
       }
       if (!this.activePrompt) { send(socket, { type: "room.error", message: "There is no active turn to steer" }); return; }
       this.steeringPromptIds.add(queued.promptId);
+      this.log("info", "queue.prompt_steer_requested", { roomId: this.roomId, promptId: queued.promptId, actorParticipantId: participant.id, ownerParticipantId: queued.participantId, activePromptId: this.activePrompt.promptId });
       send(this.hostSocket, { type: "prompt.steer", prompt: queued });
       return;
     }
@@ -402,6 +422,7 @@ class CentralRoom {
         break;
       case "relay.agent.config":
         this.agentConfig = message.config;
+        this.log("info", "agent.config_published", { roomId: this.roomId, provider: message.config.provider, model: message.config.model, effort: message.config.effort, availableModels: message.config.models.length });
         this.broadcast({ type: "agent.config", config: message.config }, this.hostSocket);
         break;
       case "relay.agent.event":
@@ -410,6 +431,9 @@ class CentralRoom {
           return;
         }
         this.broadcast({ type: "agent.event", event: message.event }, this.hostSocket);
+        if (message.event.type === "turn.started" || message.event.type === "turn.completed" || message.event.type === "agent.error" || message.event.type === "agent.exited") {
+          this.log(message.event.type === "agent.error" ? "error" : "info", `agent.${message.event.type.replace("agent.", "")}`, { roomId: this.roomId, type: message.event.type, turnId: "turnId" in message.event ? message.event.turnId : undefined, status: message.event.type === "turn.completed" ? message.event.status : undefined });
+        }
         if (message.event.type === "turn.completed" && message.event.status !== "pending-conflict") {
           this.activePrompt = null;
           this.dispatchNext();
@@ -508,6 +532,7 @@ class CentralRoom {
 
   private enqueue(prompt: QueuedPrompt): void {
     this.queue.push(prompt);
+    this.log("info", "queue.prompt_queued", { roomId: this.roomId, promptId: prompt.promptId, ownerParticipantId: prompt.participantId, model: prompt.model, effort: prompt.effort, queueDepth: this.queue.length, hasActivePrompt: Boolean(this.activePrompt) });
     this.broadcast({
       type: "prompt.queued",
       prompt,
@@ -590,6 +615,7 @@ class CentralRoom {
     }
     if (!targetParticipantId) {
       this.latestCheckpoint = transfer.descriptor;
+      this.log("info", "workspace.checkpoint_published", { roomId: this.roomId, sequence, commit: transfer.descriptor.commit.slice(0, 12), bundleBytes: transfer.descriptor.bundleBytes, chunkCount: transfer.descriptor.chunkCount });
       this.collabHistory.length = 0;
       for (const participant of this.participants.values()) {
         if (!participant.protocolCapabilities?.includes("workspace-mirror-v1")) continue;
@@ -620,6 +646,7 @@ class CentralRoom {
     const prompt = this.queue.shift();
     if (!prompt) return;
     this.activePrompt = prompt;
+    this.log("info", "queue.prompt_started", { roomId: this.roomId, promptId: prompt.promptId, ownerParticipantId: prompt.participantId, model: prompt.model, effort: prompt.effort, remainingQueueDepth: this.queue.length });
     this.broadcast({ type: "prompt.started", prompt });
   }
 
@@ -627,6 +654,7 @@ class CentralRoom {
     const participant = this.participants.get(socket);
     if (!participant) return;
     this.participants.delete(socket);
+    this.log("info", "participant.left", { roomId: this.roomId, participantId: participant.id, participants: this.participants.size + 1 });
     this.broadcast({ type: "participant.left", participantId: participant.id, name: participant.name });
     this.dispatchNext();
   }
@@ -649,12 +677,14 @@ export class RelayServer {
   private readonly maxRoomsPerIp: number;
   private readonly maxParticipantsPerRoom: number;
   private readonly authenticationTimeoutMs: number;
+  private readonly log: RelayLogger;
 
   constructor(private readonly options: RelayServerOptions) {
     this.maxRooms = options.maxRooms ?? 100;
     this.maxRoomsPerIp = options.maxRoomsPerIp ?? 5;
     this.maxParticipantsPerRoom = Math.max(2, options.maxParticipantsPerRoom ?? 32);
     this.authenticationTimeoutMs = options.authenticationTimeoutMs ?? 5_000;
+    this.log = options.logger ?? defaultLogger;
   }
 
   async listen(options: { host: string; port: number }): Promise<{ host: string; port: number }> {
@@ -709,6 +739,7 @@ export class RelayServer {
       throw error;
     }
     const address = httpServer.address() as AddressInfo;
+    this.log("info", "relay.listening", { host: options.host, port: address.port, maxRooms: this.maxRooms, maxRoomsPerIp: this.maxRoomsPerIp, maxParticipantsPerRoom: this.maxParticipantsPerRoom, persistenceEnabled: Boolean(this.options.store) });
     this.heartbeatTimer = setInterval(() => {
       for (const socket of webSocketServer.clients) {
         if (socket.readyState === WebSocket.OPEN) socket.ping();
@@ -719,6 +750,7 @@ export class RelayServer {
   }
 
   async close(): Promise<void> {
+    this.log("info", "relay.stopping", { rooms: this.rooms.size, connections: this.webSocketServer?.clients.size ?? 0 });
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
     for (const room of this.rooms.values()) room.close("Relay shutting down");
@@ -736,6 +768,7 @@ export class RelayServer {
     }
     if (httpServer) await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     await this.options.store?.close();
+    this.log("info", "relay.stopped", {});
   }
 
   private async acceptHost(socket: WebSocket, ownerIp: string): Promise<void> {
@@ -756,7 +789,7 @@ export class RelayServer {
       }
       if (parsed.data.type === "relay.room.resume") {
         const room = this.rooms.get(canonicalRoomCode(parsed.data.roomId));
-        if (!room || !secretMatches(room.resumeToken, parsed.data.resumeToken)) { reject(socket, "Invalid room resume credentials", 4003); return; }
+        if (!room || !secretMatches(room.resumeToken, parsed.data.resumeToken)) { this.log("warn", "room.resume_rejected", { roomId: canonicalRoomCode(parsed.data.roomId), reason: "invalid_credentials" }); reject(socket, "Invalid room resume credentials", 4003); return; }
         room.resume(socket); send(socket, { type: "relay.room.created", roomId: room.roomId, code: room.code, resumeToken: room.resumeToken, resumed: true }); return;
       }
       if (this.rooms.size >= this.maxRooms) {
@@ -782,13 +815,15 @@ export class RelayServer {
         this.authenticationTimeoutMs,
         this.maxParticipantsPerRoom,
         (event) => this.options.store?.appendEvent(roomId, event) ?? Promise.resolve(),
-        () => { this.rooms.delete(roomId); void this.options.store?.roomClosed(roomId); },
+        () => { this.rooms.delete(roomId); this.log("info", "room.removed", { roomId, rooms: this.rooms.size }); void this.options.store?.roomClosed(roomId); },
+        this.log,
       );
       this.rooms.set(roomId, room);
       try { await this.options.store?.roomOpened({ roomId, ownerIp }); } catch (error) {
         this.rooms.delete(roomId); room.close("Relay persistence failed"); reject(socket, error instanceof Error ? error.message : "Relay persistence failed", 1011); return;
       }
       send(socket, { type: "relay.room.created", roomId, code, resumeToken: room.resumeToken });
+      this.log("info", "room.created", { roomId, hostName: creation.name, rooms: this.rooms.size });
     })(); });
     socket.once("close", () => clearTimeout(timer));
   }
@@ -796,6 +831,7 @@ export class RelayServer {
   private acceptParticipant(socket: WebSocket, roomId: string): void {
     const room = this.rooms.get(roomId);
     if (!room) {
+      this.log("warn", "participant.join_rejected", { roomId, reason: "room_not_found" });
       reject(socket, "Room not found", 4004);
       return;
     }
@@ -803,6 +839,7 @@ export class RelayServer {
   }
 
   private rejectUpgrade(socket: Duplex): void {
+    this.log("warn", "relay.upgrade_rejected", { reason: "unknown_path" });
     socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     socket.destroy();
   }

@@ -50,7 +50,8 @@ describe("RelayServer", () => {
   });
 
   it("routes queued prompts and agent events through outbound connections", async () => {
-    const server = new RelayServer({});
+    const logs: Array<{ level: string; event: string; details: Record<string, unknown> }> = [];
+    const server = new RelayServer({ logger: (level, event, details) => logs.push({ level, event, details }) });
     servers.push(server);
     const { port } = await server.listen({ host: "127.0.0.1", port: 0 });
 
@@ -142,6 +143,22 @@ describe("RelayServer", () => {
     const preview = { id: randomUUID(), kind: "agent.preview", payload: "encrypted-preview" } as const;
     host.socket.send(JSON.stringify({ type: "relay.collab.event", event: preview }));
     expect((await participant.messages.next("collab.event")).event).toEqual(preview);
+
+    expect(logs.map((entry) => entry.event)).toEqual(expect.arrayContaining([
+      "relay.listening",
+      "room.created",
+      "participant.joined",
+      "agent.config_published",
+      "agent.settings_updated",
+      "queue.prompt_queued",
+      "queue.prompt_updated",
+      "queue.prompt_removed",
+      "queue.prompt_steer_requested",
+      "queue.prompt_started",
+    ]));
+    const serializedLogs = JSON.stringify(logs);
+    expect(serializedLogs).not.toContain("Fix the test");
+    expect(serializedLogs).not.toContain("opaque-ciphertext");
   });
 
   it("persists shared model and reasoning settings for users who join later", async () => {

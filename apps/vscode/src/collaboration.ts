@@ -63,6 +63,7 @@ export class CollaborationBridge implements vscode.Disposable {
     private readonly onAgentPreview?: (turnId: string, revision: number, diff: WorkspaceDiff) => void,
     private readonly onWorkspaceSynchronized?: (workspace: MirroredWorkspaceState) => void | Promise<void>,
     private readonly workspaceDataDirectory?: string,
+    private readonly onDiagnostic?: (event: string, details: Record<string, unknown>) => void,
   ) {
     this.disposables = [
       this.previewChanged,
@@ -107,6 +108,7 @@ export class CollaborationBridge implements vscode.Disposable {
     this.requestedCheckpointSequence = 0;
     this.checkpointTransfer = undefined;
     this.deriveKeys(inviteToken);
+    this.diagnostic("connection.requested", { relay: this.safeRelayLabel(relayUrl), room: inviteToken.split(".", 1)[0], role: requestedRole, workspaceDiskOwner });
     this.openConnection("connecting");
   }
 
@@ -146,36 +148,42 @@ export class CollaborationBridge implements vscode.Disposable {
     if (!this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
     const promptId = crypto.randomUUID();
     this.socket.send(JSON.stringify({ type: "prompt.submit", promptId, text: this.sealPrompt(promptId, text), ...settings }));
+    this.diagnostic("queue.prompt_submitted", { promptId, model: settings.model, effort: settings.effort, textLength: text.length });
     return true;
   }
 
   updateAgentSettings(model: string, effort: string): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN || !model || !effort) return false;
     this.socket.send(JSON.stringify({ type: "agent.settings.update", model, effort }));
+    this.diagnostic("agent.settings_update_sent", { model, effort });
     return true;
   }
 
   updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string } = {}): boolean {
     if (!this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ type: "prompt.update", promptId, text: this.sealPrompt(promptId, text), ...settings }));
+    this.diagnostic("queue.prompt_update_sent", { promptId, model: settings.model, effort: settings.effort, textLength: text.length });
     return true;
   }
 
   removeQueuedPrompt(promptId: string): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ type: "prompt.remove", promptId }));
+    this.diagnostic("queue.prompt_remove_sent", { promptId });
     return true;
   }
 
   steerQueuedPrompt(promptId: string): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ type: "prompt.steer", promptId }));
+    this.diagnostic("queue.prompt_steer_sent", { promptId });
     return true;
   }
 
   resolveApproval(requestId: string | number, decision: ApprovalDecision): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ type: "approval.resolve", requestId, decision }));
+    this.diagnostic("approval.response_sent", { requestId, decision });
     return true;
   }
 
@@ -192,6 +200,7 @@ export class CollaborationBridge implements vscode.Disposable {
       ciphertext: ciphertext.toString("base64url"),
     });
     this.socket.send(JSON.stringify({ type: "input.resolve", requestId, payload }));
+    this.diagnostic("input.response_sent", { requestId, cancelled: answers === null, answerFields: answers ? Object.keys(answers).length : 0 });
     return true;
   }
 
@@ -215,6 +224,7 @@ export class CollaborationBridge implements vscode.Disposable {
     socket.on("open", () => {
       if (this.socket !== socket) return;
       this.statusChanged.fire("connected");
+      this.diagnostic("connection.opened", { room: code, role: this.requestedRole });
       socket.send(JSON.stringify({
         type: "room.join",
         token: code,
@@ -236,6 +246,7 @@ export class CollaborationBridge implements vscode.Disposable {
         })
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
+          this.diagnostic("room.message_failed", { message });
           console.error(`MultiCode could not apply a room event: ${message}`);
           if (/workspace checkpoint|workspace mirror|shared workspace/i.test(message)) {
             this.requestedCheckpointSequence = 0;
@@ -244,12 +255,13 @@ export class CollaborationBridge implements vscode.Disposable {
           }
         });
     });
-    socket.on("close", () => {
+    socket.on("close", (code, reason) => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.welcomed = false;
       this.requestedCheckpointSequence = 0;
       this.checkpointTransfer = undefined;
+      this.diagnostic("connection.closed", { code, reason: reason.toString().slice(0, 200), reconnecting: Boolean(this.inviteToken) });
       if (!this.inviteToken) return;
       this.statusChanged.fire("reconnecting");
       this.reconnectTimer = setTimeout(() => {
@@ -269,10 +281,14 @@ export class CollaborationBridge implements vscode.Disposable {
 
   private async receive(raw: string): Promise<void> {
     const message = JSON.parse(raw) as RoomServerMessage;
+    if (message.type !== "agent.encrypted" || !message.eventType.endsWith(".delta")) {
+      this.diagnostic("room.message_received", { type: message.type, eventType: message.type === "agent.encrypted" ? message.eventType : undefined, bytes: Buffer.byteLength(raw) });
+    }
     this.notifyRoomMessage(message);
     if (message.type === "room.welcome") {
       this.welcomed = true;
       this.roomId = message.roomId;
+      this.diagnostic("room.welcomed", { roomId: message.roomId, selfId: message.selfId, participants: message.participants.length, queuedPrompts: message.queue.length, hasActivePrompt: Boolean(message.activePrompt), checkpointSequence: message.latestCheckpoint?.sequence });
       for (const event of message.collabHistory) await this.applyReadOnlyEvent(event, false);
       if (message.latestCheckpoint && "bundleBytes" in message.latestCheckpoint) this.requestWorkspaceCheckpoint(message.latestCheckpoint);
       return;
@@ -309,6 +325,7 @@ export class CollaborationBridge implements vscode.Disposable {
       || checkpoint.sequence <= this.requestedCheckpointSequence
     ) return;
     this.requestedCheckpointSequence = checkpoint.sequence;
+    this.diagnostic("workspace.checkpoint_requested", { sequence: checkpoint.sequence, commit: checkpoint.commit.slice(0, 12), bundleBytes: checkpoint.bundleBytes, chunkCount: checkpoint.chunkCount });
     this.socket.send(JSON.stringify({ type: "workspace.checkpoint.request", sequence: checkpoint.sequence }));
   }
 
@@ -353,7 +370,17 @@ export class CollaborationBridge implements vscode.Disposable {
       },
     });
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: "workspace.ack", sequence, commit: transfer.descriptor.commit }));
+    this.diagnostic("workspace.checkpoint_applied", { sequence, commit: transfer.descriptor.commit.slice(0, 12), bundleBytes: encrypted.byteLength, chunks: transfer.nextIndex });
     await this.onWorkspaceSynchronized?.(workspace);
+  }
+
+  private diagnostic(event: string, details: Record<string, unknown>): void {
+    this.onDiagnostic?.(event, details);
+  }
+
+  private safeRelayLabel(relayUrl: string): string {
+    try { const url = new URL(relayUrl); return `${url.protocol}//${url.host}${url.pathname}`; }
+    catch { return "invalid-relay-url"; }
   }
 
   private notifyRoomMessage(message: RoomServerMessage): void {
