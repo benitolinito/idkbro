@@ -2,6 +2,8 @@
 
 The marketing site is plain HTML, CSS, and JavaScript served by nginx.
 
+Test change verified September 1, 2026.
+
 ## Production deployment
 
 The website and relay share `multicode.luisagd.com`. nginx serves the website

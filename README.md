@@ -1,6 +1,6 @@
 # MultiCode
 
-> Codex workspace check: **working** (verified August 22, 2026).
+> Test changes: **working** (verified September 1, 2026).
 
 MultiCode lets a team co-prompt one Codex or Claude session running against the host's local repository. Participants share the prompt queue, streamed agent activity, approvals, structured questions, change previews, and an encrypted read-only mirror of the host's latest workspace version.
 
@@ -113,7 +113,7 @@ The other person pastes the complete token:
 multicode join K7MNP-4XQ2R.<room-secret>
 ```
 
-Participants can submit prompts and follow encrypted agent activity. VS Code also adds a separate managed folder containing the host's latest verified workspace version; the terminal CLI remains conversation-only. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
+Participants can submit prompts and follow encrypted agent activity. VS Code opens a separate managed workspace containing the host's latest verified version as the participant window's sole root; the terminal CLI remains conversation-only. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
 
 Use names when desired:
 

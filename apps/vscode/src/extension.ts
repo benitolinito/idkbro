@@ -10,6 +10,7 @@ import { parseWorkspaceFileReference } from "./file-link.js";
 import { hostingRepositoryWarning, resolveHostingDirectory } from "./host-workspace.js";
 import { roomSessionFromOutput, roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 import { workspaceHandoffId, workspaceHandoffSecretKey, type WorkspaceHandoff } from "./workspace-handoff.js";
+import { shouldOpenAsSoleWorkspaceRoot } from "./workspace-root.js";
 import type { AgentInputAnswers, AgentProvider, ApprovalDecision } from "@multicode/protocol";
 import { inspectManagedRoomWorktree, inspectRepository, type MirroredWorkspaceState } from "@multicode/workspace";
 
@@ -539,13 +540,11 @@ class MultiCodeController implements vscode.Disposable {
     this.status.tooltip = `Shared workspace synchronized at version ${workspace.sequence}`;
 
     const uri = vscode.Uri.file(workspace.root);
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    if (!folders.some((folder) => path.resolve(folder.uri.fsPath) === path.resolve(workspace.root))) {
-      const added = vscode.workspace.updateWorkspaceFolders(folders.length, 0, {
-        uri,
-        name: `MultiCode Shared · ${this.roomCode?.slice(0, 11) ?? workspace.roomId}`,
-      });
-      if (!added) void vscode.window.showWarningMessage("The shared workspace synchronized, but VS Code could not add it to the Explorer.");
+    const roots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+    if (shouldOpenAsSoleWorkspaceRoot(roots, workspace.root)) {
+      this.status.text = "$(sync~spin) MultiCode: opening shared workspace";
+      await vscode.commands.executeCommand("vscode.openFolder", uri, { forceNewWindow: false });
+      return;
     }
     void vscode.commands.executeCommand("git.refresh");
   }
