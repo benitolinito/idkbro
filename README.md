@@ -158,10 +158,11 @@ cp deploy/.env.example deploy/.env
 docker compose -f deploy/compose.yaml up -d --build
 ```
 
-The container is published only on the Pi's loopback interface:
+nginx is published only on the Pi's loopback interface. It serves the website
+at `/` and proxies the relay routes over the private Compose network:
 
 ```text
-127.0.0.1:7337 -> multicode-relay:7337
+127.0.0.1:7337 -> multicode-website:80 -> multicode-relay:7337
 ```
 
 Check it locally:
@@ -185,6 +186,7 @@ The existing `cloudflared` container uses host networking, so it can reach the l
 Verify the public endpoint:
 
 ```bash
+curl -I https://multicode.luisagd.com/
 curl https://multicode.luisagd.com/health
 ```
 

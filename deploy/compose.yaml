@@ -26,8 +26,6 @@ services:
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     init: true
-    ports:
-      - "127.0.0.1:7337:7337"
     environment:
       MULTICODE_RELAY_HOST: 0.0.0.0
       MULTICODE_RELAY_PORT: 7337
@@ -47,6 +45,33 @@ services:
     stop_grace_period: 10s
     depends_on:
       postgres:
+        condition: service_healthy
+
+  website:
+    container_name: multicode-website
+    image: multicode-website:local
+    build:
+      context: ..
+      dockerfile: website/Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:7337:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=8m
+      - /var/run:size=1m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      relay:
         condition: service_healthy
 
 volumes:
