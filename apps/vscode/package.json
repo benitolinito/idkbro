@@ -2,7 +2,7 @@
   "name": "multicode-vscode",
   "displayName": "MultiCode",
   "description": "Host and join collaborative Codex or Claude sessions from VS Code.",
-  "version": "0.4.8",
+  "version": "0.4.10",
   "private": true,
   "publisher": "multicode",
   "license": "MIT",
@@ -23,6 +23,7 @@
     "pair programming"
   ],
   "main": "./dist/extension.js",
+  "icon": "media/multicode-square.png",
   "dependencies": {
     "@multicode/protocol": "0.0.0",
     "@multicode/workspace": "0.0.0",
@@ -50,7 +51,7 @@
         {
           "id": "multicode",
           "title": "MultiCode",
-          "icon": "media/multicode.svg"
+          "icon": "media/multicode-square.svg"
         }
       ]
     },

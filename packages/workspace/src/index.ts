@@ -716,8 +716,9 @@ export async function createWorkspaceCheckpoint(options: {
 
 /**
  * Create a self-contained snapshot bundle for participants that do not have a
- * clone of the host repository. The synthetic commit deliberately has no
- * parent, so the bundle contains the current tree without disclosing history.
+ * clone of the host repository. The bundle contains a synthetic base commit
+ * and a synthetic current commit, exposing the shared diff without disclosing
+ * any of the host repository's history.
  */
 export async function createPortableWorkspaceCheckpoint(options: {
   cwd: string;
@@ -732,13 +733,16 @@ export async function createPortableWorkspaceCheckpoint(options: {
   const bundlePath = path.join(temporaryDirectory, "workspace.bundle");
   const checkpointRef = `refs/multicode/mirrors/${roomId}`;
   try {
+    const baseTree = await git(repository.root, ["rev-parse", `${options.baseCommit}^{tree}`]);
     const tree = await git(repository.root, ["rev-parse", `${options.sourceCommit}^{tree}`]);
-    const commit = await gitWithEnv(repository.root, ["commit-tree", tree, "-m", `MultiCode mirror ${options.sequence}`], {
+    const identity = {
       GIT_AUTHOR_NAME: "MultiCode",
       GIT_AUTHOR_EMAIL: "multicode@localhost",
       GIT_COMMITTER_NAME: "MultiCode",
       GIT_COMMITTER_EMAIL: "multicode@localhost",
-    });
+    };
+    const base = await gitWithEnv(repository.root, ["commit-tree", baseTree, "-m", "MultiCode mirror base"], identity);
+    const commit = await gitWithEnv(repository.root, ["commit-tree", tree, "-p", base, "-m", `MultiCode mirror ${options.sequence}`], identity);
     await git(repository.root, ["update-ref", checkpointRef, commit]);
     await git(repository.root, ["bundle", "create", bundlePath, checkpointRef]);
     const bundleBytes = await readFile(bundlePath);
@@ -774,12 +778,13 @@ export function decryptWorkspaceCheckpointBundle(key: Buffer, sequence: number, 
 }
 
 interface MirroredWorkspaceMarker {
-  version: 1;
+  version: 1 | 2;
   roomId: string;
   workspacePath: string;
   creationNonce: string;
   sequence: number;
   commit: string;
+  baseCommit?: string;
 }
 
 /**
@@ -804,11 +809,12 @@ export async function applyPortableWorkspaceCheckpoint(options: {
     try {
       marker = JSON.parse(await readFile(markerPath, "utf8")) as MirroredWorkspaceMarker;
       if (
-        marker.version !== 1
+        (marker.version !== 1 && marker.version !== 2)
         || marker.roomId !== roomId
         || path.resolve(marker.workspacePath) !== workspacePath
         || typeof marker.creationNonce !== "string"
         || marker.creationNonce.length < 32
+        || (marker.version === 2 && (typeof marker.baseCommit !== "string" || !marker.baseCommit))
       ) throw new Error("Invalid MultiCode mirror marker");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -825,11 +831,10 @@ export async function applyPortableWorkspaceCheckpoint(options: {
       await git(workspacePath, ["init"]);
     }
 
-    const status = await git(workspacePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
-    if (status) throw new Error("Shared workspace mirror has local changes; refusing to overwrite them");
     if (marker) {
       const currentCommit = await git(workspacePath, ["rev-parse", "HEAD"]);
-      if (currentCommit !== marker.commit) throw new Error("Shared workspace mirror no longer matches its synchronized version");
+      const expectedHead = marker.version === 2 ? marker.baseCommit as string : marker.commit;
+      if (currentCommit !== expectedHead) throw new Error("Shared workspace mirror no longer matches its synchronized version");
       const [currentTree, synchronizedTree] = await Promise.all([
         captureWorkspaceTree(workspacePath),
         git(workspacePath, ["rev-parse", `${marker.commit}^{tree}`]),
@@ -838,6 +843,9 @@ export async function applyPortableWorkspaceCheckpoint(options: {
       if (options.checkpoint.sequence <= marker.sequence) {
         return { roomId, root: workspacePath, sequence: marker.sequence, commit: marker.commit };
       }
+    } else {
+      const status = await git(workspacePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
+      if (status) throw new Error("Shared workspace mirror has local changes; refusing to overwrite them");
     }
 
     await writeFile(bundlePath, Buffer.from(options.checkpoint.bundle, "base64"));
@@ -846,15 +854,21 @@ export async function applyPortableWorkspaceCheckpoint(options: {
     await git(workspacePath, ["fetch", bundlePath, `+${options.checkpoint.ref}:${localRef}`]);
     const receivedCommit = await git(workspacePath, ["rev-parse", localRef]);
     if (receivedCommit !== options.checkpoint.commit) throw new Error("Received workspace checkpoint hash does not match the host");
+    const receivedCommitLine = await git(workspacePath, ["rev-list", "--parents", "-n", "1", receivedCommit]);
+    const receivedCommitParts = receivedCommitLine.split(/\s+/);
+    if (receivedCommitParts.length !== 2) throw new Error("Received workspace checkpoint does not contain a shared base snapshot");
+    const receivedBaseCommit = receivedCommitParts[1] as string;
     await git(workspacePath, ["reset", "--hard", receivedCommit]);
+    await git(workspacePath, ["reset", "--mixed", receivedBaseCommit]);
 
     const nextMarker: MirroredWorkspaceMarker = {
-      version: 1,
+      version: 2,
       roomId,
       workspacePath,
       creationNonce: marker?.creationNonce ?? randomBytes(32).toString("base64url"),
       sequence: options.checkpoint.sequence,
       commit: receivedCommit,
+      baseCommit: receivedBaseCommit,
     };
     const temporaryMarker = `${markerPath}.${randomBytes(12).toString("hex")}.tmp`;
     await writeFile(temporaryMarker, JSON.stringify(nextMarker, null, 2), { mode: 0o600 });

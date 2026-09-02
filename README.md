@@ -40,7 +40,7 @@ build and install it from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.4.7.vsix
+code --install-extension apps/vscode/multicode-vscode-0.4.10.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:
@@ -241,7 +241,7 @@ Run `multicode --help` for operator/development commands. End users only need
 
 The host keeps using the original checkout. MultiCode never moves its branch or resets its index, and a per-repository lease prevents two hosted rooms from owning the checkout at once. The selected agent uses one temporary detached worktree, which is removed when the host stops. Accepted agent changes appear as ordinary changes in the host working tree.
 
-VS Code participants receive encrypted, self-contained workspace checkpoints in a separate MultiCode-managed repository. A checkpoint is applied only when that mirror is clean, and it never resets or edits the participant's existing checkout. Room creation is rejected while the host repository is in the middle of a merge, rebase, cherry-pick, or revert.
+VS Code participants receive encrypted, self-contained workspace checkpoints in a separate MultiCode-managed repository. Its working tree mirrors the host while its synthetic base stays checked out, so the participant sees the shared modified, added, and deleted files in Source Control. A checkpoint is applied only when the mirror still matches its last synchronized projection, and it never resets or edits the participant's existing checkout. Room creation is rejected while the host repository is in the middle of a merge, rebase, cherry-pick, or revert.
 
 ## Development
 

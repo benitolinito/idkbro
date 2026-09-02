@@ -224,6 +224,7 @@ describe("portable workspace mirrors", () => {
     expect(await readFile(path.join(state.root, "shared.txt"), "utf8")).toBe("host version\n");
     expect(await readFile(path.join(state.root, "new.txt"), "utf8")).toBe("visible to both users\n");
     expect((await execFileAsync("git", ["-C", state.root, "rev-list", "--count", "HEAD"])).stdout.trim()).toBe("1");
+    expect((await execFileAsync("git", ["-C", state.root, "status", "--short"])).stdout).toBe(" M shared.txt\n?? new.txt\n");
   });
 
   it("updates a clean mirror but preserves an accidental participant edit", async () => {
@@ -249,6 +250,7 @@ describe("portable workspace mirrors", () => {
     const second = await createPortableWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 2, baseCommit, sourceCommit: secondInternal.commit });
     await applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: "portable-update", checkpoint: second });
     expect(await readFile(path.join(state.root, "file.txt"), "utf8")).toBe("two\n");
+    expect((await execFileAsync("git", ["-C", state.root, "status", "--short"])).stdout).toBe(" M file.txt\n");
 
     await writeFile(path.join(state.root, "file.txt"), "participant edit\n");
     await expect(applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: "portable-update", checkpoint: second })).rejects.toThrow(/local changes/);

@@ -547,6 +547,7 @@ class MultiCodeController implements vscode.Disposable {
       });
       if (!added) void vscode.window.showWarningMessage("The shared workspace synchronized, but VS Code could not add it to the Explorer.");
     }
+    void vscode.commands.executeCommand("git.refresh");
   }
 
   private async persistWorkspaceHandoff(connection: { relay: string; token: string; name: string; role: "viewer" | "participant" }): Promise<void> {
