@@ -80,7 +80,8 @@ class MultiCodeController implements vscode.Disposable {
       }
     }, (turnId, revision, diff) => this.chat.previewWorkspaceDiff(turnId, revision, diff),
     (workspace) => this.workspaceSynchronized(workspace), context.globalStorageUri.fsPath,
-    (event, details) => this.output.appendLine(`[${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`));
+    (event, details) => this.output.appendLine(`[${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`),
+    (message) => this.handleFatalRoomError(message));
     this.status.name = "MultiCode";
     this.status.command = "multicode.host";
     this.setIdle();
@@ -771,6 +772,30 @@ class MultiCodeController implements vscode.Disposable {
     this.recentOutput = "";
     this.setIdle();
     void vscode.commands.executeCommand("setContext", "multicode.connected", false);
+  }
+
+  private async handleFatalRoomError(message: string): Promise<void> {
+    const child = this.process;
+    this.process = undefined;
+    child?.kill("SIGINT");
+    this.pendingCollaboration = undefined;
+    this.activeCollaboration = undefined;
+    try {
+      await this.forgetWorkspaceHandoff();
+    } catch (error) {
+      this.output.appendLine(`Could not remove the expired room handoff: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    this.mode = undefined;
+    this.roomCode = undefined;
+    this.roomWorkspace = undefined;
+    this.roomSessionId = undefined;
+    this.roomWorkspaceReady = false;
+    this.stopping = false;
+    this.recentOutput = "";
+    this.chat.reset();
+    this.setIdle();
+    void vscode.commands.executeCommand("setContext", "multicode.connected", false);
+    void vscode.window.showErrorMessage(`MultiCode room ended: ${message}`);
   }
 
   private validRoomToken(value: string): boolean {

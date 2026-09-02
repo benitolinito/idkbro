@@ -73,6 +73,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
   ready(roomLabel: string): void { this.model.ready(roomLabel); this.publish(); }
   stopping(): void { this.model.stopping(); this.publish(); }
   stopped(message?: string): void { this.model.stopped(message); this.publish(); }
+  reset(): void { this.model.reset(); this.publish(); }
   fail(message: string): void { this.model.fail(message); this.publish(); }
   submitted(name: string, text: string): void { this.model.submitted(name, text); this.publish(); }
   previewWorkspaceDiff(turnId: string, revision: number, diff: WorkspaceDiff): void { this.model.previewWorkspaceDiff(turnId, revision, diff); this.publish(); }

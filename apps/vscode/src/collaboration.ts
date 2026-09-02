@@ -64,6 +64,7 @@ export class CollaborationBridge implements vscode.Disposable {
     private readonly onWorkspaceSynchronized?: (workspace: MirroredWorkspaceState) => void | Promise<void>,
     private readonly workspaceDataDirectory?: string,
     private readonly onDiagnostic?: (event: string, details: Record<string, unknown>) => void,
+    private readonly onFatalRoomError?: (message: string) => void | Promise<void>,
   ) {
     this.disposables = [
       this.previewChanged,
@@ -307,6 +308,12 @@ export class CollaborationBridge implements vscode.Disposable {
     }
     if (message.type === "workspace.checkpoint.complete") {
       await this.completeWorkspaceCheckpoint(message.sequence);
+      return;
+    }
+    if (message.type === "room.error" && message.fatal) {
+      this.diagnostic("connection.fatal", { message: message.message });
+      this.disconnect();
+      await this.onFatalRoomError?.(message.message);
       return;
     }
     if (message.type === "room.error" && !message.fatal && /host connection interrupted/i.test(message.message)) {
