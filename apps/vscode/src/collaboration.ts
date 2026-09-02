@@ -44,7 +44,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private relayUrl = "";
   private inviteToken = "";
   private displayName = "";
-  private requestedRole: "viewer" | "editor" = "editor";
+  private requestedRole: "viewer" | "participant" = "participant";
   private contentKey: Buffer | undefined;
   private promptKey: Buffer | undefined;
   private welcomed = false;
@@ -74,7 +74,7 @@ export class CollaborationBridge implements vscode.Disposable {
     relayUrl: string,
     inviteToken: string,
     name: string,
-    requestedRole: "viewer" | "editor" = "editor",
+    requestedRole: "viewer" | "participant" = "participant",
     _workspaceDiskOwner?: unknown,
     _captureLocalText?: boolean,
   ): void {
@@ -177,7 +177,7 @@ export class CollaborationBridge implements vscode.Disposable {
   private deriveKeys(inviteToken: string): void {
     const [code, secret] = inviteToken.split(".", 2);
     if (!code || !secret) throw new Error("Invalid MultiCode room token");
-    this.contentKey = Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(code), Buffer.from("multicode/v2/editor"), 32));
+    this.contentKey = Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(code), Buffer.from("multicode/v2/content"), 32));
     this.promptKey = Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(code.replace(/-/g, "").toUpperCase()), Buffer.from("multicode/v2/transport"), 32));
   }
 

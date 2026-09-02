@@ -76,7 +76,7 @@ describe("RelayServer", () => {
       config: { model: "gpt-5.6-sol", effort: "medium", models: [] },
     }));
     expect(await participant.messages.next("agent.config")).toMatchObject({ config: { model: "gpt-5.6-sol", effort: "medium" } });
-    host.socket.send(JSON.stringify({ type: "relay.participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "editor", "prompter", "reviewer"] }));
+    host.socket.send(JSON.stringify({ type: "relay.participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "prompter", "reviewer"] }));
     expect(await participant.messages.next("participant.capabilities")).toEqual({ type: "participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "prompter", "reviewer"] });
 
     participant.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Fix the test", model: "gpt-5.6-terra", effort: "high" }));

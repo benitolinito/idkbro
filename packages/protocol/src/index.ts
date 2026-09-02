@@ -194,7 +194,7 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("room.join"),
     token: z.string().min(1),
     name: z.string().trim().min(1).max(64),
-    requestedRole: z.enum(["viewer", "editor"]).optional(),
+    requestedRole: z.enum(["viewer", "participant"]).optional(),
     protocolCapabilities: z.array(z.enum(["agent-config-v1", "generic-tools-v1", "structured-input-v1"])).max(16).optional(),
   }),
   z.object({
@@ -388,7 +388,7 @@ export const relayHostMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("relay.participant.capabilities"),
     participantId: z.string().min(1).max(128),
-    capabilities: z.array(z.enum(["viewer", "editor", "prompter", "reviewer"])).max(4),
+    capabilities: z.array(z.enum(["viewer", "prompter", "reviewer"])).max(3),
   }),
   z.object({
     type: z.literal("relay.collab.event"),
@@ -424,7 +424,7 @@ export interface RoomParticipant {
   protocolCapabilities?: ProtocolCapability[];
 }
 
-export type Capability = "viewer" | "editor" | "prompter" | "reviewer" | "host";
+export type Capability = "viewer" | "prompter" | "reviewer" | "host";
 
 export interface QueuedPrompt {
   promptId: string;

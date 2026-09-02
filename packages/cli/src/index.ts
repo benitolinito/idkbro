@@ -402,7 +402,7 @@ async function readWorkspaceDiff(cwd: string, revision: string): Promise<Workspa
   };
 }
 
-interface EncryptedEditorUpdate {
+interface EncryptedContentPayload {
   file: string;
   nonce: string;
   tag: string;
@@ -452,18 +452,18 @@ function safeRoomFile(root: string, file: string): { fileId: string; target: str
 class RoomAuthority {
   private workspaceTail: Promise<void> = Promise.resolve();
 
-  private constructor(private readonly editorKey: Buffer) {}
+  private constructor(private readonly contentKey: Buffer) {}
 
   static async create(options: {
     roomId: string;
-    editorSalt: string;
+    contentSalt: string;
     secret: string;
     workspacePath: string;
     sessionDirectory: string;
   }): Promise<RoomAuthority> {
     const secret = await loadOrCreateRoomSecret(path.join(options.sessionDirectory, "room-secret"), options.secret);
     return new RoomAuthority(
-      Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(options.editorSalt), Buffer.from("multicode/v2/editor"), 32)),
+      Buffer.from(hkdfSync("sha256", Buffer.from(secret, "base64url"), Buffer.from(options.contentSalt), Buffer.from("multicode/v2/content"), 32)),
     );
   }
 
@@ -484,9 +484,9 @@ class RoomAuthority {
 
   private encryptedEvent(kind: "agent.preview" | "agent.proposal", file: string, payload: Uint8Array): CollaborationEvent {
     const nonce = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", this.editorKey, nonce);
+    const cipher = createCipheriv("aes-256-gcm", this.contentKey, nonce);
     const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()]);
-    const encrypted: EncryptedEditorUpdate = {
+    const encrypted: EncryptedContentPayload = {
       file,
       nonce: nonce.toString("base64url"),
       tag: cipher.getAuthTag().toString("base64url"),
@@ -721,7 +721,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const localTransportKey = transportKey(sessionSecret, participantCode);
   const authority = await RoomAuthority.create({
     roomId: prepared.roomId,
-    editorSalt: participantCode,
+    contentSalt: participantCode,
     secret: sessionSecret,
     workspacePath,
     sessionDirectory: hosted.sessionDirectory,
@@ -1041,7 +1041,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const agentPath = hosted.agentPath;
     const authority = await RoomAuthority.create({
       roomId: created.roomId,
-      editorSalt: created.code,
+      contentSalt: created.code,
       secret: sessionSecret,
       workspacePath,
       sessionDirectory: hosted.sessionDirectory,
@@ -1326,7 +1326,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   };
 
   const closed = new Promise<void>((resolve, reject) => {
-    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, requestedRole: options.viewer ? "viewer" : "editor", protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"] }));
+    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, requestedRole: options.viewer ? "viewer" : "participant", protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"] }));
     socket.on("message", (data) => {
       let message: RoomServerMessage;
       try {

@@ -38,7 +38,7 @@ class MessageCollector {
   }
 }
 
-async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "editor", protocolCapabilities?: Array<"agent-config-v1" | "generic-tools-v1" | "structured-input-v1">): Promise<{
+async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "participant", protocolCapabilities?: Array<"agent-config-v1" | "generic-tools-v1" | "structured-input-v1">): Promise<{
   socket: WebSocket;
   messages: MessageCollector;
   welcome: Extract<RoomServerMessage, { type: "room.welcome" }>;
@@ -234,13 +234,13 @@ describe("RoomRelay", () => {
     });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
-    const client = await connect(port, "secret-token", "Grace", "editor", ["agent-config-v1", "generic-tools-v1", "structured-input-v1"]);
+    const client = await connect(port, "secret-token", "Grace", "participant", ["agent-config-v1", "generic-tools-v1", "structured-input-v1"]);
     sockets.push(client.socket);
     expect(client.welcome.participants.find((participant) => participant.id === client.welcome.selfId)?.protocolCapabilities).toContain("structured-input-v1");
 
     client.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", answers: { choice: "Simple" } }));
     expect((await client.messages.next("room.error")).message).toMatch(/reviewer capability/);
-    relay.setParticipantCapabilities(client.welcome.selfId, ["viewer", "editor", "prompter", "reviewer"]);
+    relay.setParticipantCapabilities(client.welcome.selfId, ["viewer", "prompter", "reviewer"]);
     expect((await client.messages.next("participant.capabilities")).capabilities).toEqual(["viewer", "prompter", "reviewer"]);
     client.socket.send(JSON.stringify({ type: "input.resolve", requestId: "question-1", answers: { choice: "Simple" } }));
     await new Promise((resolve) => setTimeout(resolve, 10));

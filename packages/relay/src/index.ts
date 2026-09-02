@@ -195,7 +195,7 @@ export class RoomRelay {
   setParticipantCapabilities(participantId: string, capabilities: RoomParticipant["capabilities"]): void {
     const participant = this.participants().find((candidate) => candidate.id === participantId);
     if (!participant) throw new Error("Participant is no longer connected");
-    participant.capabilities = [...new Set(capabilities.filter((capability) => capability !== "editor" && capability !== "host"))];
+    participant.capabilities = [...new Set(capabilities.filter((capability) => capability !== "host"))];
     this.broadcast({ type: "participant.capabilities", participantId, capabilities: participant.capabilities });
   }
 
@@ -252,7 +252,7 @@ export class RoomRelay {
         socket.close(4003, "Invalid room token");
         return;
       }
-      this.join(socket, state, parsed.data.name, parsed.data.requestedRole ?? "editor", parsed.data.protocolCapabilities ?? []);
+      this.join(socket, state, parsed.data.name, parsed.data.requestedRole ?? "participant", parsed.data.protocolCapabilities ?? []);
       return;
     }
 
@@ -363,7 +363,7 @@ export class RoomRelay {
     this.enqueue(prompt);
   }
 
-  private join(socket: WebSocket, state: ConnectionState, name: string, requestedRole: "viewer" | "editor", protocolCapabilities: NonNullable<RoomParticipant["protocolCapabilities"]>): void {
+  private join(socket: WebSocket, state: ConnectionState, name: string, requestedRole: "viewer" | "participant", protocolCapabilities: NonNullable<RoomParticipant["protocolCapabilities"]>): void {
     clearTimeout(state.authenticationTimer);
     if (this.participants().length + 1 >= this.maxParticipants) {
       this.send(socket, { type: "room.error", message: `Room participant limit of ${this.maxParticipants} reached`, fatal: true });

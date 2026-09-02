@@ -5,7 +5,7 @@ export interface WorkspaceHandoff {
   workspace: string;
   relay: string;
   name: string;
-  role: "viewer" | "editor";
+  role: "viewer" | "participant";
   mode: "host" | "join";
   provider?: "codex" | "claude";
   roomLabel: string;

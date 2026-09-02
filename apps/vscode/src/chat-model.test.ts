@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { QueuedPrompt, RoomParticipant, RoomServerMessage } from "@multicode/protocol";
 import { ChatModel } from "./chat-model.js";
 
-const host: RoomParticipant = { id: "host", name: "Ada", joinedAt: new Date(0).toISOString(), host: true, synced: true, capabilities: ["viewer", "editor", "prompter", "reviewer"] };
-const editor: RoomParticipant = { id: "editor", name: "Ada", joinedAt: new Date(0).toISOString(), host: false, synced: true, capabilities: ["viewer", "editor", "prompter"] };
+const host: RoomParticipant = { id: "host", name: "Ada", joinedAt: new Date(0).toISOString(), host: true, synced: true, capabilities: ["viewer", "prompter", "reviewer"] };
+const participant: RoomParticipant = { id: "participant", name: "Ada", joinedAt: new Date(0).toISOString(), host: false, synced: true, capabilities: ["viewer", "prompter"] };
 const prompt: QueuedPrompt = { promptId: "prompt-1", participantId: "host", participantName: "Ada", text: "Fix the reconnect loop", submittedAt: new Date(0).toISOString() };
 
 function welcome(): RoomServerMessage {
-  return { type: "room.welcome", roomId: "ABCDE-23456", selfId: "editor", participants: [host, editor], activePrompt: null, queue: [], latestDiff: null, latestCheckpoint: null, collabHistory: [] };
+  return { type: "room.welcome", roomId: "ABCDE-23456", selfId: "participant", participants: [host, participant], activePrompt: null, queue: [], latestDiff: null, latestCheckpoint: null, collabHistory: [] };
 }
 
 describe("ChatModel", () => {
@@ -91,7 +91,7 @@ describe("ChatModel", () => {
   it("updates, removes, and steers owned queued prompts", () => {
     const model = new ChatModel();
     model.handle(welcome());
-    const ownedPrompt: QueuedPrompt = { ...prompt, promptId: "prompt-owned", participantId: "editor", model: "gpt-5.6-sol", effort: "high" };
+    const ownedPrompt: QueuedPrompt = { ...prompt, promptId: "prompt-owned", participantId: "participant", model: "gpt-5.6-sol", effort: "high" };
     model.handle({ type: "prompt.queued", prompt: ownedPrompt, position: 1 });
     model.handle({ type: "prompt.updated", prompt: { ...ownedPrompt, text: "Use the smaller change" } });
 
@@ -268,7 +268,7 @@ describe("ChatModel", () => {
     model.start("join");
     model.handle(welcome());
     expect(model.snapshot().canApprove).toBe(false);
-    model.handle({ type: "participant.capabilities", participantId: "editor", capabilities: ["viewer", "editor", "prompter", "reviewer"] });
+    model.handle({ type: "participant.capabilities", participantId: "participant", capabilities: ["viewer", "prompter", "reviewer"] });
     expect(model.snapshot().canApprove).toBe(true);
   });
 

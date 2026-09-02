@@ -7,11 +7,11 @@ import { hostApprovalCliArgs } from "./approval.js";
 import { MultiCodeChatView } from "./chat-view.js";
 import { CollaborationBridge } from "./collaboration.js";
 import { parseWorkspaceFileReference } from "./file-link.js";
-import { resolveHostingDirectory } from "./host-workspace.js";
+import { hostingRepositoryWarning, resolveHostingDirectory } from "./host-workspace.js";
 import { roomSessionFromOutput, roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 import { workspaceHandoffId, workspaceHandoffSecretKey, type WorkspaceHandoff } from "./workspace-handoff.js";
 import type { AgentInputAnswers, AgentProvider, ApprovalDecision } from "@multicode/protocol";
-import { inspectManagedRoomWorktree } from "@multicode/workspace";
+import { inspectManagedRoomWorktree, inspectRepository } from "@multicode/workspace";
 
 type SessionMode = "host" | "join";
 type ClaudeAuthentication = "subscription" | "apiKey";
@@ -41,7 +41,7 @@ class MultiCodeController implements vscode.Disposable {
   private recentOutput = "";
   readonly chat: MultiCodeChatView;
   private roomWorkspaceReady = false;
-  private pendingCollaboration: { relay: string; token: string; name: string; role: "viewer" | "editor" } | undefined;
+  private pendingCollaboration: { relay: string; token: string; name: string; role: "viewer" | "participant" } | undefined;
   private readonly collaboration: CollaborationBridge;
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -93,6 +93,16 @@ class MultiCodeController implements vscode.Disposable {
     if (!workspaceDirectory) return;
     const cwd = await this.ensureDirectWorkspace(workspaceDirectory);
     if (!cwd) return;
+
+    try {
+      const warning = hostingRepositoryWarning(await inspectRepository(cwd));
+      if (warning) {
+        await vscode.window.showWarningMessage(warning, { modal: true });
+        return;
+      }
+    } catch {
+      // Let the CLI surface its more specific repository validation error.
+    }
 
     const config = vscode.workspace.getConfiguration("multicode");
     const configuredProvider = config.get<AgentProvider>("defaultAgent", "codex");
@@ -170,18 +180,11 @@ class MultiCodeController implements vscode.Disposable {
       void vscode.window.showErrorMessage("Paste the complete MultiCode room token.");
       return;
     }
-    const role = await vscode.window.showQuickPick([
-      { label: "Participant", description: "Submit prompts and follow the shared agent", role: "editor" as const },
-      { label: "Observer", description: "Follow the shared agent without submitting prompts", role: "viewer" as const },
-    ], { title: "Choose room access", ignoreFocusOut: true });
-    if (!role) return;
-
     const config = vscode.workspace.getConfiguration("multicode");
     const name = config.get<string>("displayName")?.trim() || this.defaultName();
     const relay = config.get<string>("relayUrl")?.trim();
     const invite = code.trim(); const args = ["join", invite, "--name", name];
     args.push("--bootstrap-only");
-    if (role.role === "viewer") args.push("--viewer");
     if (relay) args.push("--relay", relay);
     this.roomCode = code.trim();
     this.startSession("join", args, cwd);
@@ -190,7 +193,7 @@ class MultiCodeController implements vscode.Disposable {
       const url = new URL(invite); collaborationToken = new URLSearchParams(url.hash.replace(/^#/, "")).get("token") ?? "";
       url.hash = ""; url.search = ""; url.pathname = url.pathname.replace(/\/rooms\/[^/]+\/?$/, ""); collaborationRelay = url.toString();
     }
-    this.pendingCollaboration = { relay: collaborationRelay, token: collaborationToken, name, role: role.role };
+    this.pendingCollaboration = { relay: collaborationRelay, token: collaborationToken, name, role: "participant" };
   }
 
   async sendPrompt(): Promise<void> {
@@ -497,7 +500,7 @@ class MultiCodeController implements vscode.Disposable {
         const config = vscode.workspace.getConfiguration("multicode");
         const relay = config.get<string>("relayUrl")?.trim() || "wss://multicode.luisagd.com";
         const name = config.get<string>("displayName")?.trim() || this.defaultName();
-        this.pendingCollaboration = { relay, token: this.roomCode, name, role: "editor" };
+        this.pendingCollaboration = { relay, token: this.roomCode, name, role: "participant" };
         this.connectCollaborationWhenSafe();
       }
     } else if (this.recentOutput.includes("Joined room")) {
@@ -516,7 +519,7 @@ class MultiCodeController implements vscode.Disposable {
     void this.persistWorkspaceHandoff(pending);
   }
 
-  private async persistWorkspaceHandoff(connection: { relay: string; token: string; name: string; role: "viewer" | "editor" }): Promise<void> {
+  private async persistWorkspaceHandoff(connection: { relay: string; token: string; name: string; role: "viewer" | "participant" }): Promise<void> {
     const workspace = this.roomWorkspace;
     if (!workspace) return;
     const id = workspaceHandoffId(workspace);

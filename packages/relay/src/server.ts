@@ -196,7 +196,7 @@ class CentralRoom {
         return;
       }
       clearTimeout(timer);
-      this.join(socket, parsed.data.name, parsed.data.requestedRole ?? "editor", parsed.data.protocolCapabilities ?? []);
+      this.join(socket, parsed.data.name, parsed.data.requestedRole ?? "participant", parsed.data.protocolCapabilities ?? []);
     };
     socket.once("message", authenticate);
     socket.once("close", () => clearTimeout(timer));
@@ -215,7 +215,7 @@ class CentralRoom {
     this.onClosed();
   }
 
-  private join(socket: WebSocket, name: string, requestedRole: "viewer" | "editor", protocolCapabilities: NonNullable<RoomParticipant["protocolCapabilities"]>): void {
+  private join(socket: WebSocket, name: string, requestedRole: "viewer" | "participant", protocolCapabilities: NonNullable<RoomParticipant["protocolCapabilities"]>): void {
     if (this.participants.size + 1 >= this.maxParticipants) {
       reject(socket, `Room participant limit of ${this.maxParticipants} reached`, 4004);
       return;
@@ -441,7 +441,7 @@ class CentralRoom {
       case "relay.participant.capabilities": {
         const participant = [...this.participants.values()].find((candidate) => candidate.id === message.participantId);
         if (!participant) { send(this.hostSocket, { type: "room.error", message: "Participant is no longer connected" }); break; }
-        participant.capabilities = [...new Set(message.capabilities.filter((capability) => capability !== "editor" && capability !== "host"))];
+        participant.capabilities = [...new Set(message.capabilities.filter((capability) => capability !== "host"))];
         this.broadcast({ type: "participant.capabilities", participantId: participant.id, capabilities: participant.capabilities });
         break;
       }

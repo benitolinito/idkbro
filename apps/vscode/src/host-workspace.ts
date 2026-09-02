@@ -1,4 +1,4 @@
-import { inspectManagedRoomWorktree, type ManagedRoomWorktree } from "@multicode/workspace";
+import { inspectManagedRoomWorktree, type ManagedRoomWorktree, type RepositoryInfo } from "@multicode/workspace";
 
 type ManagedWorktreeInspector = (directory: string) => Promise<ManagedRoomWorktree | null>;
 
@@ -16,4 +16,14 @@ export async function resolveHostingDirectory(
     // Let the CLI report its existing repository validation error.
     return directory;
   }
+}
+
+export function hostingRepositoryWarning(repository: Pick<RepositoryInfo, "dirty" | "operationInProgress">): string | undefined {
+  if (repository.operationInProgress) {
+    return "Finish the current Git operation before hosting a MultiCode room.";
+  }
+  if (repository.dirty) {
+    return "MultiCode requires a clean Git working tree with no uncommitted changes. Commit or stash all tracked and untracked changes before hosting a room.";
+  }
+  return undefined;
 }
