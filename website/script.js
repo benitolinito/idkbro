@@ -1,6 +1,52 @@
 const header = document.querySelector("[data-header]");
 const menuButton = document.querySelector(".menu-button");
 const navLinks = document.querySelector(".nav-links");
+const themeButton = document.querySelector("[data-theme-toggle]");
+const themeColor = document.querySelector('meta[name="theme-color"]');
+const colorSchemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+const getSavedTheme = () => {
+  try {
+    const theme = localStorage.getItem("multicode-theme");
+    return theme === "light" || theme === "dark" ? theme : null;
+  } catch {
+    return null;
+  }
+};
+
+const applyTheme = (theme, persist = false) => {
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+  if (themeColor) themeColor.content = theme === "dark" ? "#0e1015" : "#f5f2ea";
+
+  const nextTheme = theme === "dark" ? "light" : "dark";
+  themeButton?.setAttribute("aria-label", `Switch to ${nextTheme} mode`);
+  themeButton?.setAttribute("title", `Switch to ${nextTheme} mode`);
+  const label = themeButton?.querySelector("[data-theme-label]");
+  if (label) label.textContent = `Use ${nextTheme} mode`;
+
+  if (persist) {
+    try {
+      localStorage.setItem("multicode-theme", theme);
+    } catch {}
+  }
+};
+
+applyTheme(document.documentElement.dataset.theme === "dark" ? "dark" : "light");
+
+themeButton?.addEventListener("click", () => {
+  const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(theme, true);
+});
+
+colorSchemeQuery.addEventListener("change", (event) => {
+  if (!getSavedTheme()) applyTheme(event.matches ? "dark" : "light");
+});
+
+window.addEventListener("storage", (event) => {
+  if (event.key !== "multicode-theme") return;
+  applyTheme(event.newValue === "dark" ? "dark" : event.newValue === "light" ? "light" : colorSchemeQuery.matches ? "dark" : "light");
+});
 
 const setHeaderState = () => header?.classList.toggle("scrolled", window.scrollY > 18);
 setHeaderState();
