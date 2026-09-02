@@ -282,7 +282,7 @@
               <div class="workflow-panel active" data-panel="0">
                 <span class="big-number">01</span>
                 <h3>Start where the code already lives.</h3>
-                <p>Open the Command Palette and host a room from a clean Git repository. MultiCode checks your setup and starts the chosen agent in an isolated temporary worktree.</p>
+                <p>Open the Command Palette and host a room from a clean Git repository. MultiCode leases that checkout and starts the chosen agent directly where your code lives.</p>
               </div>
               <div class="workflow-panel" data-panel="1">
                 <span class="big-number">02</span>
@@ -303,7 +303,7 @@
                   <p><span class="terminal-dim">~/payments-api</span> <b>multicode host</b></p>
                   <p class="terminal-line delayed-1"><span class="ok">✓</span> Git repository ready</p>
                   <p class="terminal-line delayed-2"><span class="ok">✓</span> Codex authenticated</p>
-                  <p class="terminal-line delayed-3"><span class="ok">✓</span> Isolated agent workspace created</p>
+                  <p class="terminal-line delayed-3"><span class="ok">✓</span> Host checkout leased</p>
                   <p class="terminal-line delayed-4">Room ready <span class="cursor"></span></p>
                 </div>
                 <div class="terminal-scene" data-terminal="1">
@@ -356,7 +356,7 @@
           <article class="principle reveal" data-delay="2">
             <span class="principle-icon">⑂</span>
             <h3>Isolated agent changes</h3>
-            <p>The agent works in a temporary worktree. Accepted results apply back as normal changes.</p>
+            <p>The agent works directly in the host checkout. Results appear there immediately as normal changes.</p>
           </article>
           <article class="principle reveal" data-delay="3">
             <span class="principle-icon">◎</span>
@@ -419,7 +419,7 @@
           </details>
           <details>
             <summary>What happens to agent changes?<span>+</span></summary>
-            <p>The agent works in a temporary isolated worktree. Accepted results are applied to the host checkout as ordinary changes, while guests receive read-only previews.</p>
+            <p>The agent works directly in the host checkout, so its results appear there immediately as ordinary changes, while guests receive a read-only mirrored workspace.</p>
           </details>
         </div>
       </section>

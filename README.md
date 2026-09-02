@@ -14,12 +14,12 @@ Only the host needs the repository, Git, and the selected coding-agent CLI. Part
 Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbound WSS ── Collaborator
 ```
 
-- The host owns the repository, agent worktree, proposals, and workspace commits.
+- The host owns the single authoritative checkout and its workspace commits.
 - The relay generates a random `XXXXX-XXXXX` locator; a separate high-entropy invitation secret encrypts application payloads end to end.
 - Each originating IP can host at most five active rooms.
 - Observer, prompter, and reviewer capabilities are controlled by the host.
 - Prompts from all participants execute through one FIFO queue. Any participant with prompter access can edit, remove, or steer any queued prompt, including one submitted by the host.
-- The selected agent runs in a temporary isolated worktree; accepted results are applied only to the host checkout.
+- The selected agent runs directly in the host checkout, so its changes appear there immediately.
 - VS Code participants receive the host's published file tree in a separate MultiCode-managed mirror; their existing folders are never overwritten.
 - The public relay sees routing metadata and encrypted payload sizes, not prompts, agent output, previews, proposals, or workspace contents.
 
@@ -97,7 +97,7 @@ multicode host --agent claude --claude-auth subscription
 
 For explicit pay-as-you-go API billing, set `ANTHROPIC_API_KEY` and use `--claude-auth api-key`. Direct CLI invocations retain `--claude-auth auto` as the compatibility default, so use an explicit mode when the billing source matters.
 
-MultiCode leases the clean checkout, creates one temporary agent worktree, starts the host authority, connects outbound to the untrusted relay, and prints one complete invite token:
+MultiCode leases the clean checkout, starts the selected agent there, connects outbound to the untrusted relay, and prints one complete invite token:
 
 ```text
 Room token: K7MNP-4XQ2R.<room-secret>
@@ -247,7 +247,7 @@ Run `multicode --help` for operator/development commands. End users only need
 
 ## Git safety model
 
-The host keeps using the original checkout. MultiCode never moves its branch or resets its index, and a per-repository lease prevents two hosted rooms from owning the checkout at once. The selected agent uses one temporary detached worktree, which is removed when the host stops. Accepted agent changes appear as ordinary changes in the host working tree.
+The host keeps using the original checkout. MultiCode never moves its branch or resets its index, and a per-repository lease prevents two hosted rooms from owning the checkout at once. The selected agent runs in that checkout, so agent changes appear immediately as ordinary host working-tree changes without a merge-back step.
 
 VS Code participants receive encrypted, self-contained workspace checkpoints in a separate MultiCode-managed repository. Its working tree mirrors the host while its synthetic base stays checked out, so the participant sees the shared modified, added, and deleted files in Source Control. A checkpoint is applied only when the mirror still matches its last synchronized projection, and it never resets or edits the participant's existing checkout. Room creation is rejected while the host repository is in the middle of a merge, rebase, cherry-pick, or revert.
 
@@ -286,7 +286,7 @@ the same version only produce temporary Actions artifacts.
 | `@multicode/cli`            | Host daemon/controller and authenticated thin-client commands                                        |
 | `@multicode/protocol`       | Shared schemas and event types                                                                       |
 | `@multicode/session-core`   | Host-local transaction journal, recovery state, and authenticated IPC                                 |
-| `@multicode/workspace`      | Host checkout leases, agent worktrees, B/A/H merges, and transactional application                    |
+| `@multicode/workspace`      | Host checkout leases, participant mirrors, checkpoints, and legacy-worktree cleanup                   |
 | `@multicode/agent-adapters` | Provider-neutral Codex app-server and Claude Agent SDK integration                                   |
 | `@multicode/relay`          | Embedded and standalone WebSocket relays                                                             |
 | `multicode-vscode`          | VS Code commands, session output, and status-bar controls                                            |

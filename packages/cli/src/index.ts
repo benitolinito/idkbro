@@ -39,12 +39,9 @@ import {
   encryptWorkspaceCheckpointBundle,
   inspectManagedRoomWorktree,
   inspectRepository,
-  mergeAgentWorkspace,
   prepareDirectHostedWorkspace,
-  prepareAgentTurnWorkspace,
   sanitizeRoomId,
   type DirectHostedWorkspace,
-  type AgentTurnSnapshot,
 } from "@multicode/workspace";
 import WebSocket from "ws";
 import { discoverLiveSessionForWorkspace } from "./live-session.js";
@@ -580,11 +577,11 @@ class AgentPreviewWatcher {
   private revision = 0;
   private turnId = "idle";
 
-  constructor(private readonly agentPath: string, private readonly publish: (turnId: string, revision: number, diff: WorkspaceDiff) => Promise<void> | void) {}
+  constructor(private readonly workspacePath: string, private readonly publish: (turnId: string, revision: number, diff: WorkspaceDiff) => Promise<void> | void) {}
 
   start(): void {
     try {
-      this.watcher = watch(this.agentPath, { recursive: true }, (_event, filename) => {
+      this.watcher = watch(this.workspacePath, { recursive: true }, (_event, filename) => {
         const file = filename?.toString().split(path.sep).join("/") ?? "";
         if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return;
         this.schedule();
@@ -605,9 +602,9 @@ class AgentPreviewWatcher {
 
   private async reconcile(): Promise<void> {
     const candidateRevision = this.revision + 1;
-    const first = await readWorkspaceDiff(this.agentPath, `${this.turnId}:${candidateRevision}`);
+    const first = await readWorkspaceDiff(this.workspacePath, `${this.turnId}:${candidateRevision}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    const second = await readWorkspaceDiff(this.agentPath, `${this.turnId}:${candidateRevision}`);
+    const second = await readWorkspaceDiff(this.workspacePath, `${this.turnId}:${candidateRevision}`);
     if (createHash("sha256").update(first.text).digest("hex") !== createHash("sha256").update(second.text).digest("hex")) { this.schedule(); return; }
     this.revision = candidateRevision;
     await this.publish(this.turnId, candidateRevision, second);
@@ -681,7 +678,6 @@ async function prepareHostedWorkspace(roomId: string): Promise<DirectHostedWorks
   const room = await prepareDirectHostedWorkspace({ cwd: process.cwd(), roomId });
   console.log(out.success(`${out.label("Room workspace")} ${out.value(room.workspacePath)}`));
   console.log(out.success(`${out.label("Room session")} ${out.value(room.roomId)}`));
-  console.log(out.success(`${out.label("Agent workspace")} ${out.value(room.agentPath)}`));
   return room;
 }
 
@@ -701,7 +697,7 @@ async function createRoom(options: { agent: string; agentExecutable?: string; cl
     const eventTask = (async () => {
       for await (const event of adapter.events()) printAgentEvent(event);
     })();
-    const { threadId } = await adapter.start({ cwd: hosted.agentPath, ...(options.model ? { model: options.model } : {}), ...(options.effort ? { effort: options.effort } : {}) });
+    const { threadId } = await adapter.start({ cwd: hosted.workspacePath, ...(options.model ? { model: options.model } : {}), ...(options.effort ? { effort: options.effort } : {}) });
     activeAgentDisplayName = adapter.configuration().displayName;
     console.log(out.success(`${out.label(`${activeAgentDisplayName} thread`)} ${out.muted(threadId)}`));
     if (options.prompt) await adapter.sendPrompt({ promptId: randomUUID(), text: options.prompt });
@@ -813,7 +809,6 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   };
   try {
   const workspacePath = hosted.workspacePath;
-  const agentPath = hosted.agentPath;
   const baseCommit = hosted.baseCommit;
   const participantCode = localInviteCode();
   const sessionSecret = roomSecret();
@@ -827,12 +822,8 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   });
   let checkpointSequence = 0;
   let checkpointParent = baseCommit;
-  let turnSequence = 0;
-  let activeTurnBase: AgentTurnSnapshot | undefined;
-  let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
   const adapter = adapterFor(provider, options.agentExecutable, options.claudeAuth);
   const roomParticipants = new Map<string, RoomParticipant>();
-  let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
   let latestSharedCheckpoint: WorkspaceCheckpoint | undefined;
   let publishCheckpoint: (force?: boolean, targetParticipantId?: string) => Promise<void> = async () => { throw new Error("Workspace checkpoint publishing is not ready"); };
   const token = participantCode;
@@ -842,7 +833,6 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     hostName: options.name,
     onPrompt: async (prompt) => {
       await publishCheckpoint();
-      activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: prepared.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
       let promptText = prompt.text; try { promptText = openPrompt(localTransportKey, prompt.promptId, prompt.text); } catch { /* Host-local input is already plaintext. */ }
       await adapter.sendPrompt({
         promptId: prompt.promptId,
@@ -868,7 +858,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
   const ipc = new LocalIpcServer(ipcToken, async (payload) => {
     const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown; answers?: AgentInputAnswers | null };
-    if (request.type === "status") return { roomId: prepared.roomId, mode: "local", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null };
+    if (request.type === "status") return { roomId: prepared.roomId, mode: "local", workspacePath, participants: [...roomParticipants.values()], pendingProposal: null };
     if (request.type === "prompt" && request.text) {
       const promptId = randomUUID();
       relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, request.text), promptId, {
@@ -881,14 +871,11 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     if (request.type === "approval.resolve" && request.requestId !== undefined && isApprovalDecision(request.decision)) { await adapter.resolveApproval(request.requestId, request.decision); return { resolved: true }; }
     if (request.type === "input.resolve" && typeof request.requestId === "string") { await adapter.resolveInput(request.requestId, request.answers ?? null); return { resolved: true }; }
     if (request.type === "capabilities" && request.participantId && request.capabilities) { relay.setParticipantCapabilities(request.participantId, request.capabilities); return { updated: true }; }
-    if (request.type === "proposal.discard" && pendingConflict) {
-      const discarded = pendingConflict; pendingConflict = undefined; await Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); relay.publishAgentEvent({ ...discarded.event, status: "discarded" } as AgentEvent); return { discarded: true };
-    }
-    if (request.type === "proposal.retry") { await retryProposal(); return { resolved: true }; }
+    if (request.type === "proposal.discard" || request.type === "proposal.retry") throw new Error("Direct rooms do not create merge proposals");
     throw new Error("Unsupported session command");
   });
   await ipc.listen(process.platform === "win32" ? `\\\\.\\pipe\\multicode-${prepared.roomId}` : path.join(hosted.sessionDirectory, "daemon.sock"));
-  const previewWatcher = new AgentPreviewWatcher(agentPath, async (turnId, revision, diff) => {
+  const previewWatcher = new AgentPreviewWatcher(workspacePath, async (turnId, revision, diff) => {
     relay.publishCollaborationEvent(authority.previewEvent(turnId, revision, diff));
   });
   const publishCheckpointNow = async (force = false, targetParticipantId?: string): Promise<void> => {
@@ -924,13 +911,6 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   };
   publishCheckpoint = serializeWorkspaceCheckpointPublisher(publishCheckpointNow);
   const workspaceWatcher = new HostWorkspaceWatcher(workspacePath, () => publishCheckpoint());
-  retryProposal = async () => {
-    const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal");
-    const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation) });
-    if (merge.status !== "merged" && merge.status !== "unchanged") throw new Error("The proposal still conflicts with current human changes");
-    await publishCheckpoint(); pendingConflict = undefined;
-    await Promise.all([rm(proposal.proposalPath, { force: true }), rm(proposal.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); relay.publishAgentEvent({ ...proposal.event, status: "resolved" } as AgentEvent);
-  };
 
   const eventTask = (async () => {
     for await (const event of adapter.events()) {
@@ -938,29 +918,10 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       if (event.type === "input.requested") denyUnsupportedStructuredInput(event, roomParticipants, (requestId, answers) => adapter.resolveInput(requestId, answers));
       if (event.type === "turn.started") previewWatcher.beginTurn(event.turnId);
       if (event.type === "turn.completed") {
-        let relayEvent: AgentEvent = event;
-        const turn = activeTurnBase;
-        activeTurnBase = undefined;
-        if (turn && (!event.status || event.status === "completed" || event.status === "success")) {
-          try {
-            const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation) });
-            if (merge.status === "merged") {
-              await publishCheckpoint();
-            }
-            if (merge.status === "conflicted") {
-              console.error(err.warning(`Agent result has conflicts. Saved proposal at ${merge.proposalPath ?? "the session proposal directory"}`));
-              relayEvent = { ...event, status: "pending-conflict" };
-              if (merge.proposalPath) pendingConflict = { event, proposalPath: merge.proposalPath, turn };
-              if (merge.proposalPath) relay.publishCollaborationEvent(authority.proposalEvent(event.turnId, await readFile(merge.proposalPath, "utf8")));
-            }
-          } catch (error) {
-            console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`));
-            relayEvent = { ...event, status: "merge-failed" };
-          }
-        }
+        await publishCheckpoint();
         const diff = await readWorkspaceDiff(workspacePath, event.turnId);
         relay.publishWorkspaceDiff(diff);
-        relay.publishAgentEvent(relayEvent);
+        relay.publishAgentEvent(event);
         continue;
       }
       if (event.type === "command.exited") previewWatcher.reconcileNow();
@@ -988,7 +949,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
 
   try {
     const { threadId } = await adapter.start({
-      cwd: agentPath,
+      cwd: workspacePath,
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
     });
@@ -1028,15 +989,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
         if (capabilityCommand[1] === "grant") capabilities.add(capability); else capabilities.delete(capability);
         relay.setParticipantCapabilities(participant.id, [...capabilities]); return;
       }
-      if (text === "/proposal show") { console.error(pendingConflict ? err.info("◆", `Pending proposal: ${pendingConflict.proposalPath}`) : err.muted("No pending proposal.")); return; }
-      if (text === "/proposal discard") {
-        if (!pendingConflict) { console.error(err.muted("No pending proposal.")); return; }
-        const discarded = pendingConflict; pendingConflict = undefined;
-        void Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]).then(() => relay.publishAgentEvent({ ...discarded.event, status: "discarded" } as AgentEvent)); return;
-      }
-      if (text === "/proposal retry") {
-        void retryProposal().catch((error: unknown) => console.error(err.error(`Proposal retry failed: ${error instanceof Error ? error.message : String(error)}`))); return;
-      }
+      if (text.startsWith("/proposal")) { console.error(err.muted("Direct rooms do not create merge proposals.")); return; }
       const promptId = randomUUID(); relay.submitHostPrompt(sealPrompt(localTransportKey, promptId, text), promptId);
     });
     cleanupSignals = installStopHandlers(async () => {
@@ -1165,7 +1118,6 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const hosted = await prepareHostedWorkspace(created.roomId);
     hostedForShutdown = hosted;
     const workspacePath = hosted.workspacePath;
-    const agentPath = hosted.agentPath;
     const authority = await RoomAuthority.create({
       roomId: created.roomId,
       contentSalt: created.code,
@@ -1184,17 +1136,13 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     const baseCommit = hosted.baseCommit;
     let checkpointSequence = 0;
     let checkpointParent = baseCommit;
-    let turnSequence = 0;
-    let activeTurnBase: AgentTurnSnapshot | undefined;
     const processedPromptIds = new Set<string>();
-    let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
     const roomParticipants = new Map<string, RoomParticipant>();
-    let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
     let latestSharedCheckpoint: WorkspaceCheckpoint | undefined;
     const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
     ipc = new LocalIpcServer(ipcToken, async (payload) => {
       const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown; answers?: AgentInputAnswers | null };
-      if (request.type === "status") return { roomId: created.roomId, mode: "remote", workspacePath, agentPath, participants: [...roomParticipants.values()], pendingProposal: pendingConflict?.proposalPath ?? null, relayConnected: socket?.readyState === WebSocket.OPEN };
+      if (request.type === "status") return { roomId: created.roomId, mode: "remote", workspacePath, participants: [...roomParticipants.values()], pendingProposal: null, relayConnected: socket?.readyState === WebSocket.OPEN };
       if (request.type === "prompt" && request.text) {
         const promptId = randomUUID();
         sendToRelay({
@@ -1210,12 +1158,11 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       if (request.type === "approval.resolve" && request.requestId !== undefined && isApprovalDecision(request.decision)) { await adapter.resolveApproval(request.requestId, request.decision); return { resolved: true }; }
       if (request.type === "input.resolve" && typeof request.requestId === "string") { await adapter.resolveInput(request.requestId, request.answers ?? null); return { resolved: true }; }
       if (request.type === "capabilities" && request.participantId && request.capabilities) { sendToRelay({ type: "relay.participant.capabilities", participantId: request.participantId, capabilities: request.capabilities }); return { updated: true }; }
-      if (request.type === "proposal.discard" && pendingConflict) { const discarded = pendingConflict; pendingConflict = undefined; await Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); const event = { ...discarded.event, status: "discarded" } as AgentEvent; sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "discarded", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify(event))) }); return { discarded: true }; }
-      if (request.type === "proposal.retry") { await retryProposal(); return { resolved: true }; }
+      if (request.type === "proposal.discard" || request.type === "proposal.retry") throw new Error("Direct rooms do not create merge proposals");
       throw new Error("Unsupported session command");
     });
     await ipc.listen(process.platform === "win32" ? `\\\\.\\pipe\\multicode-${created.roomId}` : path.join(hosted.sessionDirectory, "daemon.sock"));
-    previewWatcher = new AgentPreviewWatcher(agentPath, async (turnId, revision, diff) => {
+    previewWatcher = new AgentPreviewWatcher(workspacePath, async (turnId, revision, diff) => {
       sendToRelay({ type: "relay.collab.event", event: authority.previewEvent(turnId, revision, diff) });
     });
     const publishCheckpoint = serializeWorkspaceCheckpointPublisher(async (force = false, targetParticipantId?: string): Promise<void> => {
@@ -1237,41 +1184,14 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       sendRemoteWorkspaceCheckpoint(sendToRelay, latestSharedCheckpoint);
     });
     workspaceWatcher = new HostWorkspaceWatcher(workspacePath, () => publishCheckpoint());
-    retryProposal = async () => {
-      const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal");
-      const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation) });
-      if (merge.status !== "merged" && merge.status !== "unchanged") throw new Error("The proposal still conflicts with current human changes");
-      await publishCheckpoint(); pendingConflict = undefined;
-      await Promise.all([rm(proposal.proposalPath, { force: true }), rm(proposal.proposalPath.replace(/\.patch$/, ".json"), { force: true })]); const resolved = { ...proposal.event, status: "resolved" } as AgentEvent;
-      sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "resolved", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify(resolved))) });
-    };
     const eventTask = (async () => {
       for await (const event of adapter.events()) {
         printAgentEvent(event);
         if (event.type === "input.requested") denyUnsupportedStructuredInput(event, roomParticipants, (requestId, answers) => adapter.resolveInput(requestId, answers));
         if (event.type === "turn.started") previewWatcher?.beginTurn(event.turnId);
         if (event.type === "turn.completed") {
-          let relayEvent: AgentEvent = event;
-          const turn = activeTurnBase;
-          activeTurnBase = undefined;
-          if (turn && (!event.status || event.status === "completed" || event.status === "success")) {
-            try {
-              const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation) });
-              if (merge.status === "merged") {
-                await publishCheckpoint();
-              }
-              if (merge.status === "conflicted") {
-                console.error(err.warning(`Agent result has conflicts. Saved proposal at ${merge.proposalPath ?? "the session proposal directory"}`));
-                relayEvent = { ...event, status: "pending-conflict" };
-                if (merge.proposalPath) pendingConflict = { event, proposalPath: merge.proposalPath, turn };
-                if (merge.proposalPath) sendToRelay({ type: "relay.collab.event", event: authority.proposalEvent(event.turnId, await readFile(merge.proposalPath, "utf8")) });
-              }
-            } catch (error) {
-              console.error(err.warning(`Agent result was not merged: ${error instanceof Error ? error.message : String(error)}`));
-              relayEvent = { ...event, status: "merge-failed" };
-            }
-          }
-          sendToRelay({ type: "relay.agent.encrypted", eventType: relayEvent.type, ...(relayEvent.type === "turn.completed" && relayEvent.status ? { status: relayEvent.status } : {}), payload: sealAgentEvent(relayTransportKey, relayEvent) });
+          await publishCheckpoint();
+          sendToRelay({ type: "relay.agent.encrypted", eventType: event.type, ...(event.status ? { status: event.status } : {}), payload: sealAgentEvent(relayTransportKey, event) });
         } else {
           if (event.type === "command.exited") previewWatcher?.reconcileNow();
           sendToRelay({ type: "relay.agent.encrypted", eventType: event.type, payload: sealAgentEvent(relayTransportKey, event) });
@@ -1280,7 +1200,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       await new Promise<void>(() => undefined);
     })();
     const { threadId } = await adapter.start({
-      cwd: agentPath,
+      cwd: workspacePath,
       ...(options.model ? { model: options.model } : {}),
       ...(options.effort ? { effort: options.effort } : {}),
     });
@@ -1339,7 +1259,6 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         processedPromptIds.add(message.prompt.promptId); if (processedPromptIds.size > 10_000) processedPromptIds.delete(processedPromptIds.keys().next().value as string);
         void (async () => {
           await publishCheckpoint();
-          activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: created.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
           await adapter.sendPrompt({
             promptId: message.prompt.promptId,
             text: openPrompt(relayTransportKey, message.prompt.promptId, message.prompt.text),
@@ -1382,15 +1301,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         if (capabilityCommand[1] === "grant") capabilities.add(capability); else capabilities.delete(capability);
         sendToRelay({ type: "relay.participant.capabilities", participantId: participant.id, capabilities: [...capabilities] }); return;
       }
-      if (text === "/proposal show") { console.error(pendingConflict ? err.info("◆", `Pending proposal: ${pendingConflict.proposalPath}`) : err.muted("No pending proposal.")); return; }
-      if (text === "/proposal discard") {
-        if (!pendingConflict) { console.error(err.muted("No pending proposal.")); return; }
-        const discarded = pendingConflict; pendingConflict = undefined;
-        void Promise.all([rm(discarded.proposalPath, { force: true }), rm(discarded.proposalPath.replace(/\.patch$/, ".json"), { force: true })]).then(() => sendToRelay({ type: "relay.agent.encrypted", eventType: "turn.completed", status: "discarded", payload: sealTransport(relayTransportKey, new TextEncoder().encode(JSON.stringify({ ...discarded.event, status: "discarded" }))) })); return;
-      }
-      if (text === "/proposal retry") {
-        void retryProposal().catch((error: unknown) => console.error(err.error(`Proposal retry failed: ${error instanceof Error ? error.message : String(error)}`))); return;
-      }
+      if (text.startsWith("/proposal")) { console.error(err.muted("Direct rooms do not create merge proposals.")); return; }
       if (socket?.readyState !== WebSocket.OPEN) {
         console.error(err.warning("Not connected; prompt was not sent."));
         return;
@@ -1551,7 +1462,7 @@ async function cleanupRoomWorkspace(roomId: string, options: { force?: boolean }
   }
 }
 
-interface LiveSessionStatus { roomId: string; mode: string; workspacePath: string; agentPath: string; participants: RoomParticipant[]; pendingProposal: string | null; relayConnected?: boolean }
+interface LiveSessionStatus { roomId: string; mode: string; workspacePath: string; participants: RoomParticipant[]; pendingProposal: string | null; relayConnected?: boolean }
 
 async function sessionDirectoryFor(roomId?: string): Promise<{ roomId: string; directory: string }> {
   const root = path.join(homedir(), ".multicode", "sessions");

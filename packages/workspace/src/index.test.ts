@@ -28,7 +28,6 @@ import {
   restoreParticipantWorkspace,
   releaseDirectCheckoutLease,
   sanitizeRoomId,
-  type WorkspaceChange,
   WorkspaceProjectionTracker,
 } from "./index.js";
 
@@ -362,8 +361,8 @@ describe("v2 host room worktrees", () => {
   });
 });
 
-describe("v3 direct host workspace", () => {
-  it("uses the original clean checkout and creates only an agent worktree", async () => {
+describe("direct host workspace", () => {
+  it("uses the original clean checkout without creating another worktree", async () => {
     const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-host-"));
     const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-data-"));
     await execFileAsync("git", ["init", "-q", repository]);
@@ -376,30 +375,38 @@ describe("v3 direct host workspace", () => {
     const hosted = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "direct-room", dataDirectory });
     const root = await realpath(repository);
     expect(hosted.workspacePath).toBe(root);
-    expect(hosted.agentPath).not.toBe(root);
-    expect(path.basename(hosted.agentPath)).toBe("agent");
-    expect(path.dirname(hosted.agentPath)).not.toBe(hosted.sessionDirectory);
-    await writeFile(path.join(hosted.sessionDirectory, "token"), "room-secret");
-    await expect(readFile(path.join(hosted.agentPath, "..", "token"), "utf8")).rejects.toThrow();
     expect(await readFile(path.join(hosted.workspacePath, "README.md"), "utf8")).toBe("# Direct room\n");
-    expect(await readFile(path.join(hosted.agentPath, "README.md"), "utf8")).toBe("# Direct room\n");
     await expect(readFile(path.join(hosted.sessionDirectory, "shared", "README.md"), "utf8")).rejects.toThrow();
     expect(await inspectManagedRoomWorktree(hosted.workspacePath)).toBeNull();
-    expect(await inspectManagedRoomWorktree(hosted.agentPath)).toMatchObject({ role: "agent", roomId: "direct-room", repositoryRoot: root });
-    await expect(prepareAgentTurnWorkspace({
-      sharedPath: hosted.workspacePath,
-      agentPath: hosted.agentPath,
+    const worktrees = (await execFileAsync("git", ["-C", root, "worktree", "list", "--porcelain"])).stdout;
+    expect(worktrees.match(/^worktree /gm)).toHaveLength(1);
+
+    await writeFile(path.join(hosted.workspacePath, "README.md"), "# Agent edited the host checkout\n");
+    expect(await readFile(path.join(root, "README.md"), "utf8")).toBe("# Agent edited the host checkout\n");
+    const checkpoint = await createWorkspaceCheckpoint({
+      cwd: hosted.workspacePath,
       roomId: hosted.roomId,
-      sequence: 1,
+      sequence: 2,
       baseCommit: hosted.baseCommit,
       parentCommit: hosted.checkpointCommit,
-    })).resolves.toMatchObject({ sequence: 1 });
+      force: true,
+    });
+    if (!checkpoint) throw new Error("Expected a host checkpoint");
+    const portable = await createPortableWorkspaceCheckpoint({
+      cwd: hosted.workspacePath,
+      roomId: hosted.roomId,
+      sequence: checkpoint.sequence,
+      baseCommit: hosted.baseCommit,
+      sourceCommit: checkpoint.commit,
+    });
+    const mirror = await applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: hosted.roomId, checkpoint: portable });
+    expect(await readFile(path.join(mirror.root, "README.md"), "utf8")).toBe("# Agent edited the host checkout\n");
 
     const lease = JSON.parse(await readFile(hosted.lease.path, "utf8")) as Record<string, unknown>;
     expect(lease).toMatchObject({ version: 3, roomId: "direct-room", repositoryRoot: root, baseCommit: hosted.baseCommit, initialTree: hosted.initialTree });
     await closeDirectHostedWorkspace(hosted);
     await expect(readFile(hosted.lease.path, "utf8")).rejects.toThrow();
-    await expect(readFile(path.join(hosted.agentPath, "README.md"), "utf8")).rejects.toThrow();
+    expect(await readFile(path.join(root, "README.md"), "utf8")).toBe("# Agent edited the host checkout\n");
   });
 
   it("rejects dirty or mismatched checkouts before creating direct-room state", async () => {
@@ -419,74 +426,6 @@ describe("v3 direct host workspace", () => {
     await expect(readFile(path.join(dataDirectory, "dirty-room", ".multicode-session.json"), "utf8")).rejects.toThrow();
     await execFileAsync("git", ["-C", repository, "restore", "file.txt"]);
     await expect(inspectDirectCheckout({ cwd: repository, expectedBaseCommit: "0".repeat(clean.head.length) })).rejects.toThrow(/does not match room base/);
-  });
-
-  it("hands an agent merge to the authority before changing the direct checkout", async () => {
-    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-merge-"));
-    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-merge-data-"));
-    await execFileAsync("git", ["init", "-q", repository]);
-    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
-    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
-    await writeFile(path.join(repository, "file.txt"), "base\n");
-    await execFileAsync("git", ["-C", repository, "add", "file.txt"]);
-    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
-    const hosted = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "direct-merge", dataDirectory });
-    const turn = await prepareAgentTurnWorkspace({ sharedPath: hosted.workspacePath, agentPath: hosted.agentPath, roomId: hosted.roomId, sequence: 1, baseCommit: hosted.baseCommit, parentCommit: hosted.checkpointCommit });
-    await writeFile(path.join(hosted.agentPath, "file.txt"), "agent\n");
-    let committed = false;
-
-    const result = await mergeAgentWorkspace({
-      sharedPath: hosted.workspacePath,
-      agentPath: hosted.agentPath,
-      sessionDirectory: hosted.sessionDirectory,
-      roomId: hosted.roomId,
-      baseCommit: hosted.baseCommit,
-      turn,
-      withCommitLock: async (operation) => operation(),
-      onCommitted: async (changes) => {
-        expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("agent\n");
-        expect(changes).toEqual([{ operation: "update", path: "file.txt", content: "agent\n" }]);
-        committed = true;
-      },
-    });
-
-    expect(result.status).toBe("merged");
-    expect(committed).toBe(true);
-    expect(await readFile(path.join(hosted.workspacePath, "file.txt"), "utf8")).toBe("agent\n");
-    await releaseDirectCheckoutLease(hosted.lease);
-  });
-
-  it("projects oversized agent files into the direct checkout as Git-only changes", async () => {
-    const repository = await mkdtemp(path.join(tmpdir(), "multicode-direct-large-"));
-    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-direct-large-data-"));
-    await execFileAsync("git", ["init", "-q", repository]);
-    await execFileAsync("git", ["-C", repository, "config", "user.email", "multicode@example.invalid"]);
-    await execFileAsync("git", ["-C", repository, "config", "user.name", "MultiCode"]);
-    await writeFile(path.join(repository, "large.ts"), "export const initial = true;\n");
-    await execFileAsync("git", ["-C", repository, "add", "large.ts"]);
-    await execFileAsync("git", ["-C", repository, "commit", "-qm", "initial"]);
-    const hosted = await prepareDirectHostedWorkspace({ cwd: repository, roomId: "direct-large", dataDirectory });
-    const turn = await prepareAgentTurnWorkspace({ sharedPath: hosted.workspacePath, agentPath: hosted.agentPath, roomId: hosted.roomId, sequence: 1, baseCommit: hosted.baseCommit, parentCommit: hosted.checkpointCommit });
-    const largeResult = `export const contents = ${JSON.stringify("x".repeat(97 * 1024))};\n`;
-    await writeFile(path.join(hosted.agentPath, "large.ts"), largeResult);
-    let committedChanges: WorkspaceChange[] = [];
-
-    const result = await mergeAgentWorkspace({
-      sharedPath: hosted.workspacePath,
-      agentPath: hosted.agentPath,
-      sessionDirectory: hosted.sessionDirectory,
-      roomId: hosted.roomId,
-      baseCommit: hosted.baseCommit,
-      turn,
-      withCommitLock: async (operation) => operation(),
-      onCommitted: async (changes) => { committedChanges = changes; },
-    });
-
-    expect(result.status).toBe("merged");
-    expect(committedChanges).toEqual([{ operation: "update", path: "large.ts", collaborative: false }]);
-    expect(await readFile(path.join(hosted.workspacePath, "large.ts"), "utf8")).toBe(largeResult);
-    expect((await execFileAsync("git", ["-C", hosted.workspacePath, "status", "--short"])).stdout).toContain(" M large.ts");
-    await releaseDirectCheckoutLease(hosted.lease);
   });
 
   it("allows only one direct room to lease a checkout", async () => {

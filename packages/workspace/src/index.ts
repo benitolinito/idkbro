@@ -48,7 +48,6 @@ export interface DirectCheckoutLease {
 export interface DirectHostedWorkspace {
   roomId: string;
   workspacePath: string;
-  agentPath: string;
   baseCommit: string;
   initialTree: string;
   checkpointCommit: string;
@@ -262,42 +261,25 @@ export async function inspectDirectCheckout(options: { cwd: string; expectedBase
 }
 
 /**
- * Prepares the v3 host layout: the original checkout is the room projection and
- * the only additional Git worktree is the temporary agent sandbox.
+ * Prepares the direct host layout. The original checkout is both the room
+ * projection and the agent's working directory; participants receive mirrors.
  */
 export async function prepareDirectHostedWorkspace(options: {
   cwd: string;
   roomId: string;
   dataDirectory?: string;
-  worktreeDirectory?: string;
 }): Promise<DirectHostedWorkspace> {
   const repository = await inspectDirectCheckout({ cwd: options.cwd });
   const roomId = sanitizeRoomId(options.roomId);
   const dataDirectory = options.dataDirectory ?? path.join(homedir(), ".multicode", "sessions");
   const sessionDirectory = path.join(dataDirectory, roomId);
-  // Keep the executable agent checkout outside the session-state tree. Agent
-  // tools run with agentPath as their cwd, so the old sibling layout exposed
-  // room credentials through obvious paths such as ../token.
-  const worktreeDirectory = options.worktreeDirectory
-    ?? (options.dataDirectory ? `${options.dataDirectory}-worktrees` : path.join(homedir(), ".multicode", "agent-worktrees"));
-  const agentContainer = path.join(worktreeDirectory, roomId);
-  const agentPath = path.join(agentContainer, "agent");
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
-  await mkdir(worktreeDirectory, { recursive: true, mode: 0o700 });
   try {
     await mkdir(sessionDirectory, { mode: 0o700 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Session directory already exists for ${roomId}`);
     throw error;
   }
-  try {
-    await mkdir(agentContainer, { mode: 0o700 });
-  } catch (error) {
-    await rm(sessionDirectory, { recursive: true, force: true });
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Agent worktree state already exists for ${roomId}`);
-    throw error;
-  }
-
   let lease: DirectCheckoutLease | undefined;
   try {
     lease = await acquireDirectCheckoutLease({
@@ -310,14 +292,11 @@ export async function prepareDirectHostedWorkspace(options: {
     await inspectDirectCheckout({ cwd: repository.root, expectedBaseCommit: repository.head });
     const checkpoint = await createWorkspaceCheckpoint({ cwd: repository.root, roomId, sequence: 1, baseCommit: repository.head, force: true });
     if (!checkpoint) throw new Error("Unable to create initial direct-room checkpoint");
-    await git(repository.root, ["worktree", "add", "--detach", agentPath, checkpoint.commit]);
-    const canonicalAgentPath = await realpath(agentPath);
     const marker = JSON.stringify({
-      version: 3,
+      version: 4,
       roomId,
       repositoryRoot: repository.root,
       workspacePath: repository.root,
-      agentPath: canonicalAgentPath,
       baseCommit: repository.head,
       initialTree: repository.initialTree,
       checkpointCommit: checkpoint.commit,
@@ -325,13 +304,9 @@ export async function prepareDirectHostedWorkspace(options: {
       creationNonce: lease.nonce,
     }, null, 2);
     await writeFile(path.join(sessionDirectory, ".multicode-session.json"), marker, { mode: 0o600 });
-    // The ownership verifier needs non-secret provenance beside the worktree;
-    // runtime credentials and journals remain only in sessionDirectory.
-    await writeFile(path.join(agentContainer, ".multicode-session.json"), marker, { mode: 0o600 });
     return {
       roomId,
       workspacePath: repository.root,
-      agentPath: canonicalAgentPath,
       baseCommit: repository.head,
       initialTree: repository.initialTree,
       checkpointCommit: checkpoint.commit,
@@ -339,9 +314,7 @@ export async function prepareDirectHostedWorkspace(options: {
       lease,
     };
   } catch (error) {
-    await git(repository.root, ["worktree", "remove", "--force", agentPath]).catch(() => undefined);
     if (lease) await releaseDirectCheckoutLease(lease).catch(() => undefined);
-    await rm(agentContainer, { recursive: true, force: true });
     await rm(sessionDirectory, { recursive: true, force: true });
     throw error;
   }
@@ -363,18 +336,19 @@ export async function releaseDirectCheckoutLease(lease: DirectCheckoutLease): Pr
   await rm(lease.path);
 }
 
-/** Ends a v3 host session without touching the user's checkout contents. */
+/** Ends a direct host session without touching the user's checkout contents. */
 export async function closeDirectHostedWorkspace(workspace: DirectHostedWorkspace): Promise<void> {
-  await verifyOwnedHostWorktrees(workspace.workspacePath, workspace.agentPath, workspace.roomId);
-  try {
-    await git(workspace.workspacePath, ["worktree", "remove", "--force", workspace.agentPath]);
-  } finally {
-    try {
-      await releaseDirectCheckoutLease(workspace.lease);
-    } finally {
-      await rm(path.dirname(workspace.agentPath), { recursive: true, force: true });
-    }
-  }
+  const marker = JSON.parse(await readFile(path.join(workspace.sessionDirectory, ".multicode-session.json"), "utf8")) as Record<string, unknown>;
+  const root = await realpath(workspace.workspacePath);
+  if (
+    marker.version !== 4
+    || marker.roomId !== sanitizeRoomId(workspace.roomId)
+    || marker.repositoryRoot !== root
+    || marker.workspacePath !== root
+    || marker.leasePath !== workspace.lease.path
+    || marker.creationNonce !== workspace.lease.nonce
+  ) throw new Error("Refusing to close a direct room because its workspace marker is invalid");
+  await releaseDirectCheckoutLease(workspace.lease);
 }
 
 /** Force-removes both worktrees from a superseded v2 host session. */

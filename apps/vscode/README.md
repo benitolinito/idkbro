@@ -4,7 +4,7 @@ Host or join a shared Codex or Claude session without leaving VS Code. The exten
 
 ## Commands
 
-- **MultiCode: Host Room** chooses an agent, leases the clean checkout, creates one temporary agent worktree, stays in the current window, and copies the complete encrypted invite token.
+- **MultiCode: Host Room** chooses an agent, leases the clean checkout, runs the agent there, stays in the current window, and copies the complete encrypted invite token.
 - Starting from a legacy v2 MultiCode room worktree discards its shared/agent worktrees and switches the same window back to the original repository before hosting.
 - **MultiCode: Join Room** joins the shared agent conversation and adds a separate MultiCode-managed mirror of the host's latest workspace version without modifying the current workspace.
 - **MultiCode: Open Chat** opens the shared conversation sidebar.
