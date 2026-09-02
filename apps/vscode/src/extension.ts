@@ -11,7 +11,7 @@ import { hostingRepositoryWarning, resolveHostingDirectory } from "./host-worksp
 import { roomSessionFromOutput, roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
 import { workspaceHandoffId, workspaceHandoffSecretKey, type WorkspaceHandoff } from "./workspace-handoff.js";
 import type { AgentInputAnswers, AgentProvider, ApprovalDecision } from "@multicode/protocol";
-import { inspectManagedRoomWorktree, inspectRepository } from "@multicode/workspace";
+import { inspectManagedRoomWorktree, inspectRepository, type MirroredWorkspaceState } from "@multicode/workspace";
 
 type SessionMode = "host" | "join";
 type ClaudeAuthentication = "subscription" | "apiKey";
@@ -42,6 +42,7 @@ class MultiCodeController implements vscode.Disposable {
   readonly chat: MultiCodeChatView;
   private roomWorkspaceReady = false;
   private pendingCollaboration: { relay: string; token: string; name: string; role: "viewer" | "participant" } | undefined;
+  private activeCollaboration: { relay: string; token: string; name: string; role: "viewer" | "participant" } | undefined;
   private readonly collaboration: CollaborationBridge;
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -75,7 +76,8 @@ class MultiCodeController implements vscode.Disposable {
       if (message.type === "agent.event" && message.event.type === "turn.completed") {
         void vscode.commands.executeCommand("git.refresh");
       }
-    }, (turnId, revision, diff) => this.chat.previewWorkspaceDiff(turnId, revision, diff));
+    }, (turnId, revision, diff) => this.chat.previewWorkspaceDiff(turnId, revision, diff),
+    (workspace) => this.workspaceSynchronized(workspace), context.globalStorageUri.fsPath);
     this.status.name = "MultiCode";
     this.status.command = "multicode.host";
     this.setIdle();
@@ -161,6 +163,7 @@ class MultiCodeController implements vscode.Disposable {
     this.status.tooltip = "Click to send a prompt";
     this.status.command = "multicode.sendPrompt";
     void vscode.commands.executeCommand("setContext", "multicode.connected", true);
+    this.activeCollaboration = { relay: handoff.relay, token, name: handoff.name, role: handoff.role };
     this.collaboration.connect(handoff.relay, token, handoff.name, handoff.role, handoff.mode === "host" ? "daemon" : "extension");
     this.openChat();
   }
@@ -428,6 +431,7 @@ class MultiCodeController implements vscode.Disposable {
     this.roomSessionId = undefined;
     this.roomWorkspaceReady = false;
     this.pendingCollaboration = undefined;
+    this.activeCollaboration = undefined;
     this.collaboration.disconnect();
     this.output.clear();
     this.output.appendLine(`$ multicode ${args.join(" ")}\n`);
@@ -515,8 +519,34 @@ class MultiCodeController implements vscode.Disposable {
     if (!this.roomWorkspaceReady || !this.pendingCollaboration) return;
     const pending = this.pendingCollaboration;
     this.pendingCollaboration = undefined;
+    this.activeCollaboration = pending;
     this.collaboration.connect(pending.relay, pending.token, pending.name, pending.role, this.mode === "host" ? "daemon" : "extension", false);
     void this.persistWorkspaceHandoff(pending);
+  }
+
+  private async workspaceSynchronized(workspace: MirroredWorkspaceState): Promise<void> {
+    if (this.mode !== "join") return;
+    const previousWorkspace = this.roomWorkspace;
+    if (previousWorkspace && path.resolve(previousWorkspace) !== path.resolve(workspace.root)) {
+      await this.forgetWorkspaceHandoff(previousWorkspace);
+    }
+    this.roomWorkspace = workspace.root;
+    this.roomSessionId = workspace.roomId;
+    this.roomWorkspaceReady = true;
+    this.collaboration.setWorkspaceRoot(vscode.Uri.file(workspace.root));
+    if (this.activeCollaboration) await this.persistWorkspaceHandoff(this.activeCollaboration);
+    this.status.text = `$(check) MultiCode: synced ${workspace.commit.slice(0, 8)}`;
+    this.status.tooltip = `Shared workspace synchronized at version ${workspace.sequence}`;
+
+    const uri = vscode.Uri.file(workspace.root);
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (!folders.some((folder) => path.resolve(folder.uri.fsPath) === path.resolve(workspace.root))) {
+      const added = vscode.workspace.updateWorkspaceFolders(folders.length, 0, {
+        uri,
+        name: `MultiCode Shared · ${this.roomCode?.slice(0, 11) ?? workspace.roomId}`,
+      });
+      if (!added) void vscode.window.showWarningMessage("The shared workspace synchronized, but VS Code could not add it to the Explorer.");
+    }
   }
 
   private async persistWorkspaceHandoff(connection: { relay: string; token: string; name: string; role: "viewer" | "participant" }): Promise<void> {
@@ -550,8 +580,8 @@ class MultiCodeController implements vscode.Disposable {
     }
   }
 
-  private async forgetWorkspaceHandoff(): Promise<void> {
-    const workspace = this.roomWorkspace;
+  private async forgetWorkspaceHandoff(workspaceOverride?: string): Promise<void> {
+    const workspace = workspaceOverride ?? this.roomWorkspace;
     if (!workspace) return;
     const id = workspaceHandoffId(workspace);
     const existing = this.context.globalState.get<Record<string, WorkspaceHandoff>>(workspaceHandoffsKey, {});
@@ -729,6 +759,7 @@ class MultiCodeController implements vscode.Disposable {
     this.roomSessionId = undefined;
     this.roomWorkspaceReady = false;
     this.pendingCollaboration = undefined;
+    this.activeCollaboration = undefined;
     this.stopping = false;
     this.recentOutput = "";
     this.setIdle();

@@ -179,7 +179,17 @@ export class RoomRelay {
   }
 
   publishWorkspaceCheckpointComplete(sequence: number, targetParticipantId?: string): void {
-    if (targetParticipantId) this.sendCheckpointMessage({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
+    if (targetParticipantId) {
+      this.sendCheckpointMessage({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
+      return;
+    }
+    if (!this.latestCheckpoint || this.latestCheckpoint.sequence !== sequence) throw new Error("Workspace checkpoint completion does not match the latest checkpoint");
+    for (const participant of this.participants()) {
+      if (!participant.protocolCapabilities?.includes("workspace-mirror-v1")) continue;
+      participant.synced = false;
+      this.broadcast({ type: "participant.syncing", participantId: participant.id, sequence });
+    }
+    this.broadcast({ type: "workspace.checkpoint.available", checkpoint: this.latestCheckpoint });
   }
 
   publishCollaborationEvent(event: CollaborationEvent): void {
@@ -375,7 +385,7 @@ export class RoomRelay {
       name,
       joinedAt: new Date().toISOString(),
       host: false,
-      synced: true,
+      synced: !(this.latestCheckpoint && protocolCapabilities.includes("workspace-mirror-v1")),
       capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "prompter"],
       protocolCapabilities,
     };

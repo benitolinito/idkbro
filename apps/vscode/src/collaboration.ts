@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 import WebSocket from "ws";
 import { workspaceDiffSchema } from "@multicode/protocol";
@@ -9,8 +9,10 @@ import type {
   CollaborationEvent,
   QueuedPrompt,
   RoomServerMessage,
+  WorkspaceCheckpointDescriptor,
   WorkspaceDiff,
 } from "@multicode/protocol";
+import { applyPortableWorkspaceCheckpoint, decryptWorkspaceCheckpointBundle, type MirroredWorkspaceState } from "@multicode/workspace";
 
 interface EncryptedPayload {
   file: string;
@@ -51,10 +53,16 @@ export class CollaborationBridge implements vscode.Disposable {
   private latestPreviewRevision = 0;
   private latestPreviewTurn = "";
   private receiveTail: Promise<void> = Promise.resolve();
+  private roomId = "";
+  private workspaceDiskOwner: "daemon" | "extension" = "extension";
+  private requestedCheckpointSequence = 0;
+  private checkpointTransfer: { descriptor: WorkspaceCheckpointDescriptor; chunks: Buffer[]; nextIndex: number; receivedBytes: number } | undefined;
 
   constructor(
     private readonly onRoomMessage?: (message: RoomServerMessage) => void,
     private readonly onAgentPreview?: (turnId: string, revision: number, diff: WorkspaceDiff) => void,
+    private readonly onWorkspaceSynchronized?: (workspace: MirroredWorkspaceState) => void | Promise<void>,
+    private readonly workspaceDataDirectory?: string,
   ) {
     this.disposables = [
       this.previewChanged,
@@ -75,7 +83,7 @@ export class CollaborationBridge implements vscode.Disposable {
     inviteToken: string,
     name: string,
     requestedRole: "viewer" | "participant" = "participant",
-    _workspaceDiskOwner?: unknown,
+    workspaceDiskOwner: "daemon" | "extension" = "extension",
     _captureLocalText?: boolean,
   ): void {
     if (
@@ -91,14 +99,18 @@ export class CollaborationBridge implements vscode.Disposable {
     this.inviteToken = inviteToken;
     this.displayName = name;
     this.requestedRole = requestedRole;
+    this.workspaceDiskOwner = workspaceDiskOwner;
     this.latestPreviewRevision = 0;
     this.latestPreviewTurn = "";
     this.welcomed = false;
+    this.roomId = "";
+    this.requestedCheckpointSequence = 0;
+    this.checkpointTransfer = undefined;
     this.deriveKeys(inviteToken);
     this.openConnection("connecting");
   }
 
-  /** Retained as a compatibility no-op; shared rooms no longer own a workspace. */
+  /** The host checkout remains external; participant mirrors are managed separately. */
   setWorkspaceRoot(_root: vscode.Uri | undefined): void {}
 
   disconnect(): void {
@@ -106,6 +118,9 @@ export class CollaborationBridge implements vscode.Disposable {
     this.relayUrl = "";
     this.displayName = "";
     this.welcomed = false;
+    this.roomId = "";
+    this.requestedCheckpointSequence = 0;
+    this.checkpointTransfer = undefined;
     this.contentKey = undefined;
     this.promptKey = undefined;
     this.closeSocket();
@@ -199,7 +214,12 @@ export class CollaborationBridge implements vscode.Disposable {
         token: code,
         name: this.displayName,
         ...(this.requestedRole === "viewer" ? { requestedRole: "viewer" } : {}),
-        protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"],
+        protocolCapabilities: [
+          "agent-config-v1",
+          "generic-tools-v1",
+          "structured-input-v1",
+          ...(this.workspaceDiskOwner === "extension" && this.workspaceDataDirectory ? ["workspace-mirror-v1" as const] : []),
+        ],
       }));
     });
     socket.on("message", (data) => {
@@ -209,13 +229,21 @@ export class CollaborationBridge implements vscode.Disposable {
           if (this.socket === socket) await this.receive(raw);
         })
         .catch((error: unknown) => {
-          console.error(`MultiCode could not apply a room event: ${error instanceof Error ? error.message : String(error)}`);
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`MultiCode could not apply a room event: ${message}`);
+          if (/workspace checkpoint|workspace mirror|shared workspace/i.test(message)) {
+            this.requestedCheckpointSequence = 0;
+            this.checkpointTransfer = undefined;
+            void vscode.window.showErrorMessage(`MultiCode could not synchronize the shared workspace: ${message}`);
+          }
         });
     });
     socket.on("close", () => {
       if (this.socket !== socket) return;
       this.socket = undefined;
       this.welcomed = false;
+      this.requestedCheckpointSequence = 0;
+      this.checkpointTransfer = undefined;
       if (!this.inviteToken) return;
       this.statusChanged.fire("reconnecting");
       this.reconnectTimer = setTimeout(() => {
@@ -238,10 +266,88 @@ export class CollaborationBridge implements vscode.Disposable {
     this.notifyRoomMessage(message);
     if (message.type === "room.welcome") {
       this.welcomed = true;
+      this.roomId = message.roomId;
       for (const event of message.collabHistory) await this.applyReadOnlyEvent(event, false);
+      if (message.latestCheckpoint && "bundleBytes" in message.latestCheckpoint) this.requestWorkspaceCheckpoint(message.latestCheckpoint);
+      return;
+    }
+    if (message.type === "workspace.checkpoint.available") {
+      this.requestWorkspaceCheckpoint(message.checkpoint);
+      return;
+    }
+    if (message.type === "workspace.checkpoint.start") {
+      this.beginWorkspaceCheckpoint(message.checkpoint);
+      return;
+    }
+    if (message.type === "workspace.checkpoint.chunk") {
+      this.acceptWorkspaceCheckpointChunk(message.chunk);
+      return;
+    }
+    if (message.type === "workspace.checkpoint.complete") {
+      await this.completeWorkspaceCheckpoint(message.sequence);
+      return;
+    }
+    if (message.type === "room.error" && !message.fatal && /host connection interrupted/i.test(message.message)) {
+      this.requestedCheckpointSequence = 0;
+      this.checkpointTransfer = undefined;
       return;
     }
     if (message.type === "collab.event") await this.applyReadOnlyEvent(message.event);
+  }
+
+  private requestWorkspaceCheckpoint(checkpoint: WorkspaceCheckpointDescriptor): void {
+    if (
+      this.workspaceDiskOwner !== "extension"
+      || !this.workspaceDataDirectory
+      || this.socket?.readyState !== WebSocket.OPEN
+      || checkpoint.sequence <= this.requestedCheckpointSequence
+    ) return;
+    this.requestedCheckpointSequence = checkpoint.sequence;
+    this.socket.send(JSON.stringify({ type: "workspace.checkpoint.request", sequence: checkpoint.sequence }));
+  }
+
+  private beginWorkspaceCheckpoint(descriptor: WorkspaceCheckpointDescriptor): void {
+    if (descriptor.sequence !== this.requestedCheckpointSequence) throw new Error("Received an unexpected workspace checkpoint");
+    this.checkpointTransfer = { descriptor, chunks: [], nextIndex: 0, receivedBytes: 0 };
+  }
+
+  private acceptWorkspaceCheckpointChunk(chunk: { sequence: number; index: number; data: string }): void {
+    const transfer = this.checkpointTransfer;
+    if (!transfer || chunk.sequence !== transfer.descriptor.sequence || chunk.index !== transfer.nextIndex) throw new Error("Workspace checkpoint chunks arrived out of order");
+    const decoded = Buffer.from(chunk.data, "base64");
+    if (decoded.toString("base64") !== chunk.data) throw new Error("Workspace checkpoint chunk encoding is invalid");
+    transfer.chunks.push(decoded);
+    transfer.nextIndex += 1;
+    transfer.receivedBytes += decoded.byteLength;
+    if (transfer.receivedBytes > transfer.descriptor.bundleBytes) throw new Error("Workspace checkpoint exceeds its declared size");
+  }
+
+  private async completeWorkspaceCheckpoint(sequence: number): Promise<void> {
+    const transfer = this.checkpointTransfer;
+    this.checkpointTransfer = undefined;
+    if (!transfer || sequence !== transfer.descriptor.sequence) throw new Error("Workspace checkpoint completion is invalid");
+    const encrypted = Buffer.concat(transfer.chunks);
+    if (
+      transfer.nextIndex !== transfer.descriptor.chunkCount
+      || encrypted.byteLength !== transfer.descriptor.bundleBytes
+      || createHash("sha256").update(encrypted).digest("hex") !== transfer.descriptor.bundleHash
+    ) throw new Error("Workspace checkpoint failed integrity validation");
+    if (!this.promptKey || !this.workspaceDataDirectory || !this.roomId) throw new Error("Workspace checkpoint arrived before the room was ready");
+    const bundle = decryptWorkspaceCheckpointBundle(this.promptKey, sequence, encrypted);
+    const workspace = await applyPortableWorkspaceCheckpoint({
+      dataDirectory: this.workspaceDataDirectory,
+      roomId: this.roomId,
+      checkpoint: {
+        sequence,
+        baseCommit: transfer.descriptor.baseCommit,
+        commit: transfer.descriptor.commit,
+        ref: transfer.descriptor.ref,
+        bundle: bundle.toString("base64"),
+        createdAt: transfer.descriptor.createdAt,
+      },
+    });
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: "workspace.ack", sequence, commit: transfer.descriptor.commit }));
+    await this.onWorkspaceSynchronized?.(workspace);
   }
 
   private notifyRoomMessage(message: RoomServerMessage): void {

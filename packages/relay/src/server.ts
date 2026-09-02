@@ -156,8 +156,10 @@ class CentralRoom {
   resume(socket: WebSocket): void {
     if (this.closed) { reject(socket, "Room is closed", 4004); return; }
     if (this.hostSocket.readyState === WebSocket.OPEN) this.hostSocket.close(4000, "Host connection replaced");
+    this.checkpointTransfers.clear();
     this.hostSocket = socket; this.attachHost(socket);
     send(socket, { type: "room.welcome", roomId: this.roomId, selfId: this.host.id, participants: [this.host, ...this.participants.values()], activePrompt: this.activePrompt, queue: [...this.queue], latestDiff: this.latestDiff, latestCheckpoint: this.latestCheckpoint, collabHistory: [...this.collabHistory], ...(this.agentConfig ? { agentConfig: this.agentConfig } : {}) });
+    if (this.latestCheckpoint) this.broadcast({ type: "workspace.checkpoint.available", checkpoint: this.latestCheckpoint }, socket);
   }
 
   private attachHost(socket: WebSocket): void {
@@ -225,7 +227,7 @@ class CentralRoom {
       name,
       joinedAt: new Date().toISOString(),
       host: false,
-      synced: true,
+      synced: !(this.latestCheckpoint && protocolCapabilities.includes("workspace-mirror-v1")),
       capabilities: requestedRole === "viewer" ? ["viewer"] : ["viewer", "prompter"],
       protocolCapabilities,
     };
@@ -564,7 +566,14 @@ class CentralRoom {
       return;
     }
     if (!targetParticipantId) {
-      void this.collabTail.then(() => { this.latestCheckpoint = transfer.descriptor; this.collabHistory.length = 0; });
+      this.latestCheckpoint = transfer.descriptor;
+      this.collabHistory.length = 0;
+      for (const participant of this.participants.values()) {
+        if (!participant.protocolCapabilities?.includes("workspace-mirror-v1")) continue;
+        participant.synced = false;
+        this.broadcast({ type: "participant.syncing", participantId: participant.id, sequence });
+      }
+      this.broadcast({ type: "workspace.checkpoint.available", checkpoint: transfer.descriptor }, this.hostSocket);
     }
     if (targetParticipantId) this.routeCheckpoint({ type: "workspace.checkpoint.complete", sequence }, targetParticipantId);
   }

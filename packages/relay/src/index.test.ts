@@ -38,7 +38,7 @@ class MessageCollector {
   }
 }
 
-async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "participant", protocolCapabilities?: Array<"agent-config-v1" | "generic-tools-v1" | "structured-input-v1">): Promise<{
+async function connect(port: number, token: string, name: string, requestedRole?: "viewer" | "participant", protocolCapabilities?: Array<"agent-config-v1" | "generic-tools-v1" | "structured-input-v1" | "workspace-mirror-v1">): Promise<{
   socket: WebSocket;
   messages: MessageCollector;
   welcome: Extract<RoomServerMessage, { type: "room.welcome" }>;
@@ -196,7 +196,7 @@ describe("RoomRelay", () => {
     });
     relays.push(relay);
     const { port } = await relay.listen({ host: "127.0.0.1", port: 0 });
-    const client = await connect(port, "secret-token", "Grace");
+    const client = await connect(port, "secret-token", "Grace", "participant", ["workspace-mirror-v1"]);
     sockets.push(client.socket);
 
     relay.publishWorkspaceCheckpoint({
@@ -207,9 +207,13 @@ describe("RoomRelay", () => {
       bundle: "bundle",
       createdAt: new Date().toISOString(),
     });
+    expect(await client.messages.next("participant.syncing")).toMatchObject({ participantId: client.welcome.selfId, sequence: 1 });
+    expect((await client.messages.next("workspace.checkpoint.available")).checkpoint.sequence).toBe(1);
     client.socket.send(JSON.stringify({ type: "prompt.submit", promptId: randomUUID(), text: "Continue" }));
     await client.messages.next("prompt.started");
     expect(dispatched).toEqual(["Continue"]);
+    client.socket.send(JSON.stringify({ type: "workspace.ack", sequence: 1, commit: "checkpoint" }));
+    expect((await client.messages.next("participant.synced")).participantId).toBe(client.welcome.selfId);
   });
 
   it("keeps observers read-only and without prompt permissions", async () => {

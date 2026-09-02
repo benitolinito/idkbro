@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
-import { access, mkdir, mkdtemp, open, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { access, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { WorkspaceCheckpoint } from "@multicode/protocol";
+import { maxCheckpointBytes, type WorkspaceCheckpoint } from "@multicode/protocol";
 
 const execFileAsync = promisify(execFile);
 const maxCollaborativeTextBytes = 96 * 1024;
@@ -87,6 +87,13 @@ export interface ParticipantWorkspaceState {
   roomId: string;
   markerPath: string;
   creationNonce: string;
+}
+
+export interface MirroredWorkspaceState {
+  roomId: string;
+  root: string;
+  sequence: number;
+  commit: string;
 }
 
 export interface WorkspaceProjectionIdentity {
@@ -702,6 +709,157 @@ export async function createWorkspaceCheckpoint(options: {
       bundle,
       createdAt: new Date().toISOString(),
     };
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Create a self-contained snapshot bundle for participants that do not have a
+ * clone of the host repository. The synthetic commit deliberately has no
+ * parent, so the bundle contains the current tree without disclosing history.
+ */
+export async function createPortableWorkspaceCheckpoint(options: {
+  cwd: string;
+  roomId: string;
+  sequence: number;
+  baseCommit: string;
+  sourceCommit: string;
+}): Promise<WorkspaceCheckpoint> {
+  const repository = await inspectRepository(options.cwd);
+  const roomId = sanitizeRoomId(options.roomId);
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "multicode-portable-checkpoint-"));
+  const bundlePath = path.join(temporaryDirectory, "workspace.bundle");
+  const checkpointRef = `refs/multicode/mirrors/${roomId}`;
+  try {
+    const tree = await git(repository.root, ["rev-parse", `${options.sourceCommit}^{tree}`]);
+    const commit = await gitWithEnv(repository.root, ["commit-tree", tree, "-m", `MultiCode mirror ${options.sequence}`], {
+      GIT_AUTHOR_NAME: "MultiCode",
+      GIT_AUTHOR_EMAIL: "multicode@localhost",
+      GIT_COMMITTER_NAME: "MultiCode",
+      GIT_COMMITTER_EMAIL: "multicode@localhost",
+    });
+    await git(repository.root, ["update-ref", checkpointRef, commit]);
+    await git(repository.root, ["bundle", "create", bundlePath, checkpointRef]);
+    const bundleBytes = await readFile(bundlePath);
+    if (bundleBytes.byteLength + 29 > maxCheckpointBytes) throw new Error("Portable workspace checkpoint exceeds the 32 MiB relay limit");
+    return {
+      sequence: options.sequence,
+      baseCommit: options.baseCommit,
+      commit,
+      ref: checkpointRef,
+      bundle: bundleBytes.toString("base64"),
+      createdAt: new Date().toISOString(),
+    };
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+/** AES-GCM envelope: version byte, 12-byte nonce, 16-byte tag, ciphertext. */
+export function encryptWorkspaceCheckpointBundle(key: Buffer, sequence: number, bundle: Buffer): Buffer {
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  cipher.setAAD(Buffer.from(`workspace-checkpoint:${sequence}`));
+  const ciphertext = Buffer.concat([cipher.update(bundle), cipher.final()]);
+  return Buffer.concat([Buffer.from([1]), nonce, cipher.getAuthTag(), ciphertext]);
+}
+
+export function decryptWorkspaceCheckpointBundle(key: Buffer, sequence: number, envelope: Buffer): Buffer {
+  if (envelope.byteLength < 30 || envelope[0] !== 1) throw new Error("Invalid encrypted workspace checkpoint");
+  const decipher = createDecipheriv("aes-256-gcm", key, envelope.subarray(1, 13));
+  decipher.setAAD(Buffer.from(`workspace-checkpoint:${sequence}`));
+  decipher.setAuthTag(envelope.subarray(13, 29));
+  return Buffer.concat([decipher.update(envelope.subarray(29)), decipher.final()]);
+}
+
+interface MirroredWorkspaceMarker {
+  version: 1;
+  roomId: string;
+  workspacePath: string;
+  creationNonce: string;
+  sequence: number;
+  commit: string;
+}
+
+/**
+ * Materialize a verified portable checkpoint into an isolated MultiCode-owned
+ * repository. Existing participant checkouts are never used or modified.
+ */
+export async function applyPortableWorkspaceCheckpoint(options: {
+  dataDirectory: string;
+  roomId: string;
+  checkpoint: WorkspaceCheckpoint;
+}): Promise<MirroredWorkspaceState> {
+  const roomId = sanitizeRoomId(options.roomId);
+  const configuredDataDirectory = path.resolve(options.dataDirectory);
+  await mkdir(configuredDataDirectory, { recursive: true, mode: 0o700 });
+  const roomDirectory = path.join(await realpath(configuredDataDirectory), "mirrors", roomId);
+  const workspacePath = path.join(roomDirectory, "workspace");
+  const markerPath = path.join(roomDirectory, ".multicode-mirror.json");
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "multicode-mirror-apply-"));
+  const bundlePath = path.join(temporaryDirectory, "workspace.bundle");
+  let marker: MirroredWorkspaceMarker | undefined;
+  try {
+    try {
+      marker = JSON.parse(await readFile(markerPath, "utf8")) as MirroredWorkspaceMarker;
+      if (
+        marker.version !== 1
+        || marker.roomId !== roomId
+        || path.resolve(marker.workspacePath) !== workspacePath
+        || typeof marker.creationNonce !== "string"
+        || marker.creationNonce.length < 32
+      ) throw new Error("Invalid MultiCode mirror marker");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    await mkdir(workspacePath, { recursive: true, mode: 0o700 });
+    if (await realpath(workspacePath) !== workspacePath) throw new Error("Refusing to use a shared workspace mirror outside its managed directory");
+    try {
+      await access(path.join(workspacePath, ".git"));
+      if (await realpath(path.join(workspacePath, ".git")) !== path.join(workspacePath, ".git")) throw new Error("Invalid shared workspace Git directory");
+    } catch {
+      const entries = await readdir(workspacePath);
+      if (entries.length) throw new Error("Refusing to initialize a MultiCode mirror over existing files");
+      await git(workspacePath, ["init"]);
+    }
+
+    const status = await git(workspacePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    if (status) throw new Error("Shared workspace mirror has local changes; refusing to overwrite them");
+    if (marker) {
+      const currentCommit = await git(workspacePath, ["rev-parse", "HEAD"]);
+      if (currentCommit !== marker.commit) throw new Error("Shared workspace mirror no longer matches its synchronized version");
+      const [currentTree, synchronizedTree] = await Promise.all([
+        captureWorkspaceTree(workspacePath),
+        git(workspacePath, ["rev-parse", `${marker.commit}^{tree}`]),
+      ]);
+      if (currentTree !== synchronizedTree) throw new Error("Shared workspace mirror has local changes; refusing to overwrite them");
+      if (options.checkpoint.sequence <= marker.sequence) {
+        return { roomId, root: workspacePath, sequence: marker.sequence, commit: marker.commit };
+      }
+    }
+
+    await writeFile(bundlePath, Buffer.from(options.checkpoint.bundle, "base64"));
+    await git(workspacePath, ["bundle", "verify", bundlePath]);
+    const localRef = `refs/multicode/received/${roomId}`;
+    await git(workspacePath, ["fetch", bundlePath, `+${options.checkpoint.ref}:${localRef}`]);
+    const receivedCommit = await git(workspacePath, ["rev-parse", localRef]);
+    if (receivedCommit !== options.checkpoint.commit) throw new Error("Received workspace checkpoint hash does not match the host");
+    await git(workspacePath, ["reset", "--hard", receivedCommit]);
+
+    const nextMarker: MirroredWorkspaceMarker = {
+      version: 1,
+      roomId,
+      workspacePath,
+      creationNonce: marker?.creationNonce ?? randomBytes(32).toString("base64url"),
+      sequence: options.checkpoint.sequence,
+      commit: receivedCommit,
+    };
+    const temporaryMarker = `${markerPath}.${randomBytes(12).toString("hex")}.tmp`;
+    await writeFile(temporaryMarker, JSON.stringify(nextMarker, null, 2), { mode: 0o600 });
+    await rename(temporaryMarker, markerPath);
+    return { roomId, root: workspacePath, sequence: nextMarker.sequence, commit: nextMarker.commit };
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }

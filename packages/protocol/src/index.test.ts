@@ -52,6 +52,15 @@ describe("room protocol", () => {
     expect(roomClientMessageSchema.parse({ type: "prompt.steer", promptId: "prompt_1" })).toEqual({ type: "prompt.steer", promptId: "prompt_1" });
   });
 
+  it("negotiates managed workspace mirrors", () => {
+    expect(roomClientMessageSchema.parse({
+      type: "room.join",
+      token: "room-token",
+      name: "Grace",
+      protocolCapabilities: ["workspace-mirror-v1"],
+    })).toMatchObject({ type: "room.join", protocolCapabilities: ["workspace-mirror-v1"] });
+  });
+
   it("accepts structured per-file workspace statistics", () => {
     expect(workspaceDiffSchema.parse({
       revision: "turn-1",

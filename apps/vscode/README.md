@@ -6,7 +6,7 @@ Host or join a shared Codex or Claude session without leaving VS Code. The exten
 
 - **MultiCode: Host Room** chooses an agent, leases the clean checkout, creates one temporary agent worktree, stays in the current window, and copies the complete encrypted invite token.
 - Starting from a legacy v2 MultiCode room worktree discards its shared/agent worktrees and switches the same window back to the original repository before hosting.
-- **MultiCode: Join Room** joins the shared agent conversation without reading or modifying the current workspace.
+- **MultiCode: Join Room** joins the shared agent conversation and adds a separate MultiCode-managed mirror of the host's latest workspace version without modifying the current workspace.
 - **MultiCode: Open Chat** opens the shared conversation sidebar.
 - **MultiCode: Send Prompt** adds a prompt to the shared FIFO queue.
 - **MultiCode: Stop or Leave Room** ends the current process.
@@ -19,4 +19,4 @@ Host or join a shared Codex or Claude session without leaving VS Code. The exten
 
 The packaged extension includes the MultiCode CLI. During development it also detects this repository's built CLI. Set `multicode.executable` only when you want to use a different CLI installation.
 
-Hosts need a clean Git repository and the selected agent CLI. Participants can join from any VS Code window without cloning the host repository; their current workspace is never synchronized or edited by MultiCode. Claude is an external-binary MVP: enable `multicode.experimentalClaude`, install the Claude CLI, and run `claude auth login`. The extension uses that local subscription login by default without reading or copying its credentials. API-key authentication remains available through SecretStorage. At the start of each subscription-backed room, the host confirms that allowed participant prompts consume the host account's limits. Claude steering stays hidden until its active-turn behavior is verified; queue and interrupt remain available.
+Hosts need a clean Git repository and the selected agent CLI. Participants can join from any VS Code window without cloning the host repository. MultiCode decrypts verified host checkpoints into an isolated managed mirror and adds it to the Explorer; it never overwrites the participant's existing folder. Local edits inside the mirror pause later synchronization rather than being discarded. Claude is an external-binary MVP: enable `multicode.experimentalClaude`, install the Claude CLI, and run `claude auth login`. The extension uses that local subscription login by default without reading or copying its credentials. API-key authentication remains available through SecretStorage. At the start of each subscription-backed room, the host confirms that allowed participant prompts consume the host account's limits. Claude steering stays hidden until its active-turn behavior is verified; queue and interrupt remain available.

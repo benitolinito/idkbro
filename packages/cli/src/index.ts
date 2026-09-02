@@ -13,6 +13,7 @@ import { createAgentAdapter } from "@multicode/agent-adapters";
 import { LocalIpcServer, loadOrCreateRoomSecret, requestLocalIpc, roomSecret, writeSessionToken } from "@multicode/session-core";
 import {
   isSensitiveWorkspacePath,
+  checkpointChunkBytes,
   parseApprovalRequestId,
   type AgentEvent,
   type AgentInputAnswers,
@@ -25,13 +26,17 @@ import {
   type RoomParticipant,
   type WorkspaceDiff,
   type WorkspaceDiffFile,
+  type WorkspaceCheckpoint,
+  type WorkspaceCheckpointDescriptor,
 } from "@multicode/protocol";
 import { PostgresRelayRoomStore, RelayServer, RoomRelay } from "@multicode/relay";
 import {
   closeDirectHostedWorkspace,
   cleanupLegacyHostedWorkspace,
   cleanupParticipantWorkspace,
+  createPortableWorkspaceCheckpoint,
   createWorkspaceCheckpoint,
+  encryptWorkspaceCheckpointBundle,
   inspectManagedRoomWorktree,
   inspectRepository,
   mergeAgentWorkspace,
@@ -329,6 +334,11 @@ function printRoomMessage(message: RoomServerMessage, includeAgent = true): void
     case "workspace.checkpoint":
       console.error(`\n${err.info("↻", `${err.label("Workspace checkpoint")} ${message.checkpoint.sequence} ${err.muted(message.checkpoint.commit.slice(0, 12))}`)}`);
       break;
+    case "workspace.checkpoint.available":
+      console.error(`\n${err.info("↻", `${err.label("Workspace version available")} ${message.checkpoint.sequence} ${err.muted(message.checkpoint.commit.slice(0, 12))}`)}`);
+      break;
+    case "participant.syncing":
+      break;
     case "participant.synced":
       console.error(`\n${err.success(`${err.label("Participant synchronized")} ${err.muted(`checkpoint ${message.sequence}`)}`)}`);
       break;
@@ -432,6 +442,60 @@ function openInputAnswers(key: Buffer, requestId: string, payload: string): Agen
   const decoded = JSON.parse(new TextDecoder().decode(openTransport(key, payload, `input:${requestId}`))) as unknown;
   if (!decoded || typeof decoded !== "object" || Array.isArray(decoded) || !("answers" in decoded)) throw new Error("Encrypted input response has no answers");
   return parseAgentInputAnswers((decoded as { answers: unknown }).answers);
+}
+
+function encryptedWorkspaceCheckpoint(key: Buffer, checkpoint: WorkspaceCheckpoint): WorkspaceCheckpoint {
+  const encrypted = encryptWorkspaceCheckpointBundle(key, checkpoint.sequence, Buffer.from(checkpoint.bundle, "base64"));
+  return { ...checkpoint, bundle: encrypted.toString("base64") };
+}
+
+function workspaceCheckpointDescriptor(checkpoint: WorkspaceCheckpoint): { descriptor: WorkspaceCheckpointDescriptor; bundle: Buffer } {
+  const bundle = Buffer.from(checkpoint.bundle, "base64");
+  return {
+    descriptor: {
+      sequence: checkpoint.sequence,
+      baseCommit: checkpoint.baseCommit,
+      commit: checkpoint.commit,
+      ref: checkpoint.ref,
+      bundleBytes: bundle.byteLength,
+      bundleHash: createHash("sha256").update(bundle).digest("hex"),
+      chunkCount: Math.ceil(bundle.byteLength / checkpointChunkBytes),
+      createdAt: checkpoint.createdAt,
+    },
+    bundle,
+  };
+}
+
+function sendRemoteWorkspaceCheckpoint(
+  send: (message: unknown) => void,
+  checkpoint: WorkspaceCheckpoint,
+  targetParticipantId?: string,
+): void {
+  const { descriptor, bundle } = workspaceCheckpointDescriptor(checkpoint);
+  send({ type: "relay.workspace.checkpoint.start", checkpoint: descriptor, ...(targetParticipantId ? { targetParticipantId } : {}) });
+  for (let index = 0; index < descriptor.chunkCount; index += 1) {
+    send({
+      type: "relay.workspace.checkpoint.chunk",
+      chunk: {
+        sequence: checkpoint.sequence,
+        index,
+        data: bundle.subarray(index * checkpointChunkBytes, (index + 1) * checkpointChunkBytes).toString("base64"),
+      },
+      ...(targetParticipantId ? { targetParticipantId } : {}),
+    });
+  }
+  send({ type: "relay.workspace.checkpoint.complete", sequence: checkpoint.sequence, ...(targetParticipantId ? { targetParticipantId } : {}) });
+}
+
+function serializeWorkspaceCheckpointPublisher(
+  publish: (force?: boolean, targetParticipantId?: string) => Promise<void>,
+): (force?: boolean, targetParticipantId?: string) => Promise<void> {
+  let tail: Promise<void> = Promise.resolve();
+  return (force, targetParticipantId) => {
+    const result = tail.then(() => publish(force, targetParticipantId));
+    tail = result.catch(() => undefined);
+    return result;
+  };
 }
 function sealAgentEvent(key: Buffer, event: AgentEvent): string {
   const safe = { ...event } as AgentEvent & { text?: string; output?: string; truncated?: boolean };
@@ -547,6 +611,41 @@ class AgentPreviewWatcher {
     if (createHash("sha256").update(first.text).digest("hex") !== createHash("sha256").update(second.text).digest("hex")) { this.schedule(); return; }
     this.revision = candidateRevision;
     await this.publish(this.turnId, candidateRevision, second);
+  }
+}
+
+class HostWorkspaceWatcher {
+  private watcher: FSWatcher | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private reconcileTimer: ReturnType<typeof setInterval> | undefined;
+
+  constructor(private readonly workspacePath: string, private readonly publish: () => Promise<void>) {}
+
+  start(): void {
+    try {
+      this.watcher = watch(this.workspacePath, { recursive: true }, (_event, filename) => {
+        const file = filename?.toString().split(path.sep).join("/") ?? "";
+        if (!file || /(^|\/)(\.git|node_modules|dist|build|\.cache|coverage)(\/|$)/.test(file) || isSensitiveWorkspacePath(file)) return;
+        this.schedule();
+      });
+    } catch { /* Periodic reconciliation below is the portable watcher fallback. */ }
+    this.reconcileTimer = setInterval(() => this.schedule(0), 2_000);
+    this.reconcileTimer.unref();
+  }
+
+  close(): void {
+    this.watcher?.close();
+    this.watcher = undefined;
+    if (this.timer) clearTimeout(this.timer);
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+  }
+
+  private schedule(delay = 1_000): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.publish().catch((error: unknown) => console.error(err.warning(`Workspace synchronization failed: ${error instanceof Error ? error.message : String(error)}`)));
+    }, delay);
   }
 }
 
@@ -734,12 +833,15 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const adapter = adapterFor(provider, options.agentExecutable, options.claudeAuth);
   const roomParticipants = new Map<string, RoomParticipant>();
   let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
+  let latestSharedCheckpoint: WorkspaceCheckpoint | undefined;
+  let publishCheckpoint: (force?: boolean, targetParticipantId?: string) => Promise<void> = async () => { throw new Error("Workspace checkpoint publishing is not ready"); };
   const token = participantCode;
   const relay = new RoomRelay({
     roomId: prepared.roomId,
     token,
     hostName: options.name,
     onPrompt: async (prompt) => {
+      await publishCheckpoint();
       activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: prepared.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
       let promptText = prompt.text; try { promptText = openPrompt(localTransportKey, prompt.promptId, prompt.text); } catch { /* Host-local input is already plaintext. */ }
       await adapter.sendPrompt({
@@ -755,6 +857,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     },
     onApproval: async (_participant, requestId, decision) => adapter.resolveApproval(requestId, decision),
     onInput: async (_participant, requestId, answers, payload) => adapter.resolveInput(requestId, payload ? openInputAnswers(localTransportKey, requestId, payload) : answers ?? null),
+    onCheckpointRequest: (participantId) => publishCheckpoint(false, participantId),
     onRoomEvent: (message) => {
       if (message.type === "participant.joined") roomParticipants.set(message.participant.id, message.participant);
       if (message.type === "participant.left") roomParticipants.delete(message.participantId);
@@ -788,19 +891,39 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
   const previewWatcher = new AgentPreviewWatcher(agentPath, async (turnId, revision, diff) => {
     relay.publishCollaborationEvent(authority.previewEvent(turnId, revision, diff));
   });
-  const publishCheckpoint = async (force = false): Promise<void> => {
-    const checkpoint = await createWorkspaceCheckpoint({
-      cwd: workspacePath,
-      roomId: prepared.roomId,
-      sequence: checkpointSequence + 1,
-      baseCommit,
-      parentCommit: checkpointParent,
-      force,
+  const publishCheckpointNow = async (force = false, targetParticipantId?: string): Promise<void> => {
+    if (targetParticipantId) {
+      if (!latestSharedCheckpoint) throw new Error("No workspace checkpoint is available yet");
+      relay.publishWorkspaceCheckpoint(latestSharedCheckpoint, targetParticipantId);
+      return;
+    }
+    const published = await authority.withWorkspaceLock(async () => {
+      const checkpoint = await createWorkspaceCheckpoint({
+        cwd: workspacePath,
+        roomId: prepared.roomId,
+        sequence: checkpointSequence + 1,
+        baseCommit,
+        parentCommit: checkpointParent,
+        force,
+      });
+      if (!checkpoint) return undefined;
+      checkpointSequence = checkpoint.sequence;
+      checkpointParent = checkpoint.commit;
+      const portable = await createPortableWorkspaceCheckpoint({
+        cwd: workspacePath,
+        roomId: prepared.roomId,
+        sequence: checkpoint.sequence,
+        baseCommit,
+        sourceCommit: checkpoint.commit,
+      });
+      return encryptedWorkspaceCheckpoint(localTransportKey, portable);
     });
-    if (!checkpoint) return;
-    checkpointSequence = checkpoint.sequence;
-    checkpointParent = checkpoint.commit;
+    if (!published) return;
+    latestSharedCheckpoint = published;
+    relay.publishWorkspaceCheckpoint(latestSharedCheckpoint);
   };
+  publishCheckpoint = serializeWorkspaceCheckpointPublisher(publishCheckpointNow);
+  const workspaceWatcher = new HostWorkspaceWatcher(workspacePath, () => publishCheckpoint());
   retryProposal = async () => {
     const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal");
     const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: prepared.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation) });
@@ -854,6 +977,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
       stopping = true;
       input?.close();
       previewWatcher.close();
+      workspaceWatcher.close();
       await ipc.close();
       await relay.close();
       await adapter.stop();
@@ -875,6 +999,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
 
     const bound = await relay.listen({ host: options.listen, port: parsePort(options.port) });
     await publishCheckpoint(true);
+    workspaceWatcher.start();
     const invite = inviteUrl({
       ...(options.publicUrl ? { publicUrl: options.publicUrl } : {}),
       listenHost: options.listen,
@@ -1010,6 +1135,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
   let cleanupSignals: () => void = () => undefined;
   let shutdownTask: Promise<void> | undefined;
   let previewWatcher: AgentPreviewWatcher | undefined;
+  let workspaceWatcher: HostWorkspaceWatcher | undefined;
   let ipc: LocalIpcServer | undefined;
   let authorityForShutdown: RoomAuthority | undefined;
   let hostedForShutdown: DirectHostedWorkspace | undefined;
@@ -1019,6 +1145,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
       stopping = true;
       input?.close();
       previewWatcher?.close();
+      workspaceWatcher?.close();
       await ipc?.close();
       if (socket?.readyState === WebSocket.OPEN) socket.close(1000, "Host stopped room");
       await adapter.stop();
@@ -1063,6 +1190,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     let pendingConflict: { event: AgentEvent; proposalPath: string; turn: AgentTurnSnapshot } | undefined;
     const roomParticipants = new Map<string, RoomParticipant>();
     let retryProposal = async (): Promise<void> => { throw new Error("Proposal resolution is not ready"); };
+    let latestSharedCheckpoint: WorkspaceCheckpoint | undefined;
     const ipcToken = await writeSessionToken(path.join(hosted.sessionDirectory, "token"));
     ipc = new LocalIpcServer(ipcToken, async (payload) => {
       const request = payload as { type?: string; text?: string; model?: string; effort?: string; participantId?: string; capabilities?: Capability[]; requestId?: string | number; decision?: unknown; answers?: AgentInputAnswers | null };
@@ -1090,13 +1218,25 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     previewWatcher = new AgentPreviewWatcher(agentPath, async (turnId, revision, diff) => {
       sendToRelay({ type: "relay.collab.event", event: authority.previewEvent(turnId, revision, diff) });
     });
-    const publishCheckpoint = async (force = false, targetParticipantId?: string): Promise<void> => {
-      if (targetParticipantId) throw new Error("Participant workspace checkpoints are disabled");
-      const checkpoint = await createWorkspaceCheckpoint({ cwd: workspacePath, roomId: prepared.roomId, sequence: checkpointSequence + 1, baseCommit, parentCommit: checkpointParent, force });
-      if (!checkpoint) return;
-      checkpointSequence = checkpoint.sequence;
-      checkpointParent = checkpoint.commit;
-    };
+    const publishCheckpoint = serializeWorkspaceCheckpointPublisher(async (force = false, targetParticipantId?: string): Promise<void> => {
+      if (targetParticipantId) {
+        if (!latestSharedCheckpoint) throw new Error("No workspace checkpoint is available yet");
+        sendRemoteWorkspaceCheckpoint(sendToRelay, latestSharedCheckpoint, targetParticipantId);
+        return;
+      }
+      const published = await authority.withWorkspaceLock(async () => {
+        const checkpoint = await createWorkspaceCheckpoint({ cwd: workspacePath, roomId: prepared.roomId, sequence: checkpointSequence + 1, baseCommit, parentCommit: checkpointParent, force });
+        if (!checkpoint) return undefined;
+        checkpointSequence = checkpoint.sequence;
+        checkpointParent = checkpoint.commit;
+        const portable = await createPortableWorkspaceCheckpoint({ cwd: workspacePath, roomId: prepared.roomId, sequence: checkpoint.sequence, baseCommit, sourceCommit: checkpoint.commit });
+        return encryptedWorkspaceCheckpoint(relayTransportKey, portable);
+      });
+      if (!published) return;
+      latestSharedCheckpoint = published;
+      sendRemoteWorkspaceCheckpoint(sendToRelay, latestSharedCheckpoint);
+    });
+    workspaceWatcher = new HostWorkspaceWatcher(workspacePath, () => publishCheckpoint());
     retryProposal = async () => {
       const proposal = pendingConflict; if (!proposal) throw new Error("No pending proposal");
       const merge = await mergeAgentWorkspace({ sharedPath: workspacePath, agentPath, sessionDirectory: hosted.sessionDirectory, roomId: created.roomId, baseCommit, turn: proposal.turn, withCommitLock: (operation) => authority.withWorkspaceLock(operation) });
@@ -1149,6 +1289,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     console.log(out.success(`${out.label(`${activeAgentDisplayName} thread`)} ${out.muted(threadId)}`));
     previewWatcher.start();
     await publishCheckpoint(true);
+    workspaceWatcher.start();
     console.log(out.success(`${out.label("Remote room")} ${out.value(relayUrl)}`));
     const inviteToken = `${created.code}.${sessionSecret}`;
     console.log(`\n${out.label("Room token")} ${chalk.bold.cyan(inviteToken)}`);
@@ -1197,6 +1338,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
         if (processedPromptIds.has(message.prompt.promptId)) { sendToRelay({ type: "relay.prompt.failed", promptId: message.prompt.promptId, message: "Duplicate prompt replay rejected" }); return; }
         processedPromptIds.add(message.prompt.promptId); if (processedPromptIds.size > 10_000) processedPromptIds.delete(processedPromptIds.keys().next().value as string);
         void (async () => {
+          await publishCheckpoint();
           activeTurnBase = await prepareAgentTurnWorkspace({ sharedPath: workspacePath, agentPath, roomId: created.roomId, sequence: ++turnSequence, baseCommit, parentCommit: checkpointParent });
           await adapter.sendPrompt({
             promptId: message.prompt.promptId,
@@ -1220,6 +1362,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
           console.error(`\n${err.warning("Relay connection interrupted; attempting to resume the room…")}`);
           void resumeRemoteRoom(relayUrl, created.roomId, created.resumeToken).then(async (resumed) => {
             socket = resumed; attach(resumed); flushRelayMessages();
+            await publishCheckpoint(true);
             console.error(err.success("Remote room resumed."));
           }).catch((error: unknown) => { console.error(err.error(`Remote room could not resume: ${error instanceof Error ? error.message : String(error)}`)); resolve(); });
         });

@@ -136,7 +136,7 @@ export interface AgentQuestion {
 }
 
 export type AgentInputAnswers = Record<string, string | string[]>;
-export type ProtocolCapability = "agent-config-v1" | "generic-tools-v1" | "structured-input-v1";
+export type ProtocolCapability = "agent-config-v1" | "generic-tools-v1" | "structured-input-v1" | "workspace-mirror-v1";
 
 export type ApprovalDecision = "accept" | "decline" | "cancel";
 
@@ -195,7 +195,7 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
     token: z.string().min(1),
     name: z.string().trim().min(1).max(64),
     requestedRole: z.enum(["viewer", "participant"]).optional(),
-    protocolCapabilities: z.array(z.enum(["agent-config-v1", "generic-tools-v1", "structured-input-v1"])).max(16).optional(),
+    protocolCapabilities: z.array(z.enum(["agent-config-v1", "generic-tools-v1", "structured-input-v1", "workspace-mirror-v1"])).max(16).optional(),
   }),
   z.object({
     type: z.literal("prompt.submit"),
@@ -534,6 +534,7 @@ export type RoomServerMessage =
   | { type: "participant.joined"; participant: RoomParticipant }
   | { type: "participant.left"; participantId: string; name: string }
   | { type: "participant.capabilities"; participantId: string; capabilities: Capability[] }
+  | { type: "participant.syncing"; participantId: string; sequence: number }
   | { type: "prompt.queued"; prompt: QueuedPrompt; position: number }
   | { type: "prompt.updated"; prompt: QueuedPrompt }
   | { type: "prompt.removed"; promptId: string }
@@ -545,6 +546,7 @@ export type RoomServerMessage =
   | { type: "agent.encrypted"; eventType: string; status?: string; payload: string }
   | { type: "workspace.diff"; diff: WorkspaceDiff }
   | { type: "workspace.checkpoint"; checkpoint: WorkspaceCheckpoint }
+  | { type: "workspace.checkpoint.available"; checkpoint: WorkspaceCheckpointDescriptor }
   | { type: "workspace.checkpoint.start"; checkpoint: WorkspaceCheckpointDescriptor }
   | { type: "workspace.checkpoint.chunk"; chunk: WorkspaceCheckpointChunk }
   | { type: "workspace.checkpoint.complete"; sequence: number }

@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
   applyWorkspaceCheckpoint,
+  applyPortableWorkspaceCheckpoint,
   applyDirectWorkspaceCheckpoint,
   closeDirectHostedWorkspace,
   cleanupLegacyHostedWorkspace,
@@ -13,6 +14,9 @@ import {
   createTaskWorktree,
   createRoomWorktrees,
   createWorkspaceCheckpoint,
+  createPortableWorkspaceCheckpoint,
+  decryptWorkspaceCheckpointBundle,
+  encryptWorkspaceCheckpointBundle,
   inspectDirectCheckout,
   inspectManagedRoomWorktree,
   inspectRepository,
@@ -187,6 +191,79 @@ describe("workspace checkpoints", () => {
     expect(removed).toBe(state.root);
     await expect(readFile(state.markerPath, "utf8")).rejects.toThrow();
     expect(await readFile(path.join(repository, "file.txt"), "utf8")).toBe("original\n");
+  });
+});
+
+describe("portable workspace mirrors", () => {
+  it("materializes a self-contained encrypted snapshot without a participant clone", async () => {
+    const host = await mkdtemp(path.join(tmpdir(), "multicode-portable-host-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-portable-data-"));
+    await execFileAsync("git", ["init", "-q", host]);
+    await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(host, "shared.txt"), "initial\n");
+    await execFileAsync("git", ["-C", host, "add", "shared.txt"]);
+    await execFileAsync("git", ["-C", host, "commit", "-qm", "initial"]);
+    const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
+    await writeFile(path.join(host, "shared.txt"), "host version\n");
+    await writeFile(path.join(host, "new.txt"), "visible to both users\n");
+    const internal = await createWorkspaceCheckpoint({ cwd: host, roomId: "portable-room", sequence: 1, baseCommit });
+    if (!internal) throw new Error("Expected internal checkpoint");
+    const portable = await createPortableWorkspaceCheckpoint({ cwd: host, roomId: "portable-room", sequence: 1, baseCommit, sourceCommit: internal.commit });
+
+    const key = Buffer.alloc(32, 7);
+    const encrypted = encryptWorkspaceCheckpointBundle(key, portable.sequence, Buffer.from(portable.bundle, "base64"));
+    expect(encrypted.includes(Buffer.from("visible to both users"))).toBe(false);
+    const decrypted = decryptWorkspaceCheckpointBundle(key, portable.sequence, encrypted);
+    const state = await applyPortableWorkspaceCheckpoint({
+      dataDirectory,
+      roomId: "portable-room",
+      checkpoint: { ...portable, bundle: decrypted.toString("base64") },
+    });
+
+    expect(await readFile(path.join(state.root, "shared.txt"), "utf8")).toBe("host version\n");
+    expect(await readFile(path.join(state.root, "new.txt"), "utf8")).toBe("visible to both users\n");
+    expect((await execFileAsync("git", ["-C", state.root, "rev-list", "--count", "HEAD"])).stdout.trim()).toBe("1");
+  });
+
+  it("updates a clean mirror but preserves an accidental participant edit", async () => {
+    const host = await mkdtemp(path.join(tmpdir(), "multicode-portable-update-host-"));
+    const dataDirectory = await mkdtemp(path.join(tmpdir(), "multicode-portable-update-data-"));
+    await execFileAsync("git", ["init", "-q", host]);
+    await execFileAsync("git", ["-C", host, "config", "user.email", "multicode@example.invalid"]);
+    await execFileAsync("git", ["-C", host, "config", "user.name", "MultiCode"]);
+    await writeFile(path.join(host, "file.txt"), "base\n");
+    await execFileAsync("git", ["-C", host, "add", "file.txt"]);
+    await execFileAsync("git", ["-C", host, "commit", "-qm", "base"]);
+    const baseCommit = (await execFileAsync("git", ["-C", host, "rev-parse", "HEAD"])).stdout.trim();
+
+    await writeFile(path.join(host, "file.txt"), "one\n");
+    const firstInternal = await createWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 1, baseCommit });
+    if (!firstInternal) throw new Error("Expected first checkpoint");
+    const first = await createPortableWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 1, baseCommit, sourceCommit: firstInternal.commit });
+    const state = await applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: "portable-update", checkpoint: first });
+
+    await writeFile(path.join(host, "file.txt"), "two\n");
+    const secondInternal = await createWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 2, baseCommit, parentCommit: firstInternal.commit });
+    if (!secondInternal) throw new Error("Expected second checkpoint");
+    const second = await createPortableWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 2, baseCommit, sourceCommit: secondInternal.commit });
+    await applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: "portable-update", checkpoint: second });
+    expect(await readFile(path.join(state.root, "file.txt"), "utf8")).toBe("two\n");
+
+    await writeFile(path.join(state.root, "file.txt"), "participant edit\n");
+    await expect(applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: "portable-update", checkpoint: second })).rejects.toThrow(/local changes/);
+    await writeFile(path.join(host, "file.txt"), "three\n");
+    const thirdInternal = await createWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 3, baseCommit, parentCommit: secondInternal.commit });
+    if (!thirdInternal) throw new Error("Expected third checkpoint");
+    const third = await createPortableWorkspaceCheckpoint({ cwd: host, roomId: "portable-update", sequence: 3, baseCommit, sourceCommit: thirdInternal.commit });
+    await expect(applyPortableWorkspaceCheckpoint({ dataDirectory, roomId: "portable-update", checkpoint: third })).rejects.toThrow(/local changes/);
+    expect(await readFile(path.join(state.root, "file.txt"), "utf8")).toBe("participant edit\n");
+  });
+
+  it("rejects a checkpoint encrypted for another sequence", () => {
+    const key = Buffer.alloc(32, 9);
+    const encrypted = encryptWorkspaceCheckpointBundle(key, 3, Buffer.from("bundle"));
+    expect(() => decryptWorkspaceCheckpointBundle(key, 4, encrypted)).toThrow();
   });
 });
 

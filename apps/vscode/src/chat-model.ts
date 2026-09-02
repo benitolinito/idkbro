@@ -190,6 +190,11 @@ export class ChatModel {
         if (participant) this.participants.set(message.participantId, { ...participant, synced: true });
         break;
       }
+      case "participant.syncing": {
+        const participant = this.participants.get(message.participantId);
+        if (participant) this.participants.set(message.participantId, { ...participant, synced: false });
+        break;
+      }
       case "prompt.queued":
         if (!this.queue.some((prompt) => prompt.promptId === message.prompt.promptId)) this.queue.push(message.prompt);
         break;
@@ -223,6 +228,12 @@ export class ChatModel {
         break;
       case "workspace.checkpoint":
         this.add("system", `Workspace checkpoint ${message.checkpoint.sequence} · ${message.checkpoint.commit.slice(0, 12)}`);
+        break;
+      case "workspace.checkpoint.available":
+      case "workspace.checkpoint.start":
+      case "workspace.checkpoint.chunk":
+      case "workspace.checkpoint.complete":
+      case "workspace.checkpoint.request":
         break;
       case "collab.event":
       case "collab.rate_limited":

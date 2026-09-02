@@ -2,7 +2,7 @@
 
 > Codex workspace check: **working** (verified August 22, 2026).
 
-MultiCode lets a team co-prompt one Codex or Claude session running against the host's local repository. Participants share the prompt queue, streamed agent activity, approvals, structured questions, and read-only change previews; MultiCode does not synchronize or co-edit participant workspaces.
+MultiCode lets a team co-prompt one Codex or Claude session running against the host's local repository. Participants share the prompt queue, streamed agent activity, approvals, structured questions, change previews, and an encrypted read-only mirror of the host's latest workspace version.
 
 The public relay defaults to `wss://multicode.luisagd.com`, so the normal workflow uses short room codes instead of network configuration or accounts.
 
@@ -20,7 +20,8 @@ Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 - Observer, prompter, and reviewer capabilities are controlled by the host.
 - Prompts from all participants execute through one FIFO queue.
 - The selected agent runs in a temporary isolated worktree; accepted results are applied only to the host checkout.
-- The public relay sees routing metadata and encrypted payload sizes, not prompts, agent output, previews, or proposals.
+- VS Code participants receive the host's published file tree in a separate MultiCode-managed mirror; their existing folders are never overwritten.
+- The public relay sees routing metadata and encrypted payload sizes, not prompts, agent output, previews, proposals, or workspace contents.
 
 ## Requirements
 
@@ -112,7 +113,7 @@ The other person pastes the complete token:
 multicode join K7MNP-4XQ2R.<room-secret>
 ```
 
-Participants can submit prompts and follow encrypted agent activity. Their open folders and files remain entirely local and are never synchronized with the host. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
+Participants can submit prompts and follow encrypted agent activity. VS Code also adds a separate managed folder containing the host's latest verified workspace version; the terminal CLI remains conversation-only. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to leave or stop the room.
 
 Use names when desired:
 
@@ -240,7 +241,7 @@ Run `multicode --help` for operator/development commands. End users only need
 
 The host keeps using the original checkout. MultiCode never moves its branch or resets its index, and a per-repository lease prevents two hosted rooms from owning the checkout at once. The selected agent uses one temporary detached worktree, which is removed when the host stops. Accepted agent changes appear as ordinary changes in the host working tree.
 
-Participants never receive a workspace checkpoint, lease a checkout, or modify host files. Room creation is rejected while the host repository is in the middle of a merge, rebase, cherry-pick, or revert.
+VS Code participants receive encrypted, self-contained workspace checkpoints in a separate MultiCode-managed repository. A checkpoint is applied only when that mirror is clean, and it never resets or edits the participant's existing checkout. Room creation is rejected while the host repository is in the middle of a merge, rebase, cherry-pick, or revert.
 
 ## Development
 
@@ -289,6 +290,7 @@ the same version only produce temporary Actions artifacts.
 - Claude active-turn steering remains disabled until its semantics are verified; queued prompts and interruption are supported.
 - Only one regular agent turn or pending proposal is allowed at a time.
 - The host device must remain online. A transient host relay connection can resume, but rooms do not survive the host device being offline.
-- Participants cannot directly edit or synchronize the host workspace.
+- Participant mirrors are view-oriented; edits made inside a mirror are preserved locally but pause further synchronization instead of changing the host.
+- Encrypted workspace mirrors are limited to 32 MiB per checkpoint and do not materialize ignored dependency directories or nested submodule checkouts.
 - Conflict resolution is host-driven: reviewers inspect the encrypted proposal, and the host resolves the local files before retrying.
 - Relay process restarts are not persisted as live WebSocket rooms; host-local authoritative state and acknowledged edits remain recoverable from SQLite.
