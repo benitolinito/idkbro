@@ -110,7 +110,7 @@ p { margin: 0; }
 .hero-proof span { display: flex; align-items: center; gap: 7px; }
 .hero-proof span::before { color: var(--blue); content: "✓"; font-family: var(--sans); font-weight: 800; }
 
-.hero-stage { position: relative; width: min(830px, 61vw); margin-left: 0; perspective: 1500px; }
+.hero-stage { position: relative; width: min(830px, 61vw); margin-left: 0; padding-left: clamp(28px, 3.5vw, 52px); perspective: 1500px; }
 .glow-orb { position: absolute; z-index: -1; border-radius: 50%; filter: blur(30px); }
 .glow-one { top: -25px; right: 3%; width: 360px; height: 360px; background: rgba(21, 94, 239, .13); }
 .glow-two { bottom: -30px; left: 10%; width: 310px; height: 250px; background: rgba(202, 255, 96, .14); }
@@ -463,7 +463,7 @@ p { margin: 0; }
 @media (max-width: 1100px) {
   .hero { grid-template-columns: 1fr; padding-top: 150px; padding-bottom: 100px; }
   .hero-copy { max-width: 730px; }
-  .hero-stage { width: min(900px, 100%); margin: 30px auto 0; }
+  .hero-stage { width: min(900px, 100%); margin: 30px auto 0; padding-left: 0; }
   .app-window { transform: none; }
   .security-diagram { transform: scale(.9); }
 }
