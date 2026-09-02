@@ -98,7 +98,7 @@ p { margin: 0; }
 .button-ghost { border-color: var(--line); background: rgba(255, 255, 255, .4); }
 .button-ghost:hover { border-color: rgba(17, 19, 24, .3); background: rgba(255,255,255,.7); }
 
-.hero { display: grid; min-height: 790px; grid-template-columns: .78fr 1.32fr; align-items: center; gap: 30px; padding-top: 112px; }
+.hero { display: grid; min-height: 790px; grid-template-columns: minmax(360px, .78fr) 1.32fr; align-items: center; gap: clamp(72px, 5vw, 96px); padding-top: 112px; }
 .hero-copy { position: relative; z-index: 3; padding-bottom: 18px; }
 .eyebrow { display: flex; align-items: center; gap: 9px; margin-bottom: 25px; color: #4d525c; font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
 .status-dot, .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #58c06e; box-shadow: 0 0 0 4px rgba(88, 192, 110, .13); }
@@ -110,7 +110,7 @@ p { margin: 0; }
 .hero-proof span { display: flex; align-items: center; gap: 7px; }
 .hero-proof span::before { color: var(--blue); content: "✓"; font-family: var(--sans); font-weight: 800; }
 
-.hero-stage { position: relative; width: 830px; margin-left: -32px; perspective: 1500px; }
+.hero-stage { position: relative; width: min(830px, 61vw); margin-left: 0; perspective: 1500px; }
 .glow-orb { position: absolute; z-index: -1; border-radius: 50%; filter: blur(30px); }
 .glow-one { top: -25px; right: 3%; width: 360px; height: 360px; background: rgba(21, 94, 239, .13); }
 .glow-two { bottom: -30px; left: 10%; width: 310px; height: 250px; background: rgba(202, 255, 96, .14); }
