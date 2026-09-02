@@ -4,7 +4,7 @@
   "description": "Host and join collaborative Codex or Claude sessions from VS Code.",
   "version": "0.4.10",
   "private": true,
-  "publisher": "multicode",
+  "publisher": "benitolinito1",
   "license": "MIT",
   "repository": {
     "type": "git",
