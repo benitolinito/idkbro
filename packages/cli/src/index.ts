@@ -1326,7 +1326,7 @@ async function joinRoom(inviteOrCode: string, options: { name: string; relay?: s
   };
 
   const closed = new Promise<void>((resolve, reject) => {
-    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, requestedRole: options.viewer ? "viewer" : "participant", protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"] }));
+    socket.send(JSON.stringify({ type: "room.join", token, name: options.name, ...(options.viewer ? { requestedRole: "viewer" } : {}), protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"] }));
     socket.on("message", (data) => {
       let message: RoomServerMessage;
       try {

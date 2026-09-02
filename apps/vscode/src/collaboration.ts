@@ -198,7 +198,7 @@ export class CollaborationBridge implements vscode.Disposable {
         type: "room.join",
         token: code,
         name: this.displayName,
-        requestedRole: this.requestedRole,
+        ...(this.requestedRole === "viewer" ? { requestedRole: "viewer" } : {}),
         protocolCapabilities: ["agent-config-v1", "generic-tools-v1", "structured-input-v1"],
       }));
     });
