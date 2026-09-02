@@ -738,7 +738,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     function renderModelControls() {
       const config = state.agentConfig;
       const models = Array.isArray(config?.models) ? config.models : [];
-      const sharedSettings = (config?.model || '') + '\n' + (config?.effort || '');
+      const sharedSettings = (config?.model || '') + '\\n' + (config?.effort || '');
       if (sharedSettings !== appliedSharedSettings) {
         appliedSharedSettings = sharedSettings;
         selectedModel = config?.model || '';
