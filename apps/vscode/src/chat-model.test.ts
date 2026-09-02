@@ -41,8 +41,8 @@ describe("ChatModel", () => {
     const model = new ChatModel();
     model.start("host");
     model.handle(welcome());
-    const firstConnection = { ...editor, id: "ben-cli", name: "benlin" };
-    const liveConnection = { ...editor, id: "ben-extension", name: "benlin" };
+    const firstConnection = { ...participant, id: "ben-cli", name: "benlin" };
+    const liveConnection = { ...participant, id: "ben-extension", name: "benlin" };
 
     model.handle({ type: "participant.joined", participant: firstConnection });
     model.handle({ type: "participant.left", participantId: firstConnection.id, name: firstConnection.name });
@@ -60,8 +60,8 @@ describe("ChatModel", () => {
   it("does not announce a transport leaving while the same participant has another connection", () => {
     const model = new ChatModel();
     model.handle(welcome());
-    const firstConnection = { ...editor, id: "ben-cli", name: "Benlin" };
-    const liveConnection = { ...editor, id: "ben-extension", name: "benlin" };
+    const firstConnection = { ...participant, id: "ben-cli", name: "Benlin" };
+    const liveConnection = { ...participant, id: "ben-extension", name: "benlin" };
 
     model.handle({ type: "participant.joined", participant: firstConnection });
     model.handle({ type: "participant.joined", participant: liveConnection });
