@@ -1,6 +1,6 @@
 # MultiCode
 
-> Test changes: **working** (verified September 1, 2026).
+> Shared-change test: **If you can read this, the README update reached the other user.** (September 1, 2026)
 
 MultiCode lets a team co-prompt one Codex or Claude session running against the host's local repository. Participants share the prompt queue, streamed agent activity, approvals, structured questions, change previews, and an encrypted read-only mirror of the host's latest workspace version.
 
