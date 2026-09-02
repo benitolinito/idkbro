@@ -149,6 +149,12 @@ export class CollaborationBridge implements vscode.Disposable {
     return true;
   }
 
+  updateAgentSettings(model: string, effort: string): boolean {
+    if (this.socket?.readyState !== WebSocket.OPEN || !model || !effort) return false;
+    this.socket.send(JSON.stringify({ type: "agent.settings.update", model, effort }));
+    return true;
+  }
+
   updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string } = {}): boolean {
     if (!this.promptKey || this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ type: "prompt.update", promptId, text: this.sealPrompt(promptId, text), ...settings }));

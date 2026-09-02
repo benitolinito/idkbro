@@ -76,6 +76,9 @@ describe("RelayServer", () => {
       config: { model: "gpt-5.6-sol", effort: "medium", models: [] },
     }));
     expect(await participant.messages.next("agent.config")).toMatchObject({ config: { model: "gpt-5.6-sol", effort: "medium" } });
+    participant.socket.send(JSON.stringify({ type: "agent.settings.update", model: "gpt-5.6-terra", effort: "high" }));
+    expect(await participant.messages.next("agent.config")).toMatchObject({ config: { model: "gpt-5.6-terra", effort: "high" } });
+    expect(await host.messages.next("agent.config")).toMatchObject({ config: { model: "gpt-5.6-terra", effort: "high" } });
     host.socket.send(JSON.stringify({ type: "relay.participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "prompter", "reviewer"] }));
     expect(await participant.messages.next("participant.capabilities")).toEqual({ type: "participant.capabilities", participantId: joined.participant.id, capabilities: ["viewer", "prompter", "reviewer"] });
 
@@ -125,6 +128,32 @@ describe("RelayServer", () => {
     const preview = { id: randomUUID(), kind: "agent.preview", payload: "encrypted-preview" } as const;
     host.socket.send(JSON.stringify({ type: "relay.collab.event", event: preview }));
     expect((await participant.messages.next("collab.event")).event).toEqual(preview);
+  });
+
+  it("persists shared model and reasoning settings for users who join later", async () => {
+    const server = new RelayServer({});
+    servers.push(server);
+    const { port } = await server.listen({ host: "127.0.0.1", port: 0 });
+    const host = await open(`ws://127.0.0.1:${port}/host`); sockets.push(host.socket);
+    host.socket.send(JSON.stringify({ type: "relay.room.create", name: "Ada" }));
+    const created = await host.messages.next("relay.room.created");
+    host.socket.send(JSON.stringify({
+      type: "relay.agent.config",
+      config: {
+        model: "gpt-5.6-sol",
+        effort: "medium",
+        models: [{ id: "sol", model: "gpt-5.6-sol", displayName: "Sol", description: "", isDefault: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "" }, { reasoningEffort: "high", description: "" }] }],
+      },
+    }));
+    const first = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`); sockets.push(first.socket);
+    first.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Grace" }));
+    await first.messages.next("room.welcome");
+    first.socket.send(JSON.stringify({ type: "agent.settings.update", model: "gpt-5.6-sol", effort: "high" }));
+    await first.messages.next("agent.config");
+
+    const late = await open(`ws://127.0.0.1:${port}/rooms/${created.code}`); sockets.push(late.socket);
+    late.socket.send(JSON.stringify({ type: "room.join", token: created.code, name: "Linus" }));
+    expect(await late.messages.next("room.welcome")).toMatchObject({ agentConfig: { model: "gpt-5.6-sol", effort: "high" } });
   });
 
   it("enforces the configured participant capacity", async () => {

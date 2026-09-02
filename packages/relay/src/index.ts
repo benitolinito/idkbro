@@ -314,6 +314,31 @@ export class RoomRelay {
       void this.options.onInput?.(state.participant, parsed.data.requestId, parsed.data.answers, parsed.data.payload).catch((error: unknown) => this.send(socket, { type: "room.error", message: error instanceof Error ? error.message : String(error) })); return;
     }
 
+    if (parsed.data.type === "agent.settings.update") {
+      const settings = parsed.data;
+      if (!state.participant.capabilities.includes("prompter")) {
+        this.send(socket, { type: "room.error", message: "Participant does not have prompter capability" });
+        return;
+      }
+      if (!this.agentConfig) {
+        this.send(socket, { type: "room.error", message: "Agent settings are not available yet" });
+        return;
+      }
+      const selectedModel = this.agentConfig.models.find((model) => model.model === settings.model);
+      if (this.agentConfig.models.length && !selectedModel) {
+        this.send(socket, { type: "room.error", message: "Selected model is not available in this room" });
+        return;
+      }
+      if (selectedModel?.supportedReasoningEfforts.length
+        && !selectedModel.supportedReasoningEfforts.some((option) => option.reasoningEffort === settings.effort)) {
+        this.send(socket, { type: "room.error", message: "Selected reasoning level is not available for this model" });
+        return;
+      }
+      this.agentConfig = { ...this.agentConfig, model: settings.model, effort: settings.effort };
+      this.broadcast({ type: "agent.config", config: this.agentConfig });
+      return;
+    }
+
     if (parsed.data.type === "prompt.update" || parsed.data.type === "prompt.remove" || parsed.data.type === "prompt.steer") {
       const queueAction = parsed.data;
       if (!this.allowRate(state, "queue", 60, 60_000)) { this.send(socket, { type: "room.error", message: "Queue action rate limit exceeded" }); return; }

@@ -214,6 +214,11 @@ export const roomClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("prompt.remove"), promptId: z.string().min(1) }),
   z.object({ type: z.literal("prompt.steer"), promptId: z.string().min(1) }),
   z.object({
+    type: z.literal("agent.settings.update"),
+    model: z.string().trim().min(1).max(128),
+    effort: z.string().trim().min(1).max(32),
+  }),
+  z.object({
     type: z.literal("workspace.ack"),
     sequence: z.number().int().positive(),
     commit: z.string().min(1).max(128),

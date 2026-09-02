@@ -12,6 +12,7 @@ export interface ChatActions {
   join(token?: string): void | Promise<void>;
   stop(): void | Promise<void>;
   submit(text: string, settings: { model?: string; effort?: string }): void | Promise<void>;
+  updateAgentSettings(model: string, effort: string): void | Promise<void>;
   updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string }): void | Promise<void>;
   removeQueuedPrompt(promptId: string): void | Promise<void>;
   steerQueuedPrompt(promptId: string): void | Promise<void>;
@@ -31,6 +32,7 @@ type WebviewMessage =
   | { type: "join"; token?: string }
   | { type: "stop" }
   | { type: "submit"; text?: string; model?: string; effort?: string }
+  | { type: "agentSettings"; model?: string; effort?: string }
   | { type: "queueUpdate"; promptId?: string; text?: string; model?: string; effort?: string }
   | { type: "queueRemove"; promptId?: string }
   | { type: "queueSteer"; promptId?: string }
@@ -126,6 +128,9 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
         });
         break;
       }
+      case "agentSettings":
+        if (message.model?.trim() && message.effort?.trim()) await this.actions.updateAgentSettings(message.model.trim(), message.effort.trim());
+        break;
       case "queueUpdate": {
         const promptId = message.promptId?.trim();
         const text = message.text?.trim();
@@ -448,6 +453,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     const savedComposer = vscode.getState() || {};
     let selectedModel = typeof savedComposer.model === 'string' ? savedComposer.model : '';
     let selectedEffort = typeof savedComposer.effort === 'string' ? savedComposer.effort : '';
+    let appliedSharedSettings = '';
     let joinVisible = false;
     let editingQueuePromptId = '';
     let queuedPromptDraft = '';
@@ -732,6 +738,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
     function renderModelControls() {
       const config = state.agentConfig;
       const models = Array.isArray(config?.models) ? config.models : [];
+      const sharedSettings = (config?.model || '') + '\n' + (config?.effort || '');
+      if (sharedSettings !== appliedSharedSettings) {
+        appliedSharedSettings = sharedSettings;
+        selectedModel = config?.model || '';
+        selectedEffort = config?.effort || '';
+      }
       if (!selectedModel) selectedModel = config?.model || models.find(model => model.isDefault)?.model || models[0]?.model || '';
       if (models.length && !models.some(model => model.model === selectedModel)) selectedModel = config?.model || models.find(model => model.isDefault)?.model || models[0]?.model || '';
 
@@ -1306,8 +1318,12 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
       elements.send.disabled = state.connection !== 'connected' || !elements.prompt.value.trim();
     });
     elements.prompt.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submitPrompt(); } });
-    elements.model.addEventListener('change', () => { selectedModel = elements.model.value; selectedEffort = ''; renderModelControls(); });
-    elements.effort.addEventListener('change', () => { selectedEffort = elements.effort.value; rememberComposer(); });
+    const publishAgentSettings = () => {
+      rememberComposer();
+      if (state.connection === 'connected' && selectedModel && selectedEffort) post('agentSettings', { model: selectedModel, effort: selectedEffort });
+    };
+    elements.model.addEventListener('change', () => { selectedModel = elements.model.value; selectedEffort = ''; renderModelControls(); publishAgentSettings(); });
+    elements.effort.addEventListener('change', () => { selectedEffort = elements.effort.value; publishAgentSettings(); });
     elements.send.onclick = submitPrompt;
     elements.back.onclick = () => { joinVisible = false; post('back'); };
     elements.copy.onclick = () => post('copyInvite');

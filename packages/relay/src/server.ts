@@ -267,6 +267,29 @@ class CentralRoom {
     const participantMessage = parsed.data;
     const participant = this.participants.get(socket);
     if (!participant) return;
+    if (participantMessage.type === "agent.settings.update") {
+      if (!participant.capabilities.includes("prompter")) {
+        send(socket, { type: "room.error", message: "Participant does not have prompter capability" });
+        return;
+      }
+      if (!this.agentConfig) {
+        send(socket, { type: "room.error", message: "Agent settings are not available yet" });
+        return;
+      }
+      const selectedModel = this.agentConfig.models.find((model) => model.model === participantMessage.model);
+      if (this.agentConfig.models.length && !selectedModel) {
+        send(socket, { type: "room.error", message: "Selected model is not available in this room" });
+        return;
+      }
+      if (selectedModel?.supportedReasoningEfforts.length
+        && !selectedModel.supportedReasoningEfforts.some((option) => option.reasoningEffort === participantMessage.effort)) {
+        send(socket, { type: "room.error", message: "Selected reasoning level is not available for this model" });
+        return;
+      }
+      this.agentConfig = { ...this.agentConfig, model: participantMessage.model, effort: participantMessage.effort };
+      this.broadcast({ type: "agent.config", config: this.agentConfig });
+      return;
+    }
     if (participantMessage.type === "workspace.ack") {
       if (!this.latestCheckpoint || participantMessage.sequence !== this.latestCheckpoint.sequence || participantMessage.commit !== this.latestCheckpoint.commit) {
         send(socket, { type: "room.error", message: "Workspace acknowledgement does not match the latest checkpoint" });

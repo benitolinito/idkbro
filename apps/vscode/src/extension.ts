@@ -53,6 +53,7 @@ class MultiCodeController implements vscode.Disposable {
       join: (token) => this.join(token),
       stop: () => this.stop(),
       submit: (text, settings) => this.submitPrompt(text, settings),
+      updateAgentSettings: (model, effort) => this.updateAgentSettings(model, effort),
       updateQueuedPrompt: (promptId, text, settings) => this.updateQueuedPrompt(promptId, text, settings),
       removeQueuedPrompt: (promptId) => this.removeQueuedPrompt(promptId),
       steerQueuedPrompt: (promptId) => this.steerQueuedPrompt(promptId),
@@ -224,6 +225,11 @@ class MultiCodeController implements vscode.Disposable {
       return;
     }
     this.process.stdin.write(`${prompt}\n`);
+  }
+
+  updateAgentSettings(model: string, effort: string): void {
+    if (this.collaboration.updateAgentSettings(model, effort)) return;
+    void vscode.window.showWarningMessage("MultiCode is reconnecting; the shared agent settings were not updated.");
   }
 
   updateQueuedPrompt(promptId: string, text: string, settings: { model?: string; effort?: string } = {}): void {
