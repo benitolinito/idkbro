@@ -627,7 +627,7 @@ class MultiCodeController implements vscode.Disposable {
     const configured = vscode.workspace.getConfiguration("multicode").get<string>("executable", "multicode").trim();
     if (configured !== "multicode") return { executable: configured, prefixArgs: [] };
 
-    const bundledCli = path.join(this.context.extensionPath, "dist/multicode-cli.cjs");
+    const bundledCli = path.join(this.context.extensionPath, "dist/multicode-cli.mjs");
     if (existsSync(bundledCli)) return { executable: "node", prefixArgs: [bundledCli] };
     const developmentCli = path.resolve(this.context.extensionPath, "../../packages/cli/dist/index.js");
     if (existsSync(developmentCli)) return { executable: "node", prefixArgs: [developmentCli] };

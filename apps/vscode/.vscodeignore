@@ -4,8 +4,11 @@ tsconfig.json
 **/*.map
 **/*.tsbuildinfo
 dist/*.mjs
+!dist/multicode-cli.mjs
+dist/multicode-cli.cjs
 dist/*.d.ts
 dist/*.test.js
+dist/ink-devtools-shim.js
 dist/chat-model.js
 dist/chat-view.js
 dist/collaboration.js

@@ -48,6 +48,7 @@ import { discoverLiveSessionForWorkspace } from "./live-session.js";
 import { claudeAuthMode, claudeEnvironment, preflightClaudeAuthentication, readClaudeAuthStatus, type ClaudeAuthMode } from "./claude-auth.js";
 import { renderTerminalMarkdown } from "./markdown.js";
 import { parseWorkspaceNumstat } from "./workspace-diff.js";
+import { runInteractiveCli } from "./ui.js";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
@@ -148,7 +149,7 @@ function denyUnsupportedStructuredInput(
   participants: Map<string, RoomParticipant>,
   resolve: (requestId: string, answers: AgentInputAnswers | null) => Promise<void>,
 ): void {
-  if (process.stdin.isTTY || [...participants.values()].some((participant) => participant.capabilities.includes("reviewer") && participant.protocolCapabilities?.includes("structured-input-v1"))) return;
+  if (process.stdin.isTTY || process.env.MULTICODE_TUI_CHILD === "1" || [...participants.values()].some((participant) => participant.capabilities.includes("reviewer") && participant.protocolCapabilities?.includes("structured-input-v1"))) return;
   const timer = setTimeout(() => {
     if ([...participants.values()].some((participant) => participant.capabilities.includes("reviewer") && participant.protocolCapabilities?.includes("structured-input-v1"))) return;
     void resolve(event.requestId, null).catch(() => undefined);
@@ -1640,7 +1641,16 @@ relay
   .option("--max-participants-per-room <count>", "maximum participants per room, including the host", process.env.MULTICODE_MAX_PARTICIPANTS_PER_ROOM ?? "32")
   .action(serveRelay);
 
-program.parseAsync().catch((error: unknown) => {
+const shouldLaunchInteractiveUi = process.argv.length === 2
+  && process.env.MULTICODE_TUI_CHILD !== "1"
+  && process.stdin.isTTY
+  && process.stdout.isTTY;
+
+const execution = shouldLaunchInteractiveUi
+  ? runInteractiveCli({ entryPath: process.argv[1] as string, cwd: process.cwd(), name: defaultName })
+  : program.parseAsync();
+
+execution.catch((error: unknown) => {
   console.error(err.error(`${err.label("Error")} ${error instanceof Error ? error.message : String(error)}`));
   process.exitCode = 1;
 });

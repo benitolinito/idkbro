@@ -84,6 +84,14 @@ multicode doctor
 multicode doctor --agent claude --claude-auth subscription
 ```
 
+Run `multicode` with no arguments to open the interactive terminal UI. Use the
+launcher to host with Codex or Claude, or paste a room token to join. The existing
+subcommands remain available for scripts and direct invocation.
+
+```bash
+multicode
+```
+
 ## Everyday workflow
 
 ### 1. Start a room
@@ -91,6 +99,8 @@ multicode doctor --agent claude --claude-auth subscription
 From the Git repository you want to work on:
 
 ```bash
+multicode
+# Or start a room directly:
 multicode host
 multicode host --agent claude --claude-auth subscription
 ```
