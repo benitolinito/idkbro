@@ -1,8 +1,8 @@
 {
   "name": "multicode-vscode",
-  "displayName": "MultiCode",
-  "description": "Host and join collaborative Codex or Claude sessions from VS Code.",
-  "version": "0.4.10",
+  "displayName": "MultiCode — Shared Codex & Claude Sessions",
+  "description": "Pair-program through one shared Codex or Claude coding-agent session with live prompts, approvals, diffs, and encrypted workspace previews.",
+  "version": "0.4.11",
   "private": true,
   "publisher": "benitolinito1",
   "license": "MIT",
@@ -10,20 +10,57 @@
     "type": "git",
     "url": "https://github.com/benitolinito/idkbro.git"
   },
+  "homepage": "https://github.com/benitolinito/idkbro#readme",
+  "bugs": {
+    "url": "https://github.com/benitolinito/idkbro/issues"
+  },
+  "pricing": "Free",
+  "qna": "marketplace",
   "engines": {
     "vscode": "^1.96.0"
   },
   "categories": [
+    "Machine Learning",
     "Other"
   ],
   "keywords": [
+    "ai",
+    "ai coding",
+    "ai agent",
+    "coding agent",
+    "agentic coding",
     "codex",
+    "openai codex",
     "claude",
+    "claude code",
     "collaboration",
-    "pair programming"
+    "pair programming",
+    "collaborative coding",
+    "remote pair programming",
+    "multi-agent",
+    "agent collaboration",
+    "prompt sharing",
+    "code review",
+    "workspace sharing"
   ],
   "main": "./dist/extension.js",
   "icon": "media/multicode-square.png",
+  "galleryBanner": {
+    "color": "#0B1220",
+    "theme": "dark"
+  },
+  "badges": [
+    {
+      "url": "https://img.shields.io/visual-studio-marketplace/v/benitolinito1.multicode-vscode",
+      "href": "https://marketplace.visualstudio.com/items?itemName=benitolinito1.multicode-vscode",
+      "description": "Visual Studio Marketplace version"
+    },
+    {
+      "url": "https://img.shields.io/visual-studio-marketplace/i/benitolinito1.multicode-vscode",
+      "href": "https://marketplace.visualstudio.com/items?itemName=benitolinito1.multicode-vscode",
+      "description": "Visual Studio Marketplace installs"
+    }
+  ],
   "dependencies": {
     "@multicode/protocol": "0.0.0",
     "@multicode/workspace": "0.0.0",

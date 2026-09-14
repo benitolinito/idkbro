@@ -32,6 +32,12 @@ Host + Agent ── outbound WSS ──▶ multicode.luisagd.com ◀── outbo
 
 ## VS Code extension
 
+[Install MultiCode from the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=benitolinito1.multicode-vscode), or install it from VS Code with:
+
+```text
+ext install benitolinito1.multicode-vscode
+```
+
 Download the latest packaged extension from
 [GitHub Releases](https://github.com/benitolinito/idkbro/releases/latest), or
 build and install it from this checkout:
@@ -40,7 +46,7 @@ build and install it from this checkout:
 npm install
 npm run build
 npm run package -w multicode-vscode
-code --install-extension apps/vscode/multicode-vscode-0.4.10.vsix
+code --install-extension apps/vscode/multicode-vscode-0.4.11.vsix
 ```
 
 Reload VS Code after installation. Open the Command Palette with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> or <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>, then use:

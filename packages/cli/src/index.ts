@@ -52,6 +52,7 @@ import { runInteractiveCli } from "./ui.js";
 
 const execFileAsync = promisify(execFile);
 const defaultRelayUrl = process.env.MULTICODE_RELAY_URL ?? "wss://multicode.luisagd.com";
+const marketplaceExtensionUrl = "https://marketplace.visualstudio.com/items?itemName=benitolinito1.multicode-vscode";
 const inviteAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 let activeAgentDisplayName = "Agent";
 
@@ -972,6 +973,7 @@ async function hostRoom(options: HostRoomOptions): Promise<void> {
     console.log(out.success(`${out.label("Room")} ${out.value(prepared.roomId)} ${out.muted("listening on")} ${out.value(`${options.listen}:${bound.port}`)}`));
     console.log(`\n${out.label("Invite someone with")}`);
     console.log(`  ${out.command(`multicode room join '${invite}' --name 'Their name'`)}`);
+    console.log(`  ${out.muted("VS Code:")} ${out.value(marketplaceExtensionUrl)}`);
     if (!options.publicUrl && options.listen === "127.0.0.1") {
       console.log(`\n${out.warning("Local-only listener.")} ${out.muted("Use")} ${out.command("--listen 0.0.0.0")} ${out.muted("for trusted LAN access or")} ${out.command("--public-url")} ${out.muted("with a secure tunnel.")}`);
     }
@@ -1217,6 +1219,7 @@ async function hostRemoteRoom(options: HostRoomOptions): Promise<void> {
     console.log(`\n${out.label("Invite someone with")}`);
     const relayArgument = relayUrl === defaultRelayUrl ? "" : ` --relay '${relayUrl}'`;
     console.log(`  ${out.command(`multicode join ${inviteToken}${relayArgument} --name 'Their name'`)}`);
+    console.log(`  ${out.muted("VS Code:")} ${out.value(marketplaceExtensionUrl)}`);
     console.log(`\n${chalk.green("●")} ${out.label("Ready for prompts")} ${out.muted("Type a prompt and press Enter. Shared prompts run in queue order.")}`);
 
     const handleRelayMessage = (data: WebSocket.RawData) => {

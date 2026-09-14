@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { hostApprovalCliArgs } from "./approval.js";
 import { MultiCodeChatView } from "./chat-view.js";
 import { CollaborationBridge } from "./collaboration.js";
+import { inviteShareText } from "./invite.js";
 import { parseWorkspaceFileReference } from "./file-link.js";
 import { hostingRepositoryWarning, resolveHostingDirectory } from "./host-workspace.js";
 import { roomSessionFromOutput, roomTokenFromOutput, roomWorkspaceFromOutput } from "./output-parser.js";
@@ -320,8 +321,8 @@ class MultiCodeController implements vscode.Disposable {
 
   async copyInvite(): Promise<void> {
     if (!this.roomCode) return;
-    await vscode.env.clipboard.writeText(this.roomCode);
-    void vscode.window.showInformationMessage("MultiCode invite token copied.");
+    await vscode.env.clipboard.writeText(inviteShareText(this.roomCode));
+    void vscode.window.showInformationMessage("MultiCode invite instructions copied.");
   }
 
   openOutput(): void {
@@ -508,8 +509,8 @@ class MultiCodeController implements vscode.Disposable {
         this.chat.ready(this.roomCode.slice(0, 11));
         this.status.text = `$(broadcast) MultiCode: ${this.roomCode.slice(0, 11)}`;
         this.status.tooltip = "Click to send a prompt";
-        void vscode.env.clipboard.writeText(this.roomCode);
-        void vscode.window.showInformationMessage("MultiCode room is ready. Its invite token was copied to your clipboard.");
+        void vscode.env.clipboard.writeText(inviteShareText(this.roomCode));
+        void vscode.window.showInformationMessage("MultiCode room is ready. Shareable install and join instructions were copied to your clipboard.");
         const config = vscode.workspace.getConfiguration("multicode");
         const relay = config.get<string>("relayUrl")?.trim() || "wss://multicode.luisagd.com";
         const name = config.get<string>("displayName")?.trim() || this.defaultName();

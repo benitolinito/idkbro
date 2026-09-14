@@ -10,6 +10,7 @@ dist/*.d.ts
 dist/*.test.js
 dist/ink-devtools-shim.js
 dist/chat-model.js
+dist/invite.js
 dist/chat-view.js
 dist/collaboration.js
 *.vsix

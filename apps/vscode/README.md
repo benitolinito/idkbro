@@ -1,22 +1,82 @@
-# MultiCode for VS Code
+<p align="center">
+  <img src="media/multicode-square.png" width="128" alt="MultiCode logo">
+</p>
 
-Host or join a shared Codex or Claude session without leaving VS Code. The extension includes a MultiCode activity-bar view with streaming reasoning and responses, command, tool, question, and diff cards, participants, prompt queue state, and room controls. Raw process activity remains available in the **MultiCode** output channel.
+# MultiCode — Shared Codex & Claude Sessions
+
+Pair-program with teammates through one shared Codex or Claude coding-agent session—without leaving VS Code.
+
+[Install from the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=benitolinito1.multicode-vscode) · [Documentation](https://github.com/benitolinito/idkbro) · [Report an issue](https://github.com/benitolinito/idkbro/issues)
+
+## Start collaborating
+
+1. Open a Git repository in VS Code.
+2. Run **MultiCode: Host Room** from the Command Palette.
+3. Send the copied invitation to your teammate. It contains the Marketplace install link and the encrypted room token.
+
+Your teammate installs MultiCode, runs **MultiCode: Join Room**, and pastes the token. Only the host needs the repository and coding-agent CLI.
+
+## One agent session, shared with your team
+
+- **Host Codex or Claude locally.** Keep the agent, credentials, and authoritative checkout on the host's machine.
+- **Share the prompt queue.** Teammates can submit, edit, remove, and steer queued prompts through one FIFO workflow.
+- **Follow work live.** See streaming reasoning, responses, commands, tool activity, questions, approvals, and participant presence.
+- **Review changes safely.** Participants receive encrypted, verified workspace previews in an isolated managed mirror.
+- **Stay in control.** The host controls viewer, prompter, and reviewer capabilities and resolves sensitive approvals.
+
+## How it works
+
+```text
+Host + Codex/Claude ── encrypted outbound WSS ──▶ MultiCode relay
+                                                    ▲
+                                                    │ encrypted outbound WSS
+                                                    │
+                                              Teammate in VS Code
+```
+
+The relay routes encrypted session traffic. Prompt contents, agent output, approvals, and workspace previews are encrypted end to end with the secret contained in the complete invitation token.
+
+## Requirements
+
+### Host
+
+- VS Code 1.96 or newer
+- Node.js 22.5 or newer
+- Git and a repository with at least one commit
+- An authenticated Codex CLI, or the Claude CLI signed in with a subscription or configured API key
+
+### Participant
+
+- VS Code 1.96 or newer
+- The complete MultiCode invitation token
+- No repository clone or agent installation required
 
 ## Commands
 
-- **MultiCode: Host Room** chooses an agent, leases the clean checkout, runs the agent there, stays in the current window, and copies the complete encrypted invite token.
-- Starting from a legacy v2 MultiCode room worktree discards its shared/agent worktrees and switches the same window back to the original repository before hosting.
-- **MultiCode: Join Room** joins the shared agent conversation and adds a separate MultiCode-managed mirror of the host's latest workspace version without modifying the current workspace.
-- **MultiCode: Open Chat** opens the shared conversation sidebar.
-- **MultiCode: Send Prompt** adds a prompt to the shared FIFO queue.
-- **MultiCode: Stop or Leave Room** ends the current process.
-- **MultiCode: Check Setup** runs the CLI diagnostics.
-- **MultiCode: Select Claude Authentication** chooses the host's local Claude subscription or explicit API-key billing.
-- **MultiCode: Configure Claude API Key** stores a BYOK Anthropic key in VS Code SecretStorage.
-- **MultiCode: Forget Claude API Key** removes the stored BYOK key.
-- **MultiCode: Open Agent Preview (Not Merged)** opens the encrypted read-only patch beside the editor.
-- **MultiCode: Open Agent Conflict Proposal** opens a pending encrypted proposal without applying it.
+- **MultiCode: Host Room** — choose Codex or Claude and create an encrypted room.
+- **MultiCode: Join Room** — join with a complete invitation token.
+- **MultiCode: Open Chat** — open the shared-agent sidebar.
+- **MultiCode: Send Prompt** — submit a prompt to the shared queue.
+- **MultiCode: Stop or Leave Room** — end the current session.
+- **MultiCode: Check Setup** — verify Node.js, Git, agent installation, authentication, and repository state.
+- **MultiCode: Select Claude Authentication** — choose a local Claude subscription or API-key billing.
+- **MultiCode: Open Agent Preview (Not Merged)** — inspect the encrypted read-only workspace preview.
+- **MultiCode: Open Agent Conflict Proposal** — review a pending proposal without applying it.
 
-The packaged extension includes the MultiCode CLI. During development it also detects this repository's built CLI. Set `multicode.executable` only when you want to use a different CLI installation.
+## Security and privacy
 
-Hosts need a clean Git repository and the selected agent CLI. Participants can join from any VS Code window without cloning the host repository. MultiCode decrypts verified host checkpoints into an isolated managed mirror, adds it to the Explorer, and preserves the synthetic room base as `HEAD` so shared changes appear in Source Control; it never overwrites the participant's existing folder. Local edits inside the mirror pause later synchronization rather than being discarded. Claude is an external-binary MVP: enable `multicode.experimentalClaude`, install the Claude CLI, and run `claude auth login`. The extension uses that local subscription login by default without reading or copying its credentials. API-key authentication remains available through SecretStorage. At the start of each subscription-backed room, the host confirms that allowed participant prompts consume the host account's limits. Claude steering stays hidden until its active-turn behavior is verified; queue and interrupt remain available.
+- Agent credentials remain on the host's machine.
+- API keys are never included in invitations or relayed session data.
+- Invitation secrets are not sent to the public relay.
+- Existing participant folders are never overwritten.
+- Local participant edits pause synchronization instead of being discarded.
+
+Treat the complete invitation token like a password: anyone who has it may attempt to join the room.
+
+## Support
+
+See [SUPPORT.md](SUPPORT.md) for troubleshooting and responsible vulnerability reporting. Release history is available in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT

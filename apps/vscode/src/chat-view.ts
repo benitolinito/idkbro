@@ -429,7 +429,7 @@ export class MultiCodeChatView implements vscode.WebviewViewProvider, vscode.Dis
 <body>
   <div id="app">
     <header>
-      <div class="topline"><span id="dot" class="dot"></span><button id="back" class="icon" title="Return to host or join">← Back</button><span class="brand">MultiCode</span><button id="copy" class="icon" title="Copy invite token">Copy invite</button><button id="stop" class="icon" title="Stop or leave room">Stop</button><button id="output" class="icon" title="Open raw output">Logs</button></div>
+      <div class="topline"><span id="dot" class="dot"></span><button id="back" class="icon" title="Return to host or join">← Back</button><span class="brand">MultiCode</span><button id="copy" class="icon" title="Copy install and join instructions">Copy invite</button><button id="stop" class="icon" title="Stop or leave room">Stop</button><button id="output" class="icon" title="Open raw output">Logs</button></div>
       <div id="room" class="room">Not connected</div>
     </header>
     <div><div id="people"></div><div id="queue"></div></div>
